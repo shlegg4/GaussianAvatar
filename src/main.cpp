@@ -13,7 +13,7 @@
 // ==========================================
 void save_image_ppm(const std::string& filename, torch::Tensor image) {
     // Input: [3, H, W] Float Tensor (0.0 - 1.0)
-    image = image.permute({1, 2, 0}).mul(255.0).clamp(0, 255).to(torch::kByte).cpu();
+    image = image.permute({1, 2, 0}).mul(255.0).clamp(0, 255).to(torch::kByte).cpu().contiguous();
     
     int H = image.size(0);
     int W = image.size(1);
@@ -28,32 +28,44 @@ void save_image_ppm(const std::string& filename, torch::Tensor image) {
 }
 
 // ==========================================
-// Helper: Get Camera Matrices (0,0,-3 looking at Origin)
+// Helper: Get Camera Matrices (centered on mesh bounds, +Z forward)
 // ==========================================
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_camera_setup(int W, int H, torch::Device device) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_camera_setup_for_bounds(
+    const torch::Tensor& verts, int W, int H, torch::Device device) {
     float fov = 60.0f;
     float n = 0.01f;
     float f = 100.0f;
-    
-    // 1. View Matrix (Simple translation back along Z)
-    auto view = torch::eye(4, device);
-    view.index_put_({2, 3}, 3.0f); // Translate world 3 units away from cam (effectively cam is at -3)
-    // view = view.inverse(); // If representing Camera-to-World, invert. Here we built World-to-Camera directly.
 
-    // 2. Projection Matrix
-    auto proj = torch::zeros({4, 4}, device);
+    auto verts_min = std::get<0>(verts.min(0));
+    auto verts_max = std::get<0>(verts.max(0));
+    auto center = (verts_min + verts_max) * 0.5f;
+    auto radius = (verts - center).norm(2, 1).max().item<float>();
+
     float tan_half_fov = tan((fov / 2.0f) * 3.14159f / 180.0f);
+    float dist = (radius / tan_half_fov) * 2.0f; // larger margin to move camera back
+
+    // 1. View Matrix (camera at center - dist, looking down +Z)
+    auto view = torch::eye(4, device);
+    view.index_put_({0, 3}, -center[0]);
+    view.index_put_({1, 3}, -center[1]);
+    view.index_put_({2, 3}, dist - center[2]);
+
+    // 2. Projection Matrix (left-handed, +Z forward)
+    auto proj = torch::zeros({4, 4}, device);
     proj[0][0] = 1.0f / (tan_half_fov * ((float)W / H));
     proj[1][1] = 1.0f / tan_half_fov;
-    proj[2][2] = -(f + n) / (f - n);
-    proj[2][3] = -(2.0f * f * n) / (f - n);
-    proj[3][2] = -1.0f;
+    proj[2][2] = f / (f - n);
+    proj[2][3] = -(f * n) / (f - n);
+    proj[3][2] = 1.0f;
     
     // 3. Cam Pos
-    auto cam_pos = torch::tensor({0.0f, 0.0f, -3.0f}, device);
-    
-    // Rasterizer expects column-major / transposed matrices depending on implementation
-    return {view.transpose(0, 1).contiguous(), proj.transpose(0, 1).contiguous(), cam_pos};
+    auto cam_pos = torch::tensor(
+        {center[0].item<float>(), center[1].item<float>(), center[2].item<float>() - dist},
+        device);
+
+    // Rasterizer applies projmatrix directly to world points, so pass proj*view.
+    auto proj_view = torch::matmul(proj, view);
+    return {view.transpose(0, 1).contiguous(), proj_view.transpose(0, 1).contiguous(), cam_pos};
 }
 
 // ==========================================
@@ -88,11 +100,11 @@ struct GaussianAvatar : torch::nn::Module {
         register_buffer("g_face_indices", g_face_indices);
         register_buffer("g_bary_coords", g_bary_coords);
 
-        g_scales = torch::full({num_gaussians, 3}, -2.0, torch::requires_grad().device(device)); // Small log scale
+        g_scales = torch::full({num_gaussians, 3}, -2.5, torch::requires_grad().device(device)); // Smaller log scale
         auto g_rots_init = torch::zeros({num_gaussians, 4}, torch::TensorOptions().device(device));
         g_rots_init.index_put_({torch::indexing::Slice(), 0}, 1.0);
         g_rots = g_rots_init.detach().clone().set_requires_grad(true);
-        g_opacities = torch::full({num_gaussians, 1}, 2.0, torch::requires_grad().device(device)); // Visible
+        g_opacities = torch::full({num_gaussians, 1}, 0.1, torch::requires_grad().device(device)); // Lower opacity
 
         register_parameter("g_scales", g_scales);
         register_parameter("g_rots", g_rots);
@@ -138,26 +150,55 @@ int main() {
         auto dict = torch::pickle_load(f_bytes).toGenericDict();
         torch::Tensor faces = dict.at("faces").toTensor().to(torch::kLong).to(device);
         
-        avatar.init_gaussians(20000, faces); // More gaussians for a solid look
+        avatar.init_gaussians(5000, faces); // Fewer gaussians for clearer borders
 
-        // 2. Setup Rasterizer Params
+        // 2. Optimization setup
+        auto betas = torch::zeros({1, 10}, torch::requires_grad().device(device));
+        auto pose_init = torch::zeros({1, 72}, torch::TensorOptions().device(device));
+        pose_init.index_put_({0, 16 * 3}, 0.5); // Lift arm
+        auto pose = pose_init.detach().clone().set_requires_grad(true);
+        auto trans = torch::zeros({1, 3}, torch::requires_grad().device(device));
+
+        // 3. Setup Rasterizer Params (fit camera to mesh bounds)
         int W = 800, H = 800;
-        auto [view_mat, proj_mat, cam_pos] = get_camera_setup(W, H, device);
+        torch::Tensor view_mat;
+        torch::Tensor proj_mat;
+        torch::Tensor cam_pos;
+        {
+            torch::NoGradGuard no_grad;
+            auto smpl_out = avatar.smpl->forward(betas, pose, trans);
+            auto verts = smpl_out.vertices[0];
+            std::tie(view_mat, proj_mat, cam_pos) = get_camera_setup_for_bounds(verts, W, H, device);
+
+            auto cloud_mean = verts.mean(0).cpu();
+            auto cam_cpu = cam_pos.cpu();
+            auto cam_dir = torch::tensor({0.0f, 0.0f, 1.0f});
+            auto cam_to_cloud = cloud_mean - cam_cpu;
+            std::cout << "Cloud mean: ("
+                      << cloud_mean[0].item<float>() << ", "
+                      << cloud_mean[1].item<float>() << ", "
+                      << cloud_mean[2].item<float>() << ")\n";
+            std::cout << "Camera pos: ("
+                      << cam_cpu[0].item<float>() << ", "
+                      << cam_cpu[1].item<float>() << ", "
+                      << cam_cpu[2].item<float>() << ")\n";
+            std::cout << "Camera dir: ("
+                      << cam_dir[0].item<float>() << ", "
+                      << cam_dir[1].item<float>() << ", "
+                      << cam_dir[2].item<float>() << ")\n";
+            std::cout << "Cam->Cloud: ("
+                      << cam_to_cloud[0].item<float>() << ", "
+                      << cam_to_cloud[1].item<float>() << ", "
+                      << cam_to_cloud[2].item<float>() << ")\n";
+        }
         
         // FOV Tangents
         float tan_fov = tan(30.0f * 3.14159f / 180.0f); // 60 deg fov
         
         // Random Colors (SH Degree 0)
         int N = avatar.g_scales.size(0);
-        auto sh = torch::rand({N, 1, 3}, device); // Random colors
-        auto colors = torch::zeros({N, 3}, torch::TensorOptions().device(device));
-
-        // 3. Optimization
-        auto betas = torch::zeros({1, 10}, torch::requires_grad().device(device));
-        auto pose_init = torch::zeros({1, 72}, torch::TensorOptions().device(device));
-        pose_init.index_put_({0, 16 * 3}, 0.5); // Lift arm
-        auto pose = pose_init.detach().clone().set_requires_grad(true);
-        auto trans = torch::zeros({1, 3}, torch::requires_grad().device(device));
+        auto sh = torch::zeros({0}, torch::TensorOptions().device(device));
+        auto colors = torch::full({N, 3}, 0.5, torch::TensorOptions().device(device));
         
         torch::optim::Adam optimizer(avatar.parameters(), 0.01);
 
@@ -176,7 +217,7 @@ int main() {
                 avatar.g_opacities,
                 avatar.g_scales,
                 avatar.g_rots,
-                1.0f, // scale_mod
+                0.005f, // scale_mod
                 view_mat, proj_mat,
                 tan_fov, tan_fov,
                 H, W,
@@ -190,7 +231,7 @@ int main() {
             auto loss = torch::mse_loss(image, torch::ones_like(image)); 
             
             loss.backward();
-            // optimizer.step();
+            optimizer.step();
             
             std::cout << "Iter " << i << " Loss: " << loss.item<float>() << std::endl;
 

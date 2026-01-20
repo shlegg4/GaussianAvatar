@@ -7,6 +7,33 @@
 // Include your corrected SMPL header
 #include "SmplLBS.h"
 
+
+torch::Tensor get_lookat_matrix(torch::Tensor eye, torch::Tensor at, torch::Tensor up) {
+    auto z_axis = (eye - at).contiguous(); // Forward (Camera looks down -Z, so Z points TO camera)
+    z_axis = z_axis / z_axis.norm();
+
+    auto x_axis = torch::cross(up, z_axis).contiguous(); // Right
+    x_axis = x_axis / x_axis.norm();
+
+    auto y_axis = torch::cross(z_axis, x_axis).contiguous(); // Up
+
+    auto view = torch::eye(4, eye.options());
+    
+    // Row 0: X axis
+    view[0][0] = x_axis[0]; view[0][1] = x_axis[1]; view[0][2] = x_axis[2];
+    view[0][3] = -torch::dot(x_axis, eye);
+
+    // Row 1: Y axis
+    view[1][0] = y_axis[0]; view[1][1] = y_axis[1]; view[1][2] = y_axis[2];
+    view[1][3] = -torch::dot(y_axis, eye);
+
+    // Row 2: Z axis
+    view[2][0] = z_axis[0]; view[2][1] = z_axis[1]; view[2][2] = z_axis[2];
+    view[2][3] = -torch::dot(z_axis, eye);
+
+    return view;
+}
+
 // ==========================================
 // Helper: Save Mesh to OBJ
 // ==========================================

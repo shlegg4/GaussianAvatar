@@ -245,6 +245,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		rgb[idx * C + 1] = result.y;
 		rgb[idx * C + 2] = result.z;
 	}
+	else
+	{
+		rgb[idx * C + 0] = colors_precomp[idx * C + 0];
+		rgb[idx * C + 1] = colors_precomp[idx * C + 1];
+		rgb[idx * C + 2] = colors_precomp[idx * C + 2];
+	}
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;

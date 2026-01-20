@@ -71,6 +71,16 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_depth = torch::full({1, H, W}, 0.0, float_opts);
   torch::Tensor out_alpha = torch::full({1, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+
+  if (background.numel() >= 3) {
+    auto bg_cpu = background.to(torch::kCPU);
+    float bg0 = bg_cpu[0].item<float>();
+    float bg1 = bg_cpu[1].item<float>();
+    float bg2 = bg_cpu[2].item<float>();
+    out_color[0].fill_(bg0);
+    out_color[1].fill_(bg1);
+    out_color[2].fill_(bg2);
+  }
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -81,6 +91,16 @@ RasterizeGaussiansCUDA(
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
   
+  const float* sh_ptr = nullptr;
+  if (sh.numel() != 0) {
+    sh_ptr = sh.contiguous().data_ptr<float>();
+  }
+
+  const float* colors_ptr = nullptr;
+  if (colors.numel() != 0) {
+    colors_ptr = colors.contiguous().data<float>();
+  }
+
   int rendered = 0;
   if(P != 0)
   {
@@ -98,8 +118,8 @@ RasterizeGaussiansCUDA(
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
-		sh.contiguous().data_ptr<float>(),
-		colors.contiguous().data<float>(), 
+		sh_ptr,
+		colors_ptr,
 		opacity.contiguous().data<float>(), 
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,

@@ -79,12 +79,10 @@ public:
         const int degree,
         const torch::Tensor& campos,
         const bool debug) 
-    {
-        // Ideally, you should also add CHECK_INPUT(means3D), CHECK_INPUT(colors), etc. here
-        // to catch errors before the forward pass runs.
+    { 
         
         auto float_opts = means3D.options().dtype(torch::kFloat32);
-        auto background = torch::zeros({3, image_height, image_width}, float_opts);
+        auto background = torch::tensor({0.0f, 0.0f, 0.0f}, float_opts);
         auto cov3D_precomp = torch::zeros({0}, float_opts); 
 
         auto result = RasterizeGaussiansCUDA(
@@ -121,15 +119,7 @@ public:
     }
 
     static torch::autograd::variable_list backward(torch::autograd::AutogradContext *ctx, torch::autograd::variable_list grad_outputs) {
-        auto dL_dout_color = grad_outputs[0];
-
-        // --- PROTECTION 1: Early exit if incoming gradient is undefined ---
-        if (!dL_dout_color.defined()) {
-            return torch::autograd::variable_list(16, torch::Tensor());
-        }
-
-        // --- PROTECTION 2: Ensure contiguous memory ---
-        dL_dout_color = dL_dout_color.contiguous();
+        auto dL_dout_color = grad_outputs[0]; 
 
         auto saved = ctx->get_saved_variables();
         
