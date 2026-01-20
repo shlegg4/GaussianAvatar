@@ -1,0 +1,57 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: Configure (Ninja)",
+            "type": "shell",
+            "options": {
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": [
+                        "/C",
+                        // 1. Locate this file on your PC. It sets up the compiler variables.
+                        // Standard path for VS 2022 Community:
+                        "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\"",
+                        "&&"
+                    ]
+                }
+            },
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}/tests/smpl_lbs_test",
+                "-B",
+                "${workspaceFolder}/tests/smpl_lbs_test/build",
+                "-G",
+                "Ninja",
+                "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+            ],
+            "group": "build",
+            "detail": "Sets up VS environment and then runs CMake"
+        },
+        {
+            "label": "CMake: Build (Ninja)",
+            "type": "shell",
+            "options": {
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": [
+                        "/C",
+                        "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\"",
+                        "&&"
+                    ]
+                }
+            },
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/tests/smpl_lbs_test/build"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$msCompile"
+        }
+    ]
+}

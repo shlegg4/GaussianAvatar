@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (Ninja)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            // 1. Connects to the Ninja Build task defined above
+            "preLaunchTask": "CMake: Build (Ninja)",
+            
+            // 2. Ninja puts the EXE directly in 'build', not 'build/Release'
+            "program": "${workspaceFolder}/tests/smpl_lbs_test/build/smpl_test.exe",
+            
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/tests/smpl_lbs_test/build",
+            "environment": [
+                {
+                    // 3. Still need LibTorch in PATH
+                    "name": "PATH",
+                    "value": "D:/libtorch/lib;${env:PATH}"
+                }
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}
