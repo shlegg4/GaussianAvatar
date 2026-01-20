@@ -19,9 +19,9 @@
             "command": "cmake",
             "args": [
                 "-S",
-                "${workspaceFolder}/tests/smpl_lbs_test",
+                "${workspaceFolder}/src",
                 "-B",
-                "${workspaceFolder}/tests/smpl_lbs_test/build",
+                "${workspaceFolder}/src/build",
                 "-G",
                 "Ninja",
                 "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
@@ -45,7 +45,7 @@
             "command": "cmake",
             "args": [
                 "--build",
-                "${workspaceFolder}/tests/smpl_lbs_test/build"
+                "${workspaceFolder}/src/build"
             ],
             "group": {
                 "kind": "build",

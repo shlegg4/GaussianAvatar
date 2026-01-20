@@ -9,11 +9,11 @@
             "preLaunchTask": "CMake: Build (Ninja)",
             
             // 2. Ninja puts the EXE directly in 'build', not 'build/Release'
-            "program": "${workspaceFolder}/tests/smpl_lbs_test/build/smpl_test.exe",
+            "program": "${workspaceFolder}/src/build/smpl_test.exe",
             
             "args": [],
             "stopAtEntry": false,
-            "cwd": "${workspaceFolder}/tests/smpl_lbs_test/build",
+            "cwd": "${workspaceFolder}/src/build",
             "environment": [
                 {
                     // 3. Still need LibTorch in PATH
