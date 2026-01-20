@@ -45,6 +45,8 @@ def main(model_path):
     # 6. Weights
     weights = to_tensor(params['weights'])
 
+    faces = torch.tensor(params['f'].astype(np.int64), dtype=torch.long)
+
     print("Saving to smpl_data.pt...")
     
     output_dict = {
@@ -53,7 +55,8 @@ def main(model_path):
         "posedirs": posedirs,
         "J_regressor": J_regressor,
         "parents": parents,
-        "weights": weights
+        "weights": weights,
+        "faces": faces
     }
     
     torch.save(output_dict, "smpl_data.pt")
