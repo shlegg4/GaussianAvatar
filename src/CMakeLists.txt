@@ -7,10 +7,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
 # --- CONFIGURATION START ---
-# SET THIS: Path to your extracted ONNX Runtime folder
-set(ONNXRUNTIME_ROOT "D:/onnxruntime-win-x64-gpu-1.23.2") 
+# SET THIS: Path to your TensorRT install folder
+set(TENSORRT_ROOT "D:/TensorRT-8.6.1.6")
+# SET THIS: Path to your CUDA install folder
+set(CUDA_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6")
 # SET THIS: Name of your ONNX model file (must be in the same folder as main.cpp)
-set(ONNX_MODEL_FILE "D:/Dissertation/Compiled_GaussianAvatar/cliff_hmr.onnx")
+set(ONNX_MODEL_FILE "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx")
 # --- CONFIGURATION END ---
 
 # ==========================================
@@ -21,16 +23,25 @@ find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # ==========================================
-# DEPENDENCY 2: OpenCV & ONNX Runtime
+# DEPENDENCY 2: OpenCV & TensorRT
 # ==========================================
 set(OpenCV_DIR "D:/opencv/build")
 find_package(OpenCV REQUIRED)
 
-if(NOT EXISTS "${ONNXRUNTIME_ROOT}")
-    message(FATAL_ERROR "ONNXRUNTIME_ROOT not found at ${ONNXRUNTIME_ROOT}. Please update the path in CMakeLists.txt")
+if(NOT EXISTS "${TENSORRT_ROOT}")
+    message(FATAL_ERROR "TENSORRT_ROOT not found at ${TENSORRT_ROOT}. Please update the path in CMakeLists.txt")
 endif()
-include_directories("${ONNXRUNTIME_ROOT}/include")
-link_directories("${ONNXRUNTIME_ROOT}/lib")
+if(NOT EXISTS "${CUDA_ROOT}")
+    message(FATAL_ERROR "CUDA_ROOT not found at ${CUDA_ROOT}. Please update the path in CMakeLists.txt")
+endif()
+include_directories("${TENSORRT_ROOT}/include")
+include_directories("${CUDA_ROOT}/include")
+link_directories("${TENSORRT_ROOT}/lib")
+if(MSVC)
+    link_directories("${CUDA_ROOT}/lib/x64")
+else()
+    link_directories("${CUDA_ROOT}/lib64")
+endif()
 
 # ==========================================
 # SUBPROJECTS
@@ -62,35 +73,46 @@ if(MSVC)
     target_link_libraries(hmr_inference 
         PRIVATE 
         ${OpenCV_LIBS}
-        onnxruntime.lib 
+        nvinfer.lib
+        nvonnxparser.lib
+        cudart.lib
         ${TORCH_LIBRARIES}
-        # Uncomment below if you need GPU execution provider symbols linked directly
-        # onnxruntime_providers_cuda.lib
     )
     target_compile_definitions(hmr_inference PRIVATE NOMINMAX)
     
-    # Post-Build: Copy onnxruntime.dll next to the exe (REQUIRED for Windows)
+    # Post-Build: Copy TensorRT and CUDA runtime DLLs next to the exe
     add_custom_command(TARGET hmr_inference POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
-        $<TARGET_FILE_DIR:hmr_inference>
-    )
-    # Post-Build: Copy CUDA provider DLLs when using ONNX Runtime GPU build
-    add_custom_command(TARGET hmr_inference POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_shared.dll"
+        "${TENSORRT_ROOT}/lib/nvinfer.dll"
         $<TARGET_FILE_DIR:hmr_inference>
     )
     add_custom_command(TARGET hmr_inference POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_cuda.dll"
+        "${TENSORRT_ROOT}/lib/nvonnxparser.dll"
+        $<TARGET_FILE_DIR:hmr_inference>
+    )
+    add_custom_command(TARGET hmr_inference POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${TENSORRT_ROOT}/lib/nvinfer_builder_resource.dll"
+        $<TARGET_FILE_DIR:hmr_inference>
+    )
+    add_custom_command(TARGET hmr_inference POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${TENSORRT_ROOT}/lib/nvinfer_plugin.dll"
+        $<TARGET_FILE_DIR:hmr_inference>
+    )
+    add_custom_command(TARGET hmr_inference POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CUDA_ROOT}/bin/cudart64_12.dll"
         $<TARGET_FILE_DIR:hmr_inference>
     )
 else()
     target_link_libraries(hmr_inference 
         PRIVATE 
         ${OpenCV_LIBS}
-        onnxruntime
+        nvinfer
+        nvonnxparser
+        cudart
         ${TORCH_LIBRARIES}
     )
 endif()

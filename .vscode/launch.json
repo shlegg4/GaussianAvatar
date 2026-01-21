@@ -34,7 +34,7 @@
             "environment": [
                 {
                     "name": "PATH", 
-                    "value": "D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
+                    "value": "D:/cudnn-windows-x86_64-8.9.7.29_cuda12-archive/bin;D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
                 }
             ],
             "console": "integratedTerminal"

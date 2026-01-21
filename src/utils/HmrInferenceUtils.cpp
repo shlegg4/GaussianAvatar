@@ -9,7 +9,9 @@
 #include <sstream>
 
 #include <torch/torch.h>
-#include <onnxruntime_c_api.h>
+#include <cuda_runtime_api.h>
+#include <NvInfer.h>
+#include <NvOnnxParser.h>
 
 #include "SmplLBS.h"
 
@@ -19,6 +21,111 @@ constexpr int kInputW = 224;
 constexpr int kInputH = 224;
 const std::vector<float> kMean = {0.485f, 0.456f, 0.406f};
 const std::vector<float> kStd  = {0.229f, 0.224f, 0.225f};
+
+class TrtLogger final : public nvinfer1::ILogger {
+public:
+    void log(Severity severity, const char* msg) noexcept override {
+        if (severity <= Severity::kWARNING) {
+            std::cout << "[TensorRT] " << msg << std::endl;
+        }
+    }
+};
+
+template <typename T>
+struct TrtDeleter {
+    void operator()(T* obj) const {
+        if (obj) obj->destroy();
+    }
+};
+
+template <typename T>
+using TrtUniquePtr = std::unique_ptr<T, TrtDeleter<T>>;
+
+void CheckCuda(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        std::ostringstream oss;
+        oss << msg << ": " << cudaGetErrorString(err);
+        throw std::runtime_error(oss.str());
+    }
+}
+
+int64_t Volume(const nvinfer1::Dims& dims) {
+    int64_t v = 1;
+    for (int i = 0; i < dims.nbDims; ++i) {
+        v *= dims.d[i];
+    }
+    return v;
+}
+
+TrtUniquePtr<nvinfer1::ICudaEngine> BuildEngineFromOnnx(const std::string& model_path,
+                                                        TrtLogger& logger) {
+    const std::filesystem::path engine_path = std::filesystem::path(model_path).string() + ".engine";
+    if (std::filesystem::exists(engine_path)) {
+        std::ifstream engine_file(engine_path, std::ios::binary | std::ios::ate);
+        if (!engine_file) {
+            throw std::runtime_error("Failed to open cached engine: " + engine_path.string());
+        }
+        const std::streamsize size = engine_file.tellg();
+        engine_file.seekg(0, std::ios::beg);
+        std::vector<char> buffer(static_cast<size_t>(size));
+        if (!engine_file.read(buffer.data(), size)) {
+            throw std::runtime_error("Failed to read cached engine: " + engine_path.string());
+        }
+
+        TrtUniquePtr<nvinfer1::IRuntime> runtime(nvinfer1::createInferRuntime(logger));
+        if (!runtime) throw std::runtime_error("Failed to create TensorRT runtime.");
+
+        TrtUniquePtr<nvinfer1::ICudaEngine> engine(
+            runtime->deserializeCudaEngine(buffer.data(), buffer.size(), nullptr));
+        if (!engine) {
+            throw std::runtime_error("Failed to deserialize cached engine: " + engine_path.string());
+        }
+        std::cout << "Loaded cached TensorRT engine: " << engine_path.string() << std::endl;
+        return engine;
+    }
+
+    TrtUniquePtr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(logger));
+    if (!builder) throw std::runtime_error("Failed to create TensorRT builder.");
+
+    const uint32_t flags = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    TrtUniquePtr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(flags));
+    if (!network) throw std::runtime_error("Failed to create TensorRT network.");
+
+    TrtUniquePtr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network, logger));
+    if (!parser) throw std::runtime_error("Failed to create TensorRT ONNX parser.");
+
+    if (!parser->parseFromFile(model_path.c_str(),
+                               static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
+        throw std::runtime_error("Failed to parse ONNX model: " + model_path);
+    }
+
+    TrtUniquePtr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
+    if (!config) throw std::runtime_error("Failed to create TensorRT builder config.");
+
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 30);
+
+    if (builder->platformHasFastFp16()) {
+        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+    }
+
+    TrtUniquePtr<nvinfer1::ICudaEngine> engine(builder->buildEngineWithConfig(*network, *config));
+    if (!engine) throw std::runtime_error("Failed to build TensorRT engine.");
+
+    TrtUniquePtr<nvinfer1::IHostMemory> serialized(engine->serialize());
+    if (!serialized) throw std::runtime_error("Failed to serialize TensorRT engine.");
+
+    std::ofstream out(engine_path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("Failed to open engine output: " + engine_path.string());
+    }
+    out.write(static_cast<const char*>(serialized->data()), serialized->size());
+    if (!out) {
+        throw std::runtime_error("Failed to write engine output: " + engine_path.string());
+    }
+    std::cout << "Saved TensorRT engine: " << engine_path.string() << std::endl;
+
+    return engine;
+}
 
 std::vector<float> PreprocessImage(const cv::Mat& img) {
     cv::Mat resized;
@@ -181,31 +288,31 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                             ResultsDict* out_results) {
     if (out_results) out_results->clear();
 
-    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "CLIF_HMR");
-    Ort::SessionOptions session_options;
-    // try {
-    //     Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CUDA(session_options, 0));
-    //     std::cout << "Using ONNX Runtime CUDA Execution Provider." << std::endl;
-    // } catch (const Ort::Exception& e) {
-    //     std::cout << "CUDA EP not available (" << e.what() << "). Falling back to CPU." << std::endl;
-    // }
-
-    std::wstring wide_model_path(model_path.begin(), model_path.end());
-    std::unique_ptr<Ort::Session> session;
-
+    TrtLogger logger;
+    TrtUniquePtr<nvinfer1::ICudaEngine> engine;
     try {
-        session = std::make_unique<Ort::Session>(env, wide_model_path.c_str(), session_options);
-    } catch (const Ort::Exception& e) {
-        std::cerr << "\n[ERROR] Failed to load model: " << e.what() << std::endl;
+        engine = BuildEngineFromOnnx(model_path, logger);
+    } catch (const std::exception& e) {
+        std::cerr << "\n[ERROR] Failed to build TensorRT engine: " << e.what() << std::endl;
         std::cerr << "Ensure .onnx and .onnx.data are in the same folder." << std::endl;
         return false;
     }
 
-    Ort::AllocatorWithDefaultOptions allocator;
-    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    TrtUniquePtr<nvinfer1::IExecutionContext> context(engine->createExecutionContext());
+    if (!context) {
+        std::cerr << "\n[ERROR] Failed to create TensorRT execution context." << std::endl;
+        return false;
+    }
 
-    const char* input_names[] = {"image", "bbox"};
-    const char* output_names[] = {"pose", "betas", "cam"};
+    const int idx_image = engine->getBindingIndex("image");
+    const int idx_bbox = engine->getBindingIndex("bbox");
+    const int idx_pose = engine->getBindingIndex("pose");
+    const int idx_betas = engine->getBindingIndex("betas");
+    const int idx_cam = engine->getBindingIndex("cam");
+    if (idx_image < 0 || idx_bbox < 0 || idx_pose < 0 || idx_betas < 0 || idx_cam < 0) {
+        std::cerr << "\n[ERROR] Failed to find required TensorRT bindings (image/bbox/pose/betas/cam)." << std::endl;
+        return false;
+    }
 
     cv::VideoCapture cap(video_path);
     if (!cap.isOpened()) {
@@ -233,7 +340,67 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
     }
 
     std::vector<float> bbox_data = {112.0f, 112.0f, 224.0f / 200.0f};
-    std::vector<int64_t> bbox_shape = {1, 3};
+
+    const nvinfer1::Dims4 img_dims(1, 3, kInputH, kInputW);
+    const nvinfer1::Dims2 bbox_dims(1, 3);
+
+    if (!context->setBindingDimensions(idx_image, img_dims) ||
+        !context->setBindingDimensions(idx_bbox, bbox_dims)) {
+        std::cerr << "\n[ERROR] Failed to set TensorRT input dimensions." << std::endl;
+        return false;
+    }
+    if (!context->allInputDimensionsSpecified()) {
+        std::cerr << "\n[ERROR] TensorRT input dimensions not fully specified." << std::endl;
+        return false;
+    }
+
+    const auto img_out_dims = context->getBindingDimensions(idx_image);
+    const auto bbox_out_dims = context->getBindingDimensions(idx_bbox);
+    const auto pose_dims = context->getBindingDimensions(idx_pose);
+    const auto betas_dims = context->getBindingDimensions(idx_betas);
+    const auto cam_dims = context->getBindingDimensions(idx_cam);
+
+    const size_t img_bytes = static_cast<size_t>(Volume(img_out_dims)) * sizeof(float);
+    const size_t bbox_bytes = static_cast<size_t>(Volume(bbox_out_dims)) * sizeof(float);
+    const size_t pose_bytes = static_cast<size_t>(Volume(pose_dims)) * sizeof(float);
+    const size_t betas_bytes = static_cast<size_t>(Volume(betas_dims)) * sizeof(float);
+    const size_t cam_bytes = static_cast<size_t>(Volume(cam_dims)) * sizeof(float);
+
+    void* d_image = nullptr;
+    void* d_bbox = nullptr;
+    void* d_pose = nullptr;
+    void* d_betas = nullptr;
+    void* d_cam = nullptr;
+    cudaStream_t stream = nullptr;
+
+    try {
+        CheckCuda(cudaStreamCreate(&stream), "cudaStreamCreate failed");
+        CheckCuda(cudaMalloc(&d_image, img_bytes), "cudaMalloc image failed");
+        CheckCuda(cudaMalloc(&d_bbox, bbox_bytes), "cudaMalloc bbox failed");
+        CheckCuda(cudaMalloc(&d_pose, pose_bytes), "cudaMalloc pose failed");
+        CheckCuda(cudaMalloc(&d_betas, betas_bytes), "cudaMalloc betas failed");
+        CheckCuda(cudaMalloc(&d_cam, cam_bytes), "cudaMalloc cam failed");
+    } catch (const std::exception& e) {
+        std::cerr << "\n[ERROR] CUDA setup failed: " << e.what() << std::endl;
+        if (d_image) cudaFree(d_image);
+        if (d_bbox) cudaFree(d_bbox);
+        if (d_pose) cudaFree(d_pose);
+        if (d_betas) cudaFree(d_betas);
+        if (d_cam) cudaFree(d_cam);
+        if (stream) cudaStreamDestroy(stream);
+        return false;
+    }
+
+    std::vector<void*> bindings(engine->getNbBindings(), nullptr);
+    bindings[idx_image] = d_image;
+    bindings[idx_bbox] = d_bbox;
+    bindings[idx_pose] = d_pose;
+    bindings[idx_betas] = d_betas;
+    bindings[idx_cam] = d_cam;
+
+    std::vector<float> pose_out(static_cast<size_t>(Volume(pose_dims)));
+    std::vector<float> betas_out(static_cast<size_t>(Volume(betas_dims)));
+    std::vector<float> cam_out(static_cast<size_t>(Volume(cam_dims)));
 
     std::cout << "Processing video..." << std::endl;
 
@@ -241,34 +408,37 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
     int frame_idx = 0;
     while (cap.read(frame)) {
         std::vector<float> img_data = PreprocessImage(frame);
-        std::vector<int64_t> img_shape = {1, 3, kInputH, kInputW};
-
-        Ort::Value img_tensor = Ort::Value::CreateTensor<float>(
-            mem_info, img_data.data(), img_data.size(), img_shape.data(), img_shape.size());
-        Ort::Value bbox_tensor = Ort::Value::CreateTensor<float>(
-            mem_info, bbox_data.data(), bbox_data.size(), bbox_shape.data(), bbox_shape.size());
-
-        std::vector<Ort::Value> input_tensors;
-        input_tensors.push_back(std::move(img_tensor));
-        input_tensors.push_back(std::move(bbox_tensor));
 
         try {
-            auto output_tensors = session->Run(
-                Ort::RunOptions{nullptr},
-                input_names, input_tensors.data(), 2,
-                output_names, 3);
+            CheckCuda(cudaMemcpyAsync(d_image, img_data.data(), img_bytes,
+                                      cudaMemcpyHostToDevice, stream),
+                      "cudaMemcpyAsync image failed");
+            CheckCuda(cudaMemcpyAsync(d_bbox, bbox_data.data(), bbox_bytes,
+                                      cudaMemcpyHostToDevice, stream),
+                      "cudaMemcpyAsync bbox failed");
 
-            float* pose_ptr  = output_tensors[0].GetTensorMutableData<float>();
-            float* shape_ptr = output_tensors[1].GetTensorMutableData<float>();
-            float* cam_ptr   = output_tensors[2].GetTensorMutableData<float>();
+            if (!context->enqueueV2(bindings.data(), stream, nullptr)) {
+                throw std::runtime_error("TensorRT enqueue failed");
+            }
+
+            CheckCuda(cudaMemcpyAsync(pose_out.data(), d_pose, pose_bytes,
+                                      cudaMemcpyDeviceToHost, stream),
+                      "cudaMemcpyAsync pose failed");
+            CheckCuda(cudaMemcpyAsync(betas_out.data(), d_betas, betas_bytes,
+                                      cudaMemcpyDeviceToHost, stream),
+                      "cudaMemcpyAsync betas failed");
+            CheckCuda(cudaMemcpyAsync(cam_out.data(), d_cam, cam_bytes,
+                                      cudaMemcpyDeviceToHost, stream),
+                      "cudaMemcpyAsync cam failed");
+
+            CheckCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize failed");
 
             SmplResult res;
-            auto pose_info = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
-            int pose_size = static_cast<int>(pose_info[1]);
+            int pose_size = static_cast<int>(pose_out.size());
 
-            res.pose.assign(pose_ptr, pose_ptr + pose_size);
-            res.shape.assign(shape_ptr, shape_ptr + 10);
-            res.camera.assign(cam_ptr, cam_ptr + 3);
+            res.pose.assign(pose_out.begin(), pose_out.end());
+            res.shape.assign(betas_out.begin(), betas_out.end());
+            res.camera.assign(cam_out.begin(), cam_out.end());
 
             if (out_results) {
                 (*out_results)[frame_idx] = res;
@@ -290,10 +460,8 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                 cv::imwrite(out_path.string(), overlay);
             }
 
-        } catch (const Ort::Exception& e) {
-            std::cerr << "Inference error frame " << frame_idx << ": " << e.what() << std::endl;
         } catch (const std::exception& e) {
-            std::cerr << "Postprocess error frame " << frame_idx << ": " << e.what() << std::endl;
+            std::cerr << "Inference/postprocess error frame " << frame_idx << ": " << e.what() << std::endl;
         }
 
         if (frame_idx % 30 == 0) std::cout << "Frame: " << frame_idx << std::endl;
@@ -301,6 +469,12 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
     }
 
     if (outfile.is_open()) outfile.close();
+    if (d_image) cudaFree(d_image);
+    if (d_bbox) cudaFree(d_bbox);
+    if (d_pose) cudaFree(d_pose);
+    if (d_betas) cudaFree(d_betas);
+    if (d_cam) cudaFree(d_cam);
+    if (stream) cudaStreamDestroy(stream);
     std::cout << "Finished." << std::endl;
     return true;
 }

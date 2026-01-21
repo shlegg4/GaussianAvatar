@@ -5,7 +5,6 @@
 #include <vector>
 
 #include <opencv2/opencv.hpp>
-#include <onnxruntime_cxx_api.h>
 
 struct SmplResult {
     std::vector<float> pose;   // 72 or 144 floats
