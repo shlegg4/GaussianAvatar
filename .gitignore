@@ -1,2 +1,6 @@
 build/
+outputs/
+
 *.pkl
+*.onnx
+*.onnx.data

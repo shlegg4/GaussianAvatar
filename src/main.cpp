@@ -204,7 +204,7 @@ int main() {
 
         std::cout << "Rendering..." << std::endl;
 
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 50; ++i) {
             optimizer.zero_grad();
             
             // Deform
@@ -235,8 +235,8 @@ int main() {
             
             std::cout << "Iter " << i << " Loss: " << loss.item<float>() << std::endl;
 
-            if (i == 4) {
-                save_image_ppm("render_output.ppm", image.detach());
+            if (i % 5 == 0) {
+                save_image_ppm("render_output_" + std::to_string(i) + ".ppm", image.detach());
             }
         }
 

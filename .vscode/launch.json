@@ -2,23 +2,39 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug (Ninja)",
+            "name": "Debug (smpl_test)",
             "type": "cppvsdbg",
             "request": "launch",
-            // 1. Connects to the Ninja Build task defined above
             "preLaunchTask": "CMake: Build (Ninja)",
-            
-            // 2. Ninja puts the EXE directly in 'build', not 'build/Release'
             "program": "${workspaceFolder}/src/build/smpl_test.exe",
-            
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",
             "environment": [
                 {
-                    // 3. Still need LibTorch in PATH
                     "name": "PATH",
                     "value": "D:/libtorch/lib;${env:PATH}"
+                }
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug (HMR Inference)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "preLaunchTask": "CMake: Build (Ninja)",
+            "program": "${workspaceFolder}/src/build/hmr_inference.exe", 
+            "args": [
+                "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx", 
+                "D:/Dissertation/videos/IMG_3845.MOV",
+                "D:/Dissertation/Compiled_GaussianAvatar/outputs/"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/src/build",
+            "environment": [
+                {
+                    "name": "PATH", 
+                    "value": "D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
                 }
             ],
             "console": "integratedTerminal"
