@@ -1,148 +1,212 @@
 #include "HmrInferenceUtils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
 
 #include <torch/torch.h>
-#include <cuda_runtime_api.h>
-#include <NvInfer.h>
-#include <NvOnnxParser.h>
-
+#include "HmrInferenceConstants.h"
+#include "HmrMathHelpers.h"
+#include "HmrOverlayHelpers.h"
+#include "SmplifyLite.h"
 #include "SmplLBS.h"
+#include "TrtBuilder.h"
+#include "YoloPersonDetector.h"
 
 namespace {
 
-constexpr int kInputW = 224;
-constexpr int kInputH = 224;
 const std::vector<float> kMean = {0.485f, 0.456f, 0.406f};
 const std::vector<float> kStd  = {0.229f, 0.224f, 0.225f};
 
-class TrtLogger final : public nvinfer1::ILogger {
-public:
-    void log(Severity severity, const char* msg) noexcept override {
-        if (severity <= Severity::kWARNING) {
-            std::cout << "[TensorRT] " << msg << std::endl;
-        }
-    }
-};
+cv::Mat MakeModelInputBgr(const cv::Mat& img) {
+    const int w = img.cols;
+    const int h = img.rows;
+    const float scale = std::min(static_cast<float>(kInputW) / w,
+                                 static_cast<float>(kInputH) / h);
+    const int new_w = static_cast<int>(std::round(w * scale));
+    const int new_h = static_cast<int>(std::round(h * scale));
 
-template <typename T>
-struct TrtDeleter {
-    void operator()(T* obj) const {
-        if (obj) obj->destroy();
-    }
-};
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(new_w, new_h));
 
-template <typename T>
-using TrtUniquePtr = std::unique_ptr<T, TrtDeleter<T>>;
+    const int pad_w = kInputW - new_w;
+    const int pad_h = kInputH - new_h;
+    const int left = pad_w / 2;
+    const int top = pad_h / 2;
 
-void CheckCuda(cudaError_t err, const char* msg) {
-    if (err != cudaSuccess) {
-        std::ostringstream oss;
-        oss << msg << ": " << cudaGetErrorString(err);
-        throw std::runtime_error(oss.str());
-    }
+    cv::Mat padded;
+    cv::copyMakeBorder(resized, padded, top, pad_h - top, left, pad_w - left,
+                       cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    return padded;
 }
 
-int64_t Volume(const nvinfer1::Dims& dims) {
-    int64_t v = 1;
-    for (int i = 0; i < dims.nbDims; ++i) {
-        v *= dims.d[i];
-    }
-    return v;
+std::vector<float> GetCliffBBox(float cx, float cy, float box_size, float focal, int img_w, int img_h) {
+    float x = cx - img_w / 2.0f;
+    float y = cy - img_h / 2.0f;
+
+    std::vector<float> bbox(3);
+    bbox[0] = (x / focal) * 2.8f;
+    bbox[1] = (y / focal) * 2.8f;
+    bbox[2] = (box_size - 0.24f * focal) / (0.06f * focal);
+    return bbox;
 }
 
-TrtUniquePtr<nvinfer1::ICudaEngine> BuildEngineFromOnnx(const std::string& model_path,
-                                                        TrtLogger& logger) {
-    const std::filesystem::path engine_path = std::filesystem::path(model_path).string() + ".engine";
-    if (std::filesystem::exists(engine_path)) {
-        std::ifstream engine_file(engine_path, std::ios::binary | std::ios::ate);
-        if (!engine_file) {
-            throw std::runtime_error("Failed to open cached engine: " + engine_path.string());
-        }
-        const std::streamsize size = engine_file.tellg();
-        engine_file.seekg(0, std::ios::beg);
-        std::vector<char> buffer(static_cast<size_t>(size));
-        if (!engine_file.read(buffer.data(), size)) {
-            throw std::runtime_error("Failed to read cached engine: " + engine_path.string());
-        }
+cv::Rect MakePaddedRect(const cv::Rect2f& bbox, int img_w, int img_h, float scale) {
+    const float cx = bbox.x + bbox.width * 0.5f;
+    const float cy = bbox.y + bbox.height * 0.5f;
+    const float half_w = 0.5f * bbox.width * scale;
+    const float half_h = 0.5f * bbox.height * scale;
 
-        TrtUniquePtr<nvinfer1::IRuntime> runtime(nvinfer1::createInferRuntime(logger));
-        if (!runtime) throw std::runtime_error("Failed to create TensorRT runtime.");
+    const int x0 = std::max(0, static_cast<int>(std::floor(cx - half_w)));
+    const int y0 = std::max(0, static_cast<int>(std::floor(cy - half_h)));
+    const int x1 = std::min(img_w, static_cast<int>(std::ceil(cx + half_w)));
+    const int y1 = std::min(img_h, static_cast<int>(std::ceil(cy + half_h)));
 
-        TrtUniquePtr<nvinfer1::ICudaEngine> engine(
-            runtime->deserializeCudaEngine(buffer.data(), buffer.size(), nullptr));
-        if (!engine) {
-            throw std::runtime_error("Failed to deserialize cached engine: " + engine_path.string());
-        }
-        std::cout << "Loaded cached TensorRT engine: " << engine_path.string() << std::endl;
-        return engine;
+    const int w = std::max(0, x1 - x0);
+    const int h = std::max(0, y1 - y0);
+    return cv::Rect(x0, y0, w, h);
+} 
+
+struct ProcessedCrop {
+    cv::Mat img;
+    float center_x = 0.0f;
+    float center_y = 0.0f;
+    float scale_size = 0.0f;
+};
+
+ProcessedCrop MakeProcessedCrop(const cv::Mat& frame, const cv::Rect2f* bbox, float pad_scale) {
+    ProcessedCrop result;
+    const int img_w = frame.cols;
+    const int img_h = frame.rows;
+
+    float cx = img_w * 0.5f;
+    float cy = img_h * 0.5f;
+    float size = static_cast<float>(std::max(img_w, img_h));
+
+    if (bbox) {
+        cx = bbox->x + bbox->width * 0.5f;
+        cy = bbox->y + bbox->height * 0.5f;
+        size = std::max(bbox->width, bbox->height) * pad_scale;
     }
 
-    TrtUniquePtr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(logger));
-    if (!builder) throw std::runtime_error("Failed to create TensorRT builder.");
+    const float half = size * 0.5f;
+    const int x0 = static_cast<int>(std::floor(cx - half));
+    const int y0 = static_cast<int>(std::floor(cy - half));
+    const int x1 = static_cast<int>(std::ceil(cx + half));
+    const int y1 = static_cast<int>(std::ceil(cy + half));
 
-    const uint32_t flags = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-    TrtUniquePtr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(flags));
-    if (!network) throw std::runtime_error("Failed to create TensorRT network.");
+    const int crop_w = x1 - x0;
+    const int crop_h = y1 - y0;
+    cv::Mat cropped(crop_h, crop_w, frame.type(), cv::Scalar(0, 0, 0));
 
-    TrtUniquePtr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network, logger));
-    if (!parser) throw std::runtime_error("Failed to create TensorRT ONNX parser.");
+    const int src_x0 = std::max(0, x0);
+    const int src_y0 = std::max(0, y0);
+    const int src_x1 = std::min(img_w, x1);
+    const int src_y1 = std::min(img_h, y1);
+    const int dst_x0 = src_x0 - x0;
+    const int dst_y0 = src_y0 - y0;
+    const int copy_w = std::max(0, src_x1 - src_x0);
+    const int copy_h = std::max(0, src_y1 - src_y0);
 
-    if (!parser->parseFromFile(model_path.c_str(),
-                               static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
-        throw std::runtime_error("Failed to parse ONNX model: " + model_path);
+    if (copy_w > 0 && copy_h > 0) {
+        frame(cv::Rect(src_x0, src_y0, copy_w, copy_h))
+            .copyTo(cropped(cv::Rect(dst_x0, dst_y0, copy_w, copy_h)));
     }
 
-    TrtUniquePtr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
-    if (!config) throw std::runtime_error("Failed to create TensorRT builder config.");
+    cv::resize(cropped, result.img, cv::Size(kInputW, kInputH), 0, 0, cv::INTER_AREA);
+    result.center_x = cx;
+    result.center_y = cy;
+    result.scale_size = size;
+    return result;
+}
 
-    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 30);
+ProcessedCrop MakeProcessedCropFromCenter(const cv::Mat& frame, float cx, float cy, float size) {
+    ProcessedCrop result;
+    const int img_w = frame.cols;
+    const int img_h = frame.rows;
 
-    if (builder->platformHasFastFp16()) {
-        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+    const float half = size * 0.5f;
+    const int x0 = static_cast<int>(std::floor(cx - half));
+    const int y0 = static_cast<int>(std::floor(cy - half));
+    const int x1 = static_cast<int>(std::ceil(cx + half));
+    const int y1 = static_cast<int>(std::ceil(cy + half));
+
+    const int crop_w = x1 - x0;
+    const int crop_h = y1 - y0;
+    cv::Mat cropped(crop_h, crop_w, frame.type(), cv::Scalar(0, 0, 0));
+
+    const int src_x0 = std::max(0, x0);
+    const int src_y0 = std::max(0, y0);
+    const int src_x1 = std::min(img_w, x1);
+    const int src_y1 = std::min(img_h, y1);
+    const int dst_x0 = src_x0 - x0;
+    const int dst_y0 = src_y0 - y0;
+    const int copy_w = std::max(0, src_x1 - src_x0);
+    const int copy_h = std::max(0, src_y1 - src_y0);
+
+    if (copy_w > 0 && copy_h > 0) {
+        frame(cv::Rect(src_x0, src_y0, copy_w, copy_h))
+            .copyTo(cropped(cv::Rect(dst_x0, dst_y0, copy_w, copy_h)));
     }
 
-    TrtUniquePtr<nvinfer1::ICudaEngine> engine(builder->buildEngineWithConfig(*network, *config));
-    if (!engine) throw std::runtime_error("Failed to build TensorRT engine.");
-
-    TrtUniquePtr<nvinfer1::IHostMemory> serialized(engine->serialize());
-    if (!serialized) throw std::runtime_error("Failed to serialize TensorRT engine.");
-
-    std::ofstream out(engine_path, std::ios::binary);
-    if (!out) {
-        throw std::runtime_error("Failed to open engine output: " + engine_path.string());
-    }
-    out.write(static_cast<const char*>(serialized->data()), serialized->size());
-    if (!out) {
-        throw std::runtime_error("Failed to write engine output: " + engine_path.string());
-    }
-    std::cout << "Saved TensorRT engine: " << engine_path.string() << std::endl;
-
-    return engine;
+    cv::resize(cropped, result.img, cv::Size(kInputW, kInputH), 0, 0, cv::INTER_AREA);
+    result.center_x = cx;
+    result.center_y = cy;
+    result.scale_size = size;
+    return result;
 }
 
 std::vector<float> PreprocessImage(const cv::Mat& img) {
-    cv::Mat resized;
-    cv::resize(img, resized, cv::Size(kInputW, kInputH));
-    cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
-    resized.convertTo(resized, CV_32F, 1.0 / 255.0);
+    cv::Mat padded;
+    if (img.cols == kInputW && img.rows == kInputH) {
+        padded = img.clone();
+    } else {
+        const int w = img.cols;
+        const int h = img.rows;
+        const float scale = std::min(static_cast<float>(kInputW) / w,
+                                     static_cast<float>(kInputH) / h);
+        const int new_w = static_cast<int>(std::round(w * scale));
+        const int new_h = static_cast<int>(std::round(h * scale));
 
+        cv::Mat resized;
+        cv::resize(img, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_AREA);
+
+        const int pad_w = kInputW - new_w;
+        const int pad_h = kInputH - new_h;
+        const int left = pad_w / 2;
+        const int top = pad_h / 2;
+
+        cv::copyMakeBorder(resized, padded, top, pad_h - top, left, pad_w - left,
+                           cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    }
+
+    // 2. Convert BGR -> RGB
+    cv::cvtColor(padded, padded, cv::COLOR_BGR2RGB);
+
+    // 3. Convert to Float [0.0, 1.0]
+    padded.convertTo(padded, CV_32F, 1.0 / 255.0);
+
+    // 4. Split channels for CHW layout
     std::vector<cv::Mat> channels(3);
-    cv::split(resized, channels);
+    cv::split(padded, channels);
 
     std::vector<float> input_data;
     input_data.reserve(1 * 3 * kInputH * kInputW);
 
+    // 5. Normalize (ImageNet stats) and Flatten to 1D vector
     for (int c = 0; c < 3; ++c) {
+        // Iterate over pixels: H then W (Row-Major)
         for (int h = 0; h < kInputH; ++h) {
+            const float* row_ptr = channels[c].ptr<float>(h); // Optimization: Get row pointer
             for (int w = 0; w < kInputW; ++w) {
-                float val = channels[c].at<float>(h, w);
+                float val = row_ptr[w];
                 input_data.push_back((val - kMean[c]) / kStd[c]);
             }
         }
@@ -150,56 +214,6 @@ std::vector<float> PreprocessImage(const cv::Mat& img) {
     return input_data;
 }
 
-torch::Tensor Rot6dToAxisAngle(const torch::Tensor& rot6d) {
-    auto a1 = rot6d.slice(-1, 0, 3);
-    auto a2 = rot6d.slice(-1, 3, 6);
-    auto b1 = torch::nn::functional::normalize(a1, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
-    auto dot = (b1 * a2).sum(-1, true);
-    auto b2 = torch::nn::functional::normalize(a2 - dot * b1, torch::nn::functional::NormalizeFuncOptions().dim(-1).eps(1e-8));
-    auto b3 = torch::cross(b1, b2, -1);
-    auto rotmat = torch::stack({b1, b2, b3}, -1);
-
-    auto trace = rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 0, 0})
-               + rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 1, 1})
-               + rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 2, 2});
-    auto cos_angle = torch::clamp((trace - 1.0f) * 0.5f, -1.0f + 1e-6f, 1.0f - 1e-6f);
-    auto angle = torch::acos(cos_angle);
-
-    auto rx = rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 2, 1})
-            - rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 1, 2});
-    auto ry = rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 0, 2})
-            - rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 2, 0});
-    auto rz = rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 1, 0})
-            - rotmat.index({torch::indexing::Slice(), torch::indexing::Slice(), 0, 1});
-    auto axis = torch::stack({rx, ry, rz}, -1);
-
-    auto sin_angle = torch::sin(angle);
-    auto denom = 2.0f * sin_angle;
-    auto safe = torch::where(denom.abs() < 1e-6f, torch::ones_like(denom), denom);
-    axis = axis / safe.unsqueeze(-1);
-
-    auto axis_angle = axis * angle.unsqueeze(-1);
-    auto small = angle.abs() < 1e-6f;
-    axis_angle = torch::where(small.unsqueeze(-1), torch::zeros_like(axis_angle), axis_angle);
-    return axis_angle;
-}
-
-torch::Tensor PoseToAxisAngle(const SmplResult& res) {
-    const int pose_size = static_cast<int>(res.pose.size());
-    if (pose_size == 72) {
-        auto pose = torch::from_blob(const_cast<float*>(res.pose.data()), {1, 24, 3}, torch::kFloat).clone();
-        return pose;
-    }
-    if (pose_size == 144) {
-        auto pose6d = torch::from_blob(const_cast<float*>(res.pose.data()), {1, 24, 6}, torch::kFloat).clone();
-        return Rot6dToAxisAngle(pose6d);
-    }
-    if (pose_size % 3 == 0 && (pose_size / 3) == 24) {
-        auto pose = torch::from_blob(const_cast<float*>(res.pose.data()), {1, 24, 3}, torch::kFloat).clone();
-        return pose;
-    }
-    throw std::runtime_error("Unsupported pose size: " + std::to_string(pose_size));
-}
 
 bool EnsureOutputDir(const std::string& dir) {
     if (dir.empty()) return false;
@@ -210,7 +224,19 @@ bool EnsureOutputDir(const std::string& dir) {
 
 std::string MakeFrameName(int frame_idx) {
     std::ostringstream oss;
-    oss << "overlay_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    oss << "overlays/overlay_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
+std::string MakeInputName(int frame_idx) {
+    std::ostringstream oss;
+    oss << "inputs/input_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
+std::string MakeObjName(int frame_idx) {
+    std::ostringstream oss;
+    oss << "smpl_" << std::setw(6) << std::setfill('0') << frame_idx << ".obj";
     return oss.str();
 }
 
@@ -228,57 +254,6 @@ void WriteResult(std::ofstream& out, int frame_idx, const SmplResult& res) {
     out << "----------------------------------------\n";
 }
 
-int CountProjectedInFrame(const torch::Tensor& verts_cpu, float s, float tx, float ty, float y_sign,
-                          int width, int height) {
-    const float img_size = static_cast<float>(kInputW);
-    const float scale_x = static_cast<float>(width) / img_size;
-    const float scale_y = static_cast<float>(height) / img_size;
-
-    auto verts_acc = verts_cpu.accessor<float, 2>();
-    int count = 0;
-    for (int i = 0; i < verts_acc.size(0); ++i) {
-        const float X = verts_acc[i][0];
-        const float Y = verts_acc[i][1] * y_sign;
-        const float u = (s * (X + tx) + img_size * 0.5f) * scale_x;
-        const float v = (s * (Y + ty) + img_size * 0.5f) * scale_y;
-        if (u >= 0.0f && v >= 0.0f && u < width && v < height) {
-            count++;
-        }
-    }
-    return count;
-}
-
-void DrawVerticesOverlay(cv::Mat& frame, const torch::Tensor& verts, const std::vector<float>& cam) {
-    if (cam.size() < 3) return;
-    const float s = cam[0];
-    const float tx = cam[1];
-    const float ty = cam[2];
-
-    auto verts_cpu = verts.squeeze(0).to(torch::kCPU).contiguous();
-
-    const int width = frame.cols;
-    const int height = frame.rows;
-
-    const int count_pos = CountProjectedInFrame(verts_cpu, s, tx, ty, 1.0f, width, height);
-    const int count_neg = CountProjectedInFrame(verts_cpu, s, tx, ty, -1.0f, width, height);
-    const float y_sign = (count_neg > count_pos) ? -1.0f : 1.0f;
-
-    const float img_size = static_cast<float>(kInputW);
-    const float scale_x = static_cast<float>(width) / img_size;
-    const float scale_y = static_cast<float>(height) / img_size;
-
-    auto verts_acc = verts_cpu.accessor<float, 2>();
-    for (int i = 0; i < verts_acc.size(0); ++i) {
-        const float X = verts_acc[i][0];
-        const float Y = verts_acc[i][1] * y_sign;
-        const float u = (s * (X + tx) + img_size * 0.5f) * scale_x;
-        const float v = (s * (Y + ty) + img_size * 0.5f) * scale_y;
-        const int ui = static_cast<int>(u);
-        const int vi = static_cast<int>(v);
-        if (ui < 0 || vi < 0 || ui >= width || vi >= height) continue;
-        cv::circle(frame, cv::Point(ui, vi), 2, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
-    }
-}
 
 } // namespace
 
@@ -315,10 +290,17 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
     }
 
     cv::VideoCapture cap(video_path);
+    cv::Mat single_frame;
+    bool use_single_frame = false;
     if (!cap.isOpened()) {
-        std::cerr << "Failed to open video." << std::endl;
-        return false;
+        single_frame = cv::imread(video_path);
+        if (single_frame.empty()) {
+            std::cerr << "Failed to open video or image." << std::endl;
+            return false;
+        }
+        use_single_frame = true;
     }
+ 
 
     const bool save_outputs = options.save_outputs && !options.output_dir.empty();
     std::ofstream outfile;
@@ -327,6 +309,8 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
             std::cerr << "Failed to create output dir: " << options.output_dir << std::endl;
             return false;
         }
+        EnsureOutputDir((std::filesystem::path(options.output_dir) / "overlays").string());
+        EnsureOutputDir((std::filesystem::path(options.output_dir) / "inputs").string());
         outfile.open(std::filesystem::path(options.output_dir) / "output.txt");
         if (!outfile.is_open()) {
             std::cerr << "Failed to open output.txt in " << options.output_dir << std::endl;
@@ -334,12 +318,20 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         }
     }
 
+    bool use_yolo = options.use_yolo && !options.yolo_model_path.empty();
     std::unique_ptr<SMPLLayer> smpl_layer;
-    if (save_outputs) {
+    if (save_outputs || use_yolo) {
         smpl_layer = std::make_unique<SMPLLayer>(options.smpl_model_path);
     }
 
-    std::vector<float> bbox_data = {112.0f, 112.0f, 224.0f / 200.0f};
+    YoloPersonDetector yolo_detector;
+    if (use_yolo) {
+        yolo_detector = YoloPersonDetector();
+        if (!yolo_detector.Load(options.yolo_model_path)) {
+            std::cerr << "Failed to load YOLO model: " << options.yolo_model_path << std::endl;
+            use_yolo = false;
+        }
+    }
 
     const nvinfer1::Dims4 img_dims(1, 3, kInputH, kInputW);
     const nvinfer1::Dims2 bbox_dims(1, 3);
@@ -404,10 +396,76 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
 
     std::cout << "Processing video..." << std::endl;
 
-    cv::Mat frame;
-    int frame_idx = 0;
-    while (cap.read(frame)) {
-        std::vector<float> img_data = PreprocessImage(frame);
+    auto process_frame = [&](const cv::Mat& frame, int frame_idx) {
+        cv::Mat base_frame;
+        if (frame.channels() == 4) {
+            cv::cvtColor(frame, base_frame, cv::COLOR_BGRA2BGR);
+        } else {
+            base_frame = frame;
+        }
+        cv::Mat model_frame = base_frame;
+        std::vector<float> bbox_data;
+        float crop_cx = base_frame.cols * 0.5f;
+        float crop_cy = base_frame.rows * 0.5f;
+        float crop_size = static_cast<float>(std::max(base_frame.cols, base_frame.rows));
+        std::optional<cv::Rect2f> yolo_bbox;
+        std::optional<cv::Rect> yolo_crop;
+        std::vector<cv::Point2f> yolo_keypoints;
+        std::vector<float> yolo_keypoint_scores;
+        std::optional<ProcessedCrop> crop_res;
+        if (use_yolo) {
+            cv::Rect2f person_bbox;
+            std::vector<cv::Point2f> keypoints;
+            std::vector<float> keypoint_scores;
+            if (yolo_detector.DetectPerson(base_frame, &person_bbox, nullptr, &keypoints, &keypoint_scores)) {
+                yolo_bbox = person_bbox;
+                yolo_keypoints = keypoints;
+                yolo_keypoint_scores = keypoint_scores;
+                float center_x = person_bbox.x + person_bbox.width * 0.5f;
+                float center_y = person_bbox.y + person_bbox.height * 0.5f;
+                const float size = std::max(person_bbox.width, person_bbox.height) * 1.1f;
+
+                const int left_hip_idx = 11;
+                const int right_hip_idx = 12;
+                const float kpt_threshold = 0.2f;
+                if (static_cast<int>(keypoints.size()) > right_hip_idx &&
+                    static_cast<int>(keypoint_scores.size()) > right_hip_idx) {
+                    const float left_score = keypoint_scores[left_hip_idx];
+                    const float right_score = keypoint_scores[right_hip_idx];
+                    if (left_score >= kpt_threshold && right_score >= kpt_threshold) {
+                        const cv::Point2f left_hip = keypoints[left_hip_idx];
+                        const cv::Point2f right_hip = keypoints[right_hip_idx];
+                        center_x = 0.5f * (left_hip.x + right_hip.x);
+                        center_y = 0.5f * (left_hip.y + right_hip.y);
+                    }
+                }
+ 
+                crop_res = MakeProcessedCropFromCenter(base_frame, center_x, center_y, size);
+                model_frame = crop_res->img;
+                crop_cx = crop_res->center_x;
+                crop_cy = crop_res->center_y;
+                crop_size = crop_res->scale_size;
+                const float half = crop_res->scale_size * 0.5f;
+                const int x0 = static_cast<int>(std::floor(crop_res->center_x - half));
+                const int y0 = static_cast<int>(std::floor(crop_res->center_y - half));
+                const int size_i = static_cast<int>(std::ceil(crop_res->scale_size));
+                yolo_crop = cv::Rect(x0, y0, size_i, size_i) &
+                            cv::Rect(0, 0, base_frame.cols, base_frame.rows);
+            }
+        }
+        const float f_geo = std::max(base_frame.cols, base_frame.rows) * options.focal_length_scale;
+        const float f_render = f_geo;
+        if (crop_res) {
+            bbox_data = GetCliffBBox(crop_res->center_x, crop_res->center_y,
+                                     crop_res->scale_size, f_geo,
+                                     base_frame.cols, base_frame.rows);
+        } else {
+            const float cx = base_frame.cols * 0.5f;
+            const float cy = base_frame.rows * 0.5f;
+            const float box_size = static_cast<float>(std::max(base_frame.cols, base_frame.rows));
+            bbox_data = GetCliffBBox(cx, cy, box_size, f_geo, base_frame.cols, base_frame.rows);
+        }
+        std::vector<float> img_data = PreprocessImage(model_frame);
 
         try {
             CheckCuda(cudaMemcpyAsync(d_image, img_data.data(), img_bytes,
@@ -440,6 +498,22 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
             res.shape.assign(betas_out.begin(), betas_out.end());
             res.camera.assign(cam_out.begin(), cam_out.end());
 
+            float smplify_y_sign = 1.0f;
+            if (use_yolo && smpl_layer && !yolo_keypoints.empty() &&
+                yolo_keypoints.size() == yolo_keypoint_scores.size()) {
+                SmplifyLiteOptions smplify_opts;
+                smplify_opts.num_iters = 150;
+                smplify_opts.keypoint_threshold = 0.2f;
+                SmplifyLite(*smpl_layer, yolo_keypoints, yolo_keypoint_scores,
+                            crop_cx, crop_cy, crop_size,
+                            f_geo, f_render,
+                            static_cast<float>(base_frame.cols), static_cast<float>(base_frame.rows),
+                            &res, smplify_opts, &smplify_y_sign,
+                            save_outputs ? &base_frame : nullptr,
+                            save_outputs ? &options.output_dir : nullptr,
+                            frame_idx);
+            }
+
             if (out_results) {
                 (*out_results)[frame_idx] = res;
             }
@@ -453,19 +527,50 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                 auto trans = torch::zeros({1, 3}, torch::kFloat);
 
                 auto smpl_out = smpl_layer->forward(betas, pose_axis, trans);
-                cv::Mat overlay = frame.clone();
-                DrawVerticesOverlay(overlay, smpl_out.vertices, res.camera);
+                cv::Mat overlay = base_frame.clone();
+                float render_y_sign = smplify_y_sign;
+                DrawVerticesOverlayPinhole(overlay, smpl_out.vertices, res.camera,
+                                           crop_cx, crop_cy, crop_size, f_geo, f_render, render_y_sign);
+                if (yolo_bbox) {
+                    const cv::Scalar color_bbox(255, 0, 0);
+                    cv::rectangle(overlay, yolo_bbox.value(), color_bbox, 2, cv::LINE_AA);
+                }
+                if (yolo_crop) {
+                    const cv::Scalar color_crop(0, 165, 255);
+                    cv::rectangle(overlay, yolo_crop.value(), color_crop, 2, cv::LINE_AA);
+                }
+                DrawOverlayDebug(overlay, res.camera, bbox_data);
+                if (!yolo_keypoints.empty()) {
+                    DrawPoseKeypoints(overlay, yolo_keypoints, yolo_keypoint_scores, 0.2f);
+                }
 
                 const auto out_path = std::filesystem::path(options.output_dir) / MakeFrameName(frame_idx);
                 cv::imwrite(out_path.string(), overlay);
+ 
+                const auto input_path = std::filesystem::path(options.output_dir) / MakeInputName(frame_idx);
+                cv::imwrite(input_path.string(), model_frame);
+
+                if (frame_idx == 150) {
+                    const auto obj_path = std::filesystem::path(options.output_dir) / MakeObjName(frame_idx);
+                    WriteObjVertices(smpl_out.vertices, obj_path.string());
+                }
             }
 
         } catch (const std::exception& e) {
             std::cerr << "Inference/postprocess error frame " << frame_idx << ": " << e.what() << std::endl;
         }
+    };
 
-        if (frame_idx % 30 == 0) std::cout << "Frame: " << frame_idx << std::endl;
-        frame_idx++;
+    cv::Mat frame;
+    int frame_idx = 0;
+    if (use_single_frame) { 
+        process_frame(single_frame, 0);
+    } else {
+        while (cap.read(frame)) {
+            process_frame(frame, frame_idx);
+            if (frame_idx % 30 == 0) std::cout << "Frame: " << frame_idx << std::endl;
+            frame_idx++;
+        }
     }
 
     if (outfile.is_open()) outfile.close();

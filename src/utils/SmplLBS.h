@@ -221,6 +221,15 @@ struct SMPLLayer : torch::nn::Module {
         auto verts = v_homo.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(0, 3)});
         verts = verts + trans.unsqueeze(1);
 
-        return {verts, J, results_G, vertex_transforms};
+        // Extract posed joint positions from global transforms and add translation
+        auto J_posed = results_G.index({
+            torch::indexing::Slice(),
+            torch::indexing::Slice(),
+            torch::indexing::Slice(0, 3),
+            3
+        });
+        J_posed = J_posed + trans.unsqueeze(1);
+
+        return {verts, J_posed, results_G, vertex_transforms};
     }
 };

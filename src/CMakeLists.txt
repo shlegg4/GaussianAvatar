@@ -13,6 +13,8 @@ set(TENSORRT_ROOT "D:/TensorRT-8.6.1.6")
 set(CUDA_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6")
 # SET THIS: Name of your ONNX model file (must be in the same folder as main.cpp)
 set(ONNX_MODEL_FILE "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx")
+# SET THIS: Path to your ONNX Runtime install folder
+set(ONNXRUNTIME_ROOT "D:/onnxruntime-win-x64-gpu-1.23.2")
 # --- CONFIGURATION END ---
 
 # ==========================================
@@ -34,9 +36,14 @@ endif()
 if(NOT EXISTS "${CUDA_ROOT}")
     message(FATAL_ERROR "CUDA_ROOT not found at ${CUDA_ROOT}. Please update the path in CMakeLists.txt")
 endif()
+if(NOT EXISTS "${ONNXRUNTIME_ROOT}")
+    message(FATAL_ERROR "ONNXRUNTIME_ROOT not found at ${ONNXRUNTIME_ROOT}. Please update the path in CMakeLists.txt")
+endif()
 include_directories("${TENSORRT_ROOT}/include")
 include_directories("${CUDA_ROOT}/include")
+include_directories("${ONNXRUNTIME_ROOT}/include")
 link_directories("${TENSORRT_ROOT}/lib")
+link_directories("${ONNXRUNTIME_ROOT}/lib")
 if(MSVC)
     link_directories("${CUDA_ROOT}/lib/x64")
 else()
@@ -67,6 +74,11 @@ target_compile_definitions(smpl_test PRIVATE NOMINMAX)
 add_executable(hmr_inference
     hmr_inference.cpp
     utils/HmrInferenceUtils.cpp
+    utils/HmrMathHelpers.cpp
+    utils/HmrOverlayHelpers.cpp
+    utils/SmplifyLite.cpp
+    utils/TrtBuilder.cpp
+    utils/YoloPersonDetector.cpp
 )
 
 if(MSVC)
@@ -76,6 +88,7 @@ if(MSVC)
         nvinfer.lib
         nvonnxparser.lib
         cudart.lib
+        onnxruntime.lib
         ${TORCH_LIBRARIES}
     )
     target_compile_definitions(hmr_inference PRIVATE NOMINMAX)
@@ -106,6 +119,27 @@ if(MSVC)
         "${CUDA_ROOT}/bin/cudart64_12.dll"
         $<TARGET_FILE_DIR:hmr_inference>
     )
+    if(EXISTS "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll")
+        add_custom_command(TARGET hmr_inference POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
+            $<TARGET_FILE_DIR:hmr_inference>
+        )
+    endif()
+    if(EXISTS "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_cuda.dll")
+        add_custom_command(TARGET hmr_inference POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_cuda.dll"
+            $<TARGET_FILE_DIR:hmr_inference>
+        )
+    endif()
+    if(EXISTS "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_shared.dll")
+        add_custom_command(TARGET hmr_inference POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_shared.dll"
+            $<TARGET_FILE_DIR:hmr_inference>
+        )
+    endif()
 else()
     target_link_libraries(hmr_inference 
         PRIVATE 
@@ -113,6 +147,7 @@ else()
         nvinfer
         nvonnxparser
         cudart
+        onnxruntime
         ${TORCH_LIBRARIES}
     )
 endif()
