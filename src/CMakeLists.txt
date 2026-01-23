@@ -59,12 +59,16 @@ add_subdirectory(third_party/diff-gaussian-rasterization)
 # ==========================================
 # EXECUTABLE 1: smpl_test (LibTorch)
 # ==========================================
-add_executable(smpl_test main.cpp)
+add_executable(smpl_test
+    main.cpp
+    utils/HmrMathHelpers.cpp
+)
 
 target_link_libraries(smpl_test 
     PRIVATE 
     "${TORCH_LIBRARIES}" 
     GaussianRasterizer
+    ${OpenCV_LIBS}
 )
 target_compile_definitions(smpl_test PRIVATE NOMINMAX)
 

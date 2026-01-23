@@ -7,13 +7,21 @@
             "request": "launch",
             "preLaunchTask": "CMake: Build (Ninja)",
             "program": "${workspaceFolder}/src/build/smpl_test.exe",
-            "args": [],
+            "args": [
+                "${workspaceFolder}/outputs/gaussian_train.jsonl",
+                "${workspaceFolder}/src/smpl_data.pt",
+                "5000",
+                "1",
+                "0.01",
+                "D:/Dissertation/Compiled_GaussianAvatar/outputs/gaussian_renders"
+            ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",
             "environment": [
                 {
                     "name": "PATH",
-                    "value": "D:/libtorch/lib;${env:PATH}"
+                    "value": "D:/cudnn-windows-x86_64-8.9.7.29_cuda12-archive/bin;D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
+
                 }
             ],
             "console": "integratedTerminal"
@@ -31,7 +39,7 @@
                 "--rtmpose", "D:/Dissertation/Compiled_GaussianAvatar/rtmpose26.onnx", 
                 "--yolo", "D:/Dissertation/Compiled_GaussianAvatar/yolov8n.onnx",
                 "--frame-stride", "2",
-                "--smplify-required-yolo"
+                "--smplify-requires-yolo"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",
