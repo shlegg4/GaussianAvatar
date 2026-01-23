@@ -8,16 +8,19 @@ struct SmplResult;
 struct SMPLLayer;
 
 struct SmplifyLiteOptions {
-    int num_iters = 150;
-    float lr = 1e-2f;
-    float keypoint_threshold = 0.2f;
-    float pose_reg = 5e-4f;
+    int num_iters = 50;
+    float lr = 5e-4f;
+    float keypoint_threshold = 1e-5f;
+    float keypoint_weight_floor = 0.5f;
+    float keypoint_weight_pow = 0.5f;
+    float face_weight = 0.0f;
+    float pose_reg = 100.0f;
     float betas_reg = 5e-4f;
     int log_every = 5;
     int render_every = 5;
     bool optimize_translation = true;
     float target_height = 1.77f;
-    float height_weight = 10.0f; 
+    float height_weight = 1000.0f; 
     bool lock_wrist_ankle = true;
 };
 

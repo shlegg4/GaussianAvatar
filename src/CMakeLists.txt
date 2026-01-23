@@ -78,6 +78,7 @@ add_executable(hmr_inference
     utils/HmrOverlayHelpers.cpp
     utils/SmplifyLite.cpp
     utils/TrtBuilder.cpp
+    utils/RtmPoseDetector.cpp
     utils/YoloPersonDetector.cpp
 )
 

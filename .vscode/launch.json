@@ -26,10 +26,11 @@
             "program": "${workspaceFolder}/src/build/hmr_inference.exe", 
             "args": [
                 "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx", 
-                "D:/Dissertation/Compiled_GaussianAvatar/frame_150.png",
+                "D:/Dissertation/videos/IMG_3845.MOV",
                 "D:/Dissertation/Compiled_GaussianAvatar/outputs/",
-                "D:/Dissertation/Compiled_GaussianAvatar/yolov8n-pose.onnx",
-                "1.2"
+                "D:/Dissertation/Compiled_GaussianAvatar/rtmpose26.onnx",
+                "1.2",
+                "D:/Dissertation/Compiled_GaussianAvatar/yolov8n.onnx"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",

@@ -18,6 +18,7 @@
 #include "SmplifyLite.h"
 #include "SmplLBS.h"
 #include "TrtBuilder.h"
+#include "RtmPoseDetector.h"
 #include "YoloPersonDetector.h"
 
 namespace {
@@ -74,6 +75,39 @@ cv::Rect MakePaddedRect(const cv::Rect2f& bbox, int img_w, int img_h, float scal
     return cv::Rect(x0, y0, w, h);
 } 
 
+std::optional<cv::Rect2f> PoseKeypointsToBbox(const std::vector<cv::Point2f>& keypoints,
+                                              const std::vector<float>& scores,
+                                              float min_score,
+                                              int img_w,
+                                              int img_h) {
+    if (keypoints.empty() || keypoints.size() != scores.size()) {
+        return std::nullopt;
+    }
+    float min_x = static_cast<float>(img_w);
+    float min_y = static_cast<float>(img_h);
+    float max_x = 0.0f;
+    float max_y = 0.0f;
+    int valid = 0;
+    for (size_t i = 0; i < keypoints.size(); ++i) {
+        if (scores[i] < min_score) continue;
+        min_x = std::min(min_x, keypoints[i].x);
+        min_y = std::min(min_y, keypoints[i].y);
+        max_x = std::max(max_x, keypoints[i].x);
+        max_y = std::max(max_y, keypoints[i].y);
+        valid++;
+    }
+    if (valid < 2) {
+        return std::nullopt;
+    }
+    min_x = std::max(0.0f, std::min(min_x, static_cast<float>(img_w - 1)));
+    min_y = std::max(0.0f, std::min(min_y, static_cast<float>(img_h - 1)));
+    max_x = std::max(0.0f, std::min(max_x, static_cast<float>(img_w - 1)));
+    max_y = std::max(0.0f, std::min(max_y, static_cast<float>(img_h - 1)));
+    const float w = std::max(1.0f, max_x - min_x);
+    const float h = std::max(1.0f, max_y - min_y);
+    return cv::Rect2f(min_x, min_y, w, h);
+}
+
 struct ProcessedCrop {
     cv::Mat img;
     float center_x = 0.0f;
@@ -126,43 +160,7 @@ ProcessedCrop MakeProcessedCrop(const cv::Mat& frame, const cv::Rect2f* bbox, fl
     result.scale_size = size;
     return result;
 }
-
-ProcessedCrop MakeProcessedCropFromCenter(const cv::Mat& frame, float cx, float cy, float size) {
-    ProcessedCrop result;
-    const int img_w = frame.cols;
-    const int img_h = frame.rows;
-
-    const float half = size * 0.5f;
-    const int x0 = static_cast<int>(std::floor(cx - half));
-    const int y0 = static_cast<int>(std::floor(cy - half));
-    const int x1 = static_cast<int>(std::ceil(cx + half));
-    const int y1 = static_cast<int>(std::ceil(cy + half));
-
-    const int crop_w = x1 - x0;
-    const int crop_h = y1 - y0;
-    cv::Mat cropped(crop_h, crop_w, frame.type(), cv::Scalar(0, 0, 0));
-
-    const int src_x0 = std::max(0, x0);
-    const int src_y0 = std::max(0, y0);
-    const int src_x1 = std::min(img_w, x1);
-    const int src_y1 = std::min(img_h, y1);
-    const int dst_x0 = src_x0 - x0;
-    const int dst_y0 = src_y0 - y0;
-    const int copy_w = std::max(0, src_x1 - src_x0);
-    const int copy_h = std::max(0, src_y1 - src_y0);
-
-    if (copy_w > 0 && copy_h > 0) {
-        frame(cv::Rect(src_x0, src_y0, copy_w, copy_h))
-            .copyTo(cropped(cv::Rect(dst_x0, dst_y0, copy_w, copy_h)));
-    }
-
-    cv::resize(cropped, result.img, cv::Size(kInputW, kInputH), 0, 0, cv::INTER_AREA);
-    result.center_x = cx;
-    result.center_y = cy;
-    result.scale_size = size;
-    return result;
-}
-
+ 
 std::vector<float> PreprocessImage(const cv::Mat& img) {
     cv::Mat padded;
     if (img.cols == kInputW && img.rows == kInputH) {
@@ -318,18 +316,43 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         }
     }
 
-    bool use_yolo = options.use_yolo && !options.yolo_model_path.empty();
+    bool use_rtmpose = options.use_rtmpose && !options.rtmpose_model_path.empty();
     std::unique_ptr<SMPLLayer> smpl_layer;
-    if (save_outputs || use_yolo) {
+    if (save_outputs || use_rtmpose) {
         smpl_layer = std::make_unique<SMPLLayer>(options.smpl_model_path);
     }
 
-    YoloPersonDetector yolo_detector;
+    bool use_yolo = options.use_yolo && !options.yolo_model_path.empty();
+    if (!use_yolo && use_rtmpose && !options.yolo_model_path.empty()) {
+        std::error_code ec;
+        if (std::filesystem::exists(options.yolo_model_path, ec) && !ec) {
+            use_yolo = true;
+            std::cout << "RTMPose cropping: auto-enabling YOLO from "
+                      << options.yolo_model_path << std::endl;
+        }
+    }
+    YoloPersonDetectorOptions yolo_opts;
+    yolo_opts.conf_threshold = options.yolo_conf_threshold;
+    yolo_opts.nms_threshold = options.yolo_nms_threshold;
+    yolo_opts.use_cuda = options.yolo_use_cuda;
+    YoloPersonDetector yolo_detector(yolo_opts);
     if (use_yolo) {
-        yolo_detector = YoloPersonDetector();
         if (!yolo_detector.Load(options.yolo_model_path)) {
             std::cerr << "Failed to load YOLO model: " << options.yolo_model_path << std::endl;
             use_yolo = false;
+        }
+    }
+
+    RtmPoseDetectorOptions pose_opts;
+    if (save_outputs) {
+        pose_opts.save_debug_input = true;
+        pose_opts.debug_dir = (std::filesystem::path(options.output_dir) / "rtmpose_inputs").string();
+    }
+    RtmPoseDetector rtmpose_detector(pose_opts);
+    if (use_rtmpose) {
+        if (!rtmpose_detector.Load(options.rtmpose_model_path)) {
+            std::cerr << "Failed to load RTMPose model: " << options.rtmpose_model_path << std::endl;
+            use_rtmpose = false;
         }
     }
 
@@ -408,49 +431,56 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         float crop_cx = base_frame.cols * 0.5f;
         float crop_cy = base_frame.rows * 0.5f;
         float crop_size = static_cast<float>(std::max(base_frame.cols, base_frame.rows));
+        std::optional<cv::Rect2f> pose_bbox;
+        std::optional<cv::Rect> pose_crop;
+        std::vector<cv::Point2f> pose_keypoints;
+        std::vector<float> pose_keypoint_scores;
+        std::optional<ProcessedCrop> crop_res;
         std::optional<cv::Rect2f> yolo_bbox;
         std::optional<cv::Rect> yolo_crop;
-        std::vector<cv::Point2f> yolo_keypoints;
-        std::vector<float> yolo_keypoint_scores;
-        std::optional<ProcessedCrop> crop_res;
         if (use_yolo) {
-            cv::Rect2f person_bbox;
+            cv::Rect2f bbox;
+            float score = 0.0f;
+            if (yolo_detector.DetectPerson(base_frame, &bbox, &score)) {
+                yolo_bbox = bbox;
+                yolo_crop = MakePaddedRect(bbox, base_frame.cols, base_frame.rows, options.yolo_crop_scale);
+            }
+        }
+        if (use_rtmpose) {
             std::vector<cv::Point2f> keypoints;
             std::vector<float> keypoint_scores;
-            if (yolo_detector.DetectPerson(base_frame, &person_bbox, nullptr, &keypoints, &keypoint_scores)) {
-                yolo_bbox = person_bbox;
-                yolo_keypoints = keypoints;
-                yolo_keypoint_scores = keypoint_scores;
-                float center_x = person_bbox.x + person_bbox.width * 0.5f;
-                float center_y = person_bbox.y + person_bbox.height * 0.5f;
-                const float size = std::max(person_bbox.width, person_bbox.height) * 1.1f;
-
-                const int left_hip_idx = 11;
-                const int right_hip_idx = 12;
-                const float kpt_threshold = 0.2f;
-                if (static_cast<int>(keypoints.size()) > right_hip_idx &&
-                    static_cast<int>(keypoint_scores.size()) > right_hip_idx) {
-                    const float left_score = keypoint_scores[left_hip_idx];
-                    const float right_score = keypoint_scores[right_hip_idx];
-                    if (left_score >= kpt_threshold && right_score >= kpt_threshold) {
-                        const cv::Point2f left_hip = keypoints[left_hip_idx];
-                        const cv::Point2f right_hip = keypoints[right_hip_idx];
-                        center_x = 0.5f * (left_hip.x + right_hip.x);
-                        center_y = 0.5f * (left_hip.y + right_hip.y);
+            cv::Rect pose_roi(0, 0, base_frame.cols, base_frame.rows);
+            cv::Mat pose_frame = base_frame;
+            if (yolo_crop) {
+                pose_roi = yolo_crop.value();
+                pose_frame = base_frame(pose_roi);
+            }
+            if (rtmpose_detector.DetectPose(pose_frame, &keypoints, &keypoint_scores, frame_idx)) {
+                if (yolo_crop) {
+                    for (auto& kpt : keypoints) {
+                        kpt.x += static_cast<float>(pose_roi.x);
+                        kpt.y += static_cast<float>(pose_roi.y);
                     }
                 }
- 
-                crop_res = MakeProcessedCropFromCenter(base_frame, center_x, center_y, size);
-                model_frame = crop_res->img;
-                crop_cx = crop_res->center_x;
-                crop_cy = crop_res->center_y;
-                crop_size = crop_res->scale_size;
-                const float half = crop_res->scale_size * 0.5f;
-                const int x0 = static_cast<int>(std::floor(crop_res->center_x - half));
-                const int y0 = static_cast<int>(std::floor(crop_res->center_y - half));
-                const int size_i = static_cast<int>(std::ceil(crop_res->scale_size));
-                yolo_crop = cv::Rect(x0, y0, size_i, size_i) &
-                            cv::Rect(0, 0, base_frame.cols, base_frame.rows);
+                pose_keypoints = keypoints;
+                pose_keypoint_scores = keypoint_scores;
+                const float kpt_threshold = 0.0001f;
+                const auto bbox_opt = PoseKeypointsToBbox(keypoints, keypoint_scores, kpt_threshold,
+                                                          base_frame.cols, base_frame.rows);
+                if (bbox_opt) {
+                    pose_bbox = bbox_opt.value();
+                    crop_res = MakeProcessedCrop(base_frame, &pose_bbox.value(), 1.1f);
+                    model_frame = crop_res->img;
+                    crop_cx = crop_res->center_x;
+                    crop_cy = crop_res->center_y;
+                    crop_size = crop_res->scale_size;
+                    const float half = crop_res->scale_size * 0.5f;
+                    const int x0 = static_cast<int>(std::floor(crop_res->center_x - half));
+                    const int y0 = static_cast<int>(std::floor(crop_res->center_y - half));
+                    const int size_i = static_cast<int>(std::ceil(crop_res->scale_size));
+                    pose_crop = cv::Rect(x0, y0, size_i, size_i) &
+                                cv::Rect(0, 0, base_frame.cols, base_frame.rows);
+                }
             }
         }
         const float f_geo = std::max(base_frame.cols, base_frame.rows) * options.focal_length_scale;
@@ -499,12 +529,11 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
             res.camera.assign(cam_out.begin(), cam_out.end());
 
             float smplify_y_sign = 1.0f;
-            if (use_yolo && smpl_layer && !yolo_keypoints.empty() &&
-                yolo_keypoints.size() == yolo_keypoint_scores.size()) {
-                SmplifyLiteOptions smplify_opts;
-                smplify_opts.num_iters = 150;
-                smplify_opts.keypoint_threshold = 0.2f;
-                SmplifyLite(*smpl_layer, yolo_keypoints, yolo_keypoint_scores,
+            if (use_rtmpose && smpl_layer && !pose_keypoints.empty() &&
+                pose_keypoints.size() == pose_keypoint_scores.size()) {
+                SmplifyLiteOptions smplify_opts; 
+                smplify_opts.face_weight = 1.0f;
+                SmplifyLite(*smpl_layer, pose_keypoints, pose_keypoint_scores,
                             crop_cx, crop_cy, crop_size,
                             f_geo, f_render,
                             static_cast<float>(base_frame.cols), static_cast<float>(base_frame.rows),
@@ -531,17 +560,21 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                 float render_y_sign = smplify_y_sign;
                 DrawVerticesOverlayPinhole(overlay, smpl_out.vertices, res.camera,
                                            crop_cx, crop_cy, crop_size, f_geo, f_render, render_y_sign);
-                if (yolo_bbox) {
+                if (pose_bbox) {
                     const cv::Scalar color_bbox(255, 0, 0);
-                    cv::rectangle(overlay, yolo_bbox.value(), color_bbox, 2, cv::LINE_AA);
+                    cv::rectangle(overlay, pose_bbox.value(), color_bbox, 2, cv::LINE_AA);
                 }
-                if (yolo_crop) {
+                if (yolo_bbox) {
+                    const cv::Scalar color_yolo(0, 255, 255);
+                    cv::rectangle(overlay, yolo_bbox.value(), color_yolo, 2, cv::LINE_AA);
+                }
+                if (pose_crop) {
                     const cv::Scalar color_crop(0, 165, 255);
-                    cv::rectangle(overlay, yolo_crop.value(), color_crop, 2, cv::LINE_AA);
+                    cv::rectangle(overlay, pose_crop.value(), color_crop, 2, cv::LINE_AA);
                 }
                 DrawOverlayDebug(overlay, res.camera, bbox_data);
-                if (!yolo_keypoints.empty()) {
-                    DrawPoseKeypoints(overlay, yolo_keypoints, yolo_keypoint_scores, 0.2f);
+                if (!pose_keypoints.empty()) {
+                    DrawPoseKeypoints(overlay, pose_keypoints, pose_keypoint_scores, 0.2f);
                 }
 
                 const auto out_path = std::filesystem::path(options.output_dir) / MakeFrameName(frame_idx);
