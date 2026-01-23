@@ -3,9 +3,37 @@
 
 #include "utils/HmrInferenceUtils.h"
 
+namespace {
+
+void PrintUsage() {
+    std::cout
+        << "Usage:\n"
+        << "  hmr_inference <model.onnx> <video.mp4|image.png> [options]\n\n"
+        << "Options:\n"
+        << "  --output <dir>                 Save outputs to directory\n"
+        << "  --rtmpose <model.onnx>          RTMPose model path\n"
+        << "  --yolo <model.onnx>             YOLO model path\n"
+        << "  --focal-scale <float>           Focal length scale (default 1.2)\n"
+        << "  --frame-stride <int>            Process every Nth frame (default 1)\n"
+        << "  --smplify-requires-yolo         Only run Smplify when YOLO detects a person\n"
+        << "  --save-outputs                 Enable output saving (requires --output)\n"
+        << "  --no-save                      Disable output saving\n"
+        << "  --help                         Show this help\n\n"
+        << "Legacy positional args still work: [output_dir] [rtmpose.onnx] [focal_scale] [yolo.onnx]\n";
+}
+
+bool LooksLikeNumber(const std::string& s) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    std::strtof(s.c_str(), &end);
+    return end && *end == '\0';
+}
+
+} // namespace
+
 int main(int argc, char* argv[]) {
-    if (argc < 3 || argc > 7) {
-        std::cout << "Usage: ./hmr_inference <model.onnx> <video.mp4|image.png> [output_dir] [rtmpose.onnx] [focal_scale] [yolo.onnx]" << std::endl;
+    if (argc < 3) {
+        PrintUsage();
         return -1;
     }
 
@@ -13,39 +41,91 @@ int main(int argc, char* argv[]) {
     std::string video_path = argv[2];
 
     HmrOutputOptions options;
-    if (argc == 4 && std::string(argv[3]).size() > 0) {
-        const std::string arg3 = argv[3];
-        if (arg3.size() >= 5 && arg3.substr(arg3.size() - 5) == ".onnx") {
-            options.use_rtmpose = true;
-            options.rtmpose_model_path = arg3;
-        } else {
-            options.output_dir = arg3;
-            options.save_outputs = true;
+    bool focal_set = false;
+
+    for (int i = 3; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            PrintUsage();
+            return 0;
         }
-    }
-    if (argc >= 5 && std::string(argv[4]).size() > 0) {
-        options.use_rtmpose = true;
-        options.rtmpose_model_path = argv[4];
-        options.output_dir = argv[3];
-        options.save_outputs = true;
-    }
-    if (argc >= 6 && std::string(argv[5]).size() > 0) {
-        const std::string arg5 = argv[5];
-        if (arg5.size() >= 5 && arg5.substr(arg5.size() - 5) == ".onnx") {
+        if (arg == "--output" && i + 1 < argc) {
+            options.output_dir = argv[++i];
+            options.save_outputs = true;
+            continue;
+        }
+        if (arg == "--rtmpose" && i + 1 < argc) {
+            options.use_rtmpose = true;
+            options.rtmpose_model_path = argv[++i];
+            continue;
+        }
+        if (arg == "--yolo" && i + 1 < argc) {
             options.use_yolo = true;
-            options.yolo_model_path = arg5;
-        } else {
+            options.yolo_model_path = argv[++i];
+            continue;
+        }
+        if (arg == "--focal-scale" && i + 1 < argc) {
             try {
-                options.focal_length_scale = std::stof(arg5);
+                options.focal_length_scale = std::stof(argv[++i]);
+                focal_set = true;
             } catch (const std::exception&) {
-                std::cerr << "Invalid focal_scale: " << arg5 << std::endl;
+                std::cerr << "Invalid focal-scale value." << std::endl;
                 return -1;
             }
+            continue;
+        }
+        if (arg == "--frame-stride" && i + 1 < argc) {
+            try {
+                options.frame_stride = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                std::cerr << "Invalid frame-stride value." << std::endl;
+                return -1;
+            }
+            continue;
+        }
+        if (arg == "--smplify-requires-yolo") {
+            options.smplify_requires_yolo = true;
+            continue;
+        }
+        if (arg == "--save-outputs") {
+            options.save_outputs = true;
+            continue;
+        }
+        if (arg == "--no-save") {
+            options.save_outputs = false;
+            continue;
+        }
+
+        // Legacy positional fallback.
+        if (arg.size() >= 5 && arg.substr(arg.size() - 5) == ".onnx") {
+            if (!options.use_rtmpose) {
+                options.use_rtmpose = true;
+                options.rtmpose_model_path = arg;
+            } else if (!options.use_yolo) {
+                options.use_yolo = true;
+                options.yolo_model_path = arg;
+            }
+            continue;
+        }
+        if (!focal_set && LooksLikeNumber(arg)) {
+            options.focal_length_scale = std::stof(arg);
+            focal_set = true;
+            continue;
+        }
+        if (options.output_dir.empty()) {
+            options.output_dir = arg;
+            options.save_outputs = true;
+            continue;
         }
     }
-    if (argc >= 7 && std::string(argv[6]).size() > 0) {
-        options.use_yolo = true;
-        options.yolo_model_path = argv[6];
+
+    if (options.frame_stride < 1) {
+        std::cerr << "frame-stride must be >= 1. Using 1." << std::endl;
+        options.frame_stride = 1;
+    }
+    if (options.save_outputs && options.output_dir.empty()) {
+        std::cerr << "Output saving requested but no output dir set." << std::endl;
+        return -1;
     }
 
     ResultsDict results;

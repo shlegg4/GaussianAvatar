@@ -27,6 +27,8 @@ struct HmrOutputOptions {
     bool yolo_use_cuda = false;
     float yolo_crop_scale = 1.2f;
     float focal_length_scale = 1.2f;
+    int frame_stride = 1;
+    bool smplify_requires_yolo = false;
 };
 
 bool RunHmrInferenceOnVideo(const std::string& model_path,

@@ -27,10 +27,11 @@
             "args": [
                 "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx", 
                 "D:/Dissertation/videos/IMG_3845.MOV",
-                "D:/Dissertation/Compiled_GaussianAvatar/outputs/",
-                "D:/Dissertation/Compiled_GaussianAvatar/rtmpose26.onnx",
-                "1.2",
-                "D:/Dissertation/Compiled_GaussianAvatar/yolov8n.onnx"
+                "--output", "D:/Dissertation/Compiled_GaussianAvatar/outputs/",
+                "--rtmpose", "D:/Dissertation/Compiled_GaussianAvatar/rtmpose26.onnx", 
+                "--yolo", "D:/Dissertation/Compiled_GaussianAvatar/yolov8n.onnx",
+                "--frame-stride", "2",
+                "--smplify-required-yolo"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",

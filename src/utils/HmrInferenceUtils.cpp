@@ -232,6 +232,18 @@ std::string MakeInputName(int frame_idx) {
     return oss.str();
 }
 
+std::string MakeFrameNameRaw(int frame_idx) {
+    std::ostringstream oss;
+    oss << "frames/frame_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
+std::string MakeCropName(int frame_idx) {
+    std::ostringstream oss;
+    oss << "crops/crop_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
 std::string MakeObjName(int frame_idx) {
     std::ostringstream oss;
     oss << "smpl_" << std::setw(6) << std::setfill('0') << frame_idx << ".obj";
@@ -250,6 +262,65 @@ void WriteResult(std::ofstream& out, int frame_idx, const SmplResult& res) {
     for (float v : res.camera) out << v << " ";
     out << "\n";
     out << "----------------------------------------\n";
+}
+
+std::string JsonEscape(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (char c : input) {
+        switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default: out += c; break;
+        }
+    }
+    return out;
+}
+
+void WriteTrainRecord(std::ofstream& out,
+                      int frame_idx,
+                      const SmplResult& res,
+                      const std::string& frame_path,
+                      const std::string& crop_path,
+                      const std::string& input_path,
+                      const std::string& overlay_path,
+                      float crop_cx, float crop_cy, float crop_size,
+                      float focal_length, float y_sign,
+                      int img_w, int img_h) {
+    out << std::fixed << std::setprecision(8);
+    out << "{";
+    out << "\"frame\":" << frame_idx << ",";
+    out << "\"image\":\"" << JsonEscape(frame_path) << "\",";
+    out << "\"crop\":\"" << JsonEscape(crop_path) << "\",";
+    out << "\"input\":\"" << JsonEscape(input_path) << "\",";
+    out << "\"overlay\":\"" << JsonEscape(overlay_path) << "\",";
+    out << "\"img_w\":" << img_w << ",";
+    out << "\"img_h\":" << img_h << ",";
+    out << "\"crop_cx\":" << crop_cx << ",";
+    out << "\"crop_cy\":" << crop_cy << ",";
+    out << "\"crop_size\":" << crop_size << ",";
+    out << "\"focal_length\":" << focal_length << ",";
+    out << "\"y_sign\":" << y_sign << ",";
+    out << "\"pose\":[";
+    for (size_t i = 0; i < res.pose.size(); ++i) {
+        if (i) out << ",";
+        out << res.pose[i];
+    }
+    out << "],\"betas\":[";
+    for (size_t i = 0; i < res.shape.size(); ++i) {
+        if (i) out << ",";
+        out << res.shape[i];
+    }
+    out << "],\"cam\":[";
+    for (size_t i = 0; i < res.camera.size(); ++i) {
+        if (i) out << ",";
+        out << res.camera[i];
+    }
+    out << "]}";
+    out << "\n";
 }
 
 
@@ -302,16 +373,22 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
 
     const bool save_outputs = options.save_outputs && !options.output_dir.empty();
     std::ofstream outfile;
+    std::ofstream trainfile;
     if (save_outputs) {
         if (!EnsureOutputDir(options.output_dir)) {
             std::cerr << "Failed to create output dir: " << options.output_dir << std::endl;
             return false;
         }
         EnsureOutputDir((std::filesystem::path(options.output_dir) / "overlays").string());
-        EnsureOutputDir((std::filesystem::path(options.output_dir) / "inputs").string());
+        EnsureOutputDir((std::filesystem::path(options.output_dir) / "crops").string());
         outfile.open(std::filesystem::path(options.output_dir) / "output.txt");
         if (!outfile.is_open()) {
             std::cerr << "Failed to open output.txt in " << options.output_dir << std::endl;
+            return false;
+        }
+        trainfile.open(std::filesystem::path(options.output_dir) / "gaussian_train.jsonl");
+        if (!trainfile.is_open()) {
+            std::cerr << "Failed to open gaussian_train.jsonl in " << options.output_dir << std::endl;
             return false;
         }
     }
@@ -345,8 +422,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
 
     RtmPoseDetectorOptions pose_opts;
     if (save_outputs) {
-        pose_opts.save_debug_input = true;
-        pose_opts.debug_dir = (std::filesystem::path(options.output_dir) / "rtmpose_inputs").string();
+        pose_opts.save_debug_input = false;
     }
     RtmPoseDetector rtmpose_detector(pose_opts);
     if (use_rtmpose) {
@@ -438,12 +514,14 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         std::optional<ProcessedCrop> crop_res;
         std::optional<cv::Rect2f> yolo_bbox;
         std::optional<cv::Rect> yolo_crop;
+        bool yolo_found = false;
         if (use_yolo) {
             cv::Rect2f bbox;
             float score = 0.0f;
             if (yolo_detector.DetectPerson(base_frame, &bbox, &score)) {
                 yolo_bbox = bbox;
                 yolo_crop = MakePaddedRect(bbox, base_frame.cols, base_frame.rows, options.yolo_crop_scale);
+                yolo_found = true;
             }
         }
         if (use_rtmpose) {
@@ -529,7 +607,8 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
             res.camera.assign(cam_out.begin(), cam_out.end());
 
             float smplify_y_sign = 1.0f;
-            if (use_rtmpose && smpl_layer && !pose_keypoints.empty() &&
+            const bool smplify_allowed = !options.smplify_requires_yolo || yolo_found;
+            if (use_rtmpose && smpl_layer && smplify_allowed && !pose_keypoints.empty() &&
                 pose_keypoints.size() == pose_keypoint_scores.size()) {
                 SmplifyLiteOptions smplify_opts; 
                 smplify_opts.face_weight = 1.0f;
@@ -538,8 +617,8 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                             f_geo, f_render,
                             static_cast<float>(base_frame.cols), static_cast<float>(base_frame.rows),
                             &res, smplify_opts, &smplify_y_sign,
-                            save_outputs ? &base_frame : nullptr,
-                            save_outputs ? &options.output_dir : nullptr,
+                            (save_outputs && yolo_found) ? &base_frame : nullptr,
+                            (save_outputs && yolo_found) ? &options.output_dir : nullptr,
                             frame_idx);
             }
 
@@ -547,7 +626,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                 (*out_results)[frame_idx] = res;
             }
 
-            if (save_outputs) {
+            if (save_outputs && yolo_found) {
                 WriteResult(outfile, frame_idx, res);
 
                 torch::NoGradGuard no_grad;
@@ -579,9 +658,23 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
 
                 const auto out_path = std::filesystem::path(options.output_dir) / MakeFrameName(frame_idx);
                 cv::imwrite(out_path.string(), overlay);
- 
-                const auto input_path = std::filesystem::path(options.output_dir) / MakeInputName(frame_idx);
-                cv::imwrite(input_path.string(), model_frame);
+
+                std::string crop_path_str;
+                if (pose_crop && pose_crop->width > 0 && pose_crop->height > 0) {
+                    const auto crop_path = std::filesystem::path(options.output_dir) / MakeCropName(frame_idx);
+                    cv::Mat crop_img = base_frame(*pose_crop);
+                    cv::imwrite(crop_path.string(), crop_img);
+                    crop_path_str = crop_path.generic_string();
+                }
+
+                WriteTrainRecord(trainfile, frame_idx, res,
+                                 std::string(),
+                                 crop_path_str,
+                                 std::string(),
+                                 out_path.generic_string(),
+                                 crop_cx, crop_cy, crop_size,
+                                 f_geo, smplify_y_sign,
+                                 base_frame.cols, base_frame.rows);
 
                 if (frame_idx == 150) {
                     const auto obj_path = std::filesystem::path(options.output_dir) / MakeObjName(frame_idx);
@@ -600,13 +693,16 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         process_frame(single_frame, 0);
     } else {
         while (cap.read(frame)) {
-            process_frame(frame, frame_idx);
+            if (options.frame_stride <= 1 || (frame_idx % options.frame_stride) == 0) {
+                process_frame(frame, frame_idx);
+            }
             if (frame_idx % 30 == 0) std::cout << "Frame: " << frame_idx << std::endl;
             frame_idx++;
         }
     }
 
     if (outfile.is_open()) outfile.close();
+    if (trainfile.is_open()) trainfile.close();
     if (d_image) cudaFree(d_image);
     if (d_bbox) cudaFree(d_bbox);
     if (d_pose) cudaFree(d_pose);
