@@ -14,6 +14,8 @@ struct SmplifyLiteOptions {
     float keypoint_weight_floor = 0.5f;
     float keypoint_weight_pow = 0.5f;
     float face_weight = 0.0f;
+    float loss_tol = 1e-4f;
+    int min_iters = 5;
     float pose_reg = 100.0f;
     float betas_reg = 5e-4f;
     int log_every = 5;

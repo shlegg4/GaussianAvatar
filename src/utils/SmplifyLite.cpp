@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -244,6 +245,8 @@ bool SmplifyLite(SMPLLayer &smpl_layer,
         return false;
     }
 
+    const auto device = smpl_layer.v_template.device();
+
     std::vector<int> smpl_indices;
     std::vector<float> weights_vec;
     auto target_xy = BuildTargetTensor(keypoints, keypoint_scores,
@@ -280,11 +283,23 @@ bool SmplifyLite(SMPLLayer &smpl_layer,
         face_weights = face_weights / (face_weights.mean() + 1e-8f);
     }
 
-    auto pose_init = PoseToAxisAngle(*io_res).clone();
+    target_xy = target_xy.to(device);
+    weights = weights.to(device);
+    if (face_target_xy.defined())
+    {
+        face_target_xy = face_target_xy.to(device);
+    }
+    if (face_weights.defined())
+    {
+        face_weights = face_weights.to(device);
+    }
+
+    auto pose_init = PoseToAxisAngle(*io_res).clone().to(device);
     auto betas_init = torch::from_blob(io_res->shape.data(),
                                        {1, static_cast<int64_t>(io_res->shape.size())},
                                        torch::kFloat)
-                          .clone();
+                          .clone()
+                          .to(device);
 
     auto pose = pose_init.clone().detach().set_requires_grad(true);
     auto betas = betas_init.clone().detach().set_requires_grad(true); 
@@ -294,6 +309,7 @@ bool SmplifyLite(SMPLLayer &smpl_layer,
                                                      f_geo, img_w, img_h);
     auto t_tensor = torch::tensor({t_init_val[0], t_init_val[1], t_init_val[2]}, torch::kFloat)
                         .reshape({1, 3})
+                        .to(device)
                         .detach()
                         .requires_grad_(options.optimize_translation);
 
@@ -318,12 +334,13 @@ bool SmplifyLite(SMPLLayer &smpl_layer,
 
     torch::optim::Adam optimizer(param_groups, torch::optim::AdamOptions(options.lr));
    
+    const auto trans_zeros = torch::zeros({1, 3}, torch::TensorOptions().dtype(torch::kFloat).device(device));
+    float prev_loss_val = std::numeric_limits<float>::infinity();
     for (int iter = 0; iter < options.num_iters; ++iter)
     {
         optimizer.zero_grad();
 
         // Forward Pass (SMPL) 
-        const auto trans_zeros = torch::zeros({1, 3}, torch::kFloat);
         auto pose_eff = pose;
         auto smpl_out = smpl_layer.forward(betas, pose_eff, trans_zeros);
         auto joints = smpl_out.joints.squeeze(0);
@@ -384,6 +401,12 @@ bool SmplifyLite(SMPLLayer &smpl_layer,
         auto betas_reg = (betas - betas_init).pow(2).mean() * options.betas_reg;
 
         auto total = data_loss + (face_loss * options.face_weight) + pose_reg + betas_reg + height_loss;
+        const float curr_loss_val = total.item<float>();
+        if (iter >= options.min_iters && std::abs(prev_loss_val - curr_loss_val) < options.loss_tol)
+        {
+            break;
+        }
+        prev_loss_val = curr_loss_val;
         total.backward();
         optimizer.step(); 
     }
