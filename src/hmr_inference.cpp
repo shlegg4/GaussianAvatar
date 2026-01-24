@@ -13,6 +13,9 @@ void PrintUsage() {
         << "  --output <dir>                 Save outputs to directory\n"
         << "  --rtmpose <model.onnx>          RTMPose model path\n"
         << "  --yolo <model.onnx>             YOLO model path\n"
+        << "  --modnet <model.onnx>           MODNet matting model path\n"
+        << "  --modnet-cuda                   Enable CUDA for MODNet (if available)\n"
+        << "  --modnet-input <int>            MODNet input size if model is dynamic\n"
         << "  --focal-scale <float>           Focal length scale (default 1.2)\n"
         << "  --frame-stride <int>            Process every Nth frame (default 1)\n"
         << "  --smplify-requires-yolo         Only run Smplify when YOLO detects a person\n"
@@ -62,6 +65,24 @@ int main(int argc, char* argv[]) {
         if (arg == "--yolo" && i + 1 < argc) {
             options.use_yolo = true;
             options.yolo_model_path = argv[++i];
+            continue;
+        }
+        if (arg == "--modnet" && i + 1 < argc) {
+            options.use_modnet = true;
+            options.modnet_model_path = argv[++i];
+            continue;
+        }
+        if (arg == "--modnet-cuda") {
+            options.modnet_use_cuda = true;
+            continue;
+        }
+        if (arg == "--modnet-input" && i + 1 < argc) {
+            try {
+                options.modnet_input_size = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                std::cerr << "Invalid modnet-input value." << std::endl;
+                return -1;
+            }
             continue;
         }
         if (arg == "--focal-scale" && i + 1 < argc) {

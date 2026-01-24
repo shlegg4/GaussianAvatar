@@ -30,6 +30,28 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 set(OpenCV_DIR "D:/opencv/build")
 find_package(OpenCV REQUIRED)
 
+option(ENABLE_VIEWER "Build GLFW viewer support" ON)
+if(ENABLE_VIEWER)
+    find_package(OpenGL REQUIRED)
+    find_package(glfw3 CONFIG QUIET)
+    message(STATUS "OpenGL found: ${OpenGL_FOUND}")
+    message(STATUS "glfw3 found: ${glfw3_FOUND}")
+    if(NOT glfw3_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+            glfw
+            GIT_REPOSITORY https://github.com/glfw/glfw.git
+            GIT_TAG 3.4
+        )
+        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(glfw)
+        message(STATUS "glfw3 provided via FetchContent")
+    endif()
+endif()
+
 if(NOT EXISTS "${TENSORRT_ROOT}")
     message(FATAL_ERROR "TENSORRT_ROOT not found at ${TENSORRT_ROOT}. Please update the path in CMakeLists.txt")
 endif()
@@ -70,6 +92,10 @@ target_link_libraries(smpl_test
     GaussianRasterizer
     ${OpenCV_LIBS}
 )
+if(ENABLE_VIEWER)
+    target_compile_definitions(smpl_test PRIVATE GAUSS_VIEWER)
+    target_link_libraries(smpl_test PRIVATE OpenGL::GL glfw)
+endif()
 target_compile_definitions(smpl_test PRIVATE NOMINMAX)
 
 # ==========================================
@@ -84,6 +110,7 @@ add_executable(hmr_inference
     utils/TrtBuilder.cpp
     utils/RtmPoseDetector.cpp
     utils/YoloPersonDetector.cpp
+    utils/ModNetMatte.cpp
 )
 
 if(MSVC)

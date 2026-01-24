@@ -8,12 +8,18 @@
             "preLaunchTask": "CMake: Build (Ninja)",
             "program": "${workspaceFolder}/src/build/smpl_test.exe",
             "args": [
-                "${workspaceFolder}/outputs/gaussian_train.jsonl",
-                "${workspaceFolder}/src/smpl_data.pt",
-                "5000",
-                "1",
-                "0.01",
-                "D:/Dissertation/Compiled_GaussianAvatar/outputs/gaussian_renders"
+                "--jsonl", "${workspaceFolder}/outputs/gaussian_train.jsonl",
+                "--smpl", "${workspaceFolder}/src/smpl_data.pt",
+                "--num-gaussians", "5000",
+                "--epochs", "50",
+                "--lr", "0.001",
+                "--output-dir", "D:/Dissertation/Compiled_GaussianAvatar/outputs/gaussian_renders",
+                "--scale-reg", "0.01",
+                "--offset-reg", "0.1",
+                "--color-lr", "0.01",
+                "--num-gaussians", "40000",
+                "--viewer",
+                "--sh-degree", "2"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",
@@ -38,6 +44,7 @@
                 "--output", "D:/Dissertation/Compiled_GaussianAvatar/outputs/",
                 "--rtmpose", "D:/Dissertation/Compiled_GaussianAvatar/rtmpose26.onnx", 
                 "--yolo", "D:/Dissertation/Compiled_GaussianAvatar/yolov8n.onnx",
+                "--modnet", "D:/Dissertation/Compiled_GaussianAvatar/modnet.onnx",
                 "--frame-stride", "2",
                 "--smplify-requires-yolo"
             ],

@@ -24,7 +24,8 @@
                 "${workspaceFolder}/src/build",
                 "-G",
                 "Ninja",
-                "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                "-DENABLE_VIEWER=ON"
             ],
             "group": "build",
             "detail": "Sets up VS environment and then runs CMake"

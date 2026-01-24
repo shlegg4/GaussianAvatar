@@ -29,6 +29,10 @@ struct HmrOutputOptions {
     float focal_length_scale = 1.2f;
     int frame_stride = 1;
     bool smplify_requires_yolo = false;
+    bool use_modnet = false;
+    std::string modnet_model_path = "modnet.onnx";
+    bool modnet_use_cuda = false;
+    int modnet_input_size = 512;
 };
 
 bool RunHmrInferenceOnVideo(const std::string& model_path,

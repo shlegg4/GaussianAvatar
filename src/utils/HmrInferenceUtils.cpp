@@ -15,6 +15,7 @@
 #include "HmrInferenceConstants.h"
 #include "HmrMathHelpers.h"
 #include "HmrOverlayHelpers.h"
+#include "ModNetMatte.h"
 #include "SmplifyLite.h"
 #include "SmplLBS.h"
 #include "TrtBuilder.h"
@@ -244,6 +245,18 @@ std::string MakeCropName(int frame_idx) {
     return oss.str();
 }
 
+std::string MakeMatteName(int frame_idx) {
+    std::ostringstream oss;
+    oss << "mattes/matte_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
+std::string MakeMatteCropName(int frame_idx) {
+    std::ostringstream oss;
+    oss << "mattes/matte_crop_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
 std::string MakeObjName(int frame_idx) {
     std::ostringstream oss;
     oss << "smpl_" << std::setw(6) << std::setfill('0') << frame_idx << ".obj";
@@ -381,6 +394,9 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         }
         EnsureOutputDir((std::filesystem::path(options.output_dir) / "overlays").string());
         EnsureOutputDir((std::filesystem::path(options.output_dir) / "crops").string());
+        if (options.use_modnet) {
+            EnsureOutputDir((std::filesystem::path(options.output_dir) / "mattes").string());
+        }
         outfile.open(std::filesystem::path(options.output_dir) / "output.txt");
         if (!outfile.is_open()) {
             std::cerr << "Failed to open output.txt in " << options.output_dir << std::endl;
@@ -429,6 +445,18 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         if (!rtmpose_detector.Load(options.rtmpose_model_path)) {
             std::cerr << "Failed to load RTMPose model: " << options.rtmpose_model_path << std::endl;
             use_rtmpose = false;
+        }
+    }
+
+    bool use_modnet = options.use_modnet && !options.modnet_model_path.empty();
+    ModNetMatteOptions modnet_opts;
+    modnet_opts.input_size = options.modnet_input_size;
+    modnet_opts.use_cuda = options.modnet_use_cuda;
+    ModNetMatte modnet(modnet_opts);
+    if (use_modnet) {
+        if (!modnet.Load(options.modnet_model_path)) {
+            std::cerr << "Failed to load MODNet model: " << options.modnet_model_path << std::endl;
+            use_modnet = false;
         }
     }
 
@@ -663,6 +691,24 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                 if (pose_crop && pose_crop->width > 0 && pose_crop->height > 0) {
                     const auto crop_path = std::filesystem::path(options.output_dir) / MakeCropName(frame_idx);
                     cv::Mat crop_img = base_frame(*pose_crop);
+                    cv::Mat matte;
+                    cv::Mat matted_frame;
+                    bool has_matte = false;
+                    if (use_modnet) {
+                        if (modnet.ComputeMatte(crop_img, &matte)) {
+                            matted_frame = modnet.ApplyMatte(crop_img, matte);
+                            has_matte = true;
+                        }
+                    }
+                    if (has_matte) {
+                        cv::Mat matte_u8;
+                        matte.convertTo(matte_u8, CV_8U, 255.0);
+                        const auto matte_path = std::filesystem::path(options.output_dir) / MakeMatteName(frame_idx);
+                        cv::imwrite(matte_path.string(), matte_u8);
+                        const auto matte_crop_path = std::filesystem::path(options.output_dir) / MakeMatteCropName(frame_idx);
+                        cv::imwrite(matte_crop_path.string(), matte_u8);
+                        crop_img = matted_frame;
+                    }
                     cv::imwrite(crop_path.string(), crop_img);
                     crop_path_str = crop_path.generic_string();
                 }
