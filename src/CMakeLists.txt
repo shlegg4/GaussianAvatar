@@ -99,6 +99,17 @@ endif()
 target_compile_definitions(smpl_test PRIVATE NOMINMAX)
 
 # ==========================================
+# EXECUTABLE 1.5: gaussian_viewer (OpenGL)
+# ==========================================
+if(ENABLE_VIEWER)
+    add_executable(gaussian_viewer
+        gaussian_viewer.cpp
+    )
+    target_link_libraries(gaussian_viewer PRIVATE OpenGL::GL glfw "${TORCH_LIBRARIES}" GaussianRasterizer)
+    target_compile_definitions(gaussian_viewer PRIVATE NOMINMAX)
+endif()
+
+# ==========================================
 # EXECUTABLE 2: hmr_inference (ONNX/OpenCV)
 # ==========================================
 add_executable(hmr_inference
