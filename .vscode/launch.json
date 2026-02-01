@@ -9,17 +9,20 @@
             "program": "${workspaceFolder}/src/build/smpl_test.exe",
             "args": [
                 "--jsonl", "${workspaceFolder}/outputs/gaussian_train.jsonl",
-                "--smpl", "${workspaceFolder}/src/smpl_data.pt",
-                "--num-gaussians", "5000",
+                "--smpl", "${workspaceFolder}/src/smpl_data.pt", 
                 "--epochs", "50",
                 "--lr", "0.001",
                 "--output-dir", "D:/Dissertation/Compiled_GaussianAvatar/outputs/gaussian_renders",
                 "--scale-reg", "0.01",
+                "--scale-max-reg", "0.1",
+                "--scale-max", "0.02",
                 "--offset-reg", "0.1",
+                "--mesh-reg", "0.1",
+                "--mesh-max-dist", "0.02",
                 "--color-lr", "0.01",
                 "--num-gaussians", "40000",
                 "--viewer",
-                "--sh-degree", "2"
+                "--sh-degree", "1"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",

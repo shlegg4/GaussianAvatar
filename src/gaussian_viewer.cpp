@@ -285,6 +285,16 @@ Vec3 CrossVec3(const Vec3 &a, const Vec3 &b)
     return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 
+Vec3 CameraPosFromView(const Mat4 &view)
+{
+    // view is world->camera, column-major. Camera position is -R^T * t.
+    const Vec3 t{view.m[12], view.m[13], view.m[14]};
+    return {
+        -(view.m[0] * t.x + view.m[1] * t.y + view.m[2] * t.z),
+        -(view.m[4] * t.x + view.m[5] * t.y + view.m[6] * t.z),
+        -(view.m[8] * t.x + view.m[9] * t.y + view.m[10] * t.z)};
+}
+
 struct Quat
 {
     float w = 1.0f;
@@ -292,6 +302,43 @@ struct Quat
     float y = 0.0f;
     float z = 0.0f;
 };
+
+Mat4 Mat4FromQuatTranslation(const Quat &q, const Vec3 &t)
+{
+    const float w = q.w;
+    const float x = q.x;
+    const float y = q.y;
+    const float z = q.z;
+
+    const float xx = x * x;
+    const float yy = y * y;
+    const float zz = z * z;
+    const float xy = x * y;
+    const float xz = x * z;
+    const float yz = y * z;
+    const float wx = w * x;
+    const float wy = w * y;
+    const float wz = w * z;
+
+    Mat4 out = Identity();
+    // Column-major rotation.
+    out.m[0] = 1.0f - 2.0f * (yy + zz);
+    out.m[1] = 2.0f * (xy + wz);
+    out.m[2] = 2.0f * (xz - wy);
+
+    out.m[4] = 2.0f * (xy - wz);
+    out.m[5] = 1.0f - 2.0f * (xx + zz);
+    out.m[6] = 2.0f * (yz + wx);
+
+    out.m[8] = 2.0f * (xz + wy);
+    out.m[9] = 2.0f * (yz - wx);
+    out.m[10] = 1.0f - 2.0f * (xx + yy);
+
+    out.m[12] = t.x;
+    out.m[13] = t.y;
+    out.m[14] = t.z;
+    return out;
+}
 
 torch::Tensor QuatToMat3(const Quat &q, torch::Device device)
 {
@@ -368,6 +415,11 @@ Vec3 RotatePointQuat(const Vec3 &p, const Vec3 &center, const Quat &q)
     Quat qn = NormalizeQuat(q);
     Quat res = MulQuat(MulQuat(qn, qv), ConjugateQuat(qn));
     return {center.x + res.x, center.y + res.y, center.z + res.z};
+}
+
+Vec3 RotateVec3Quat(const Vec3 &v, const Quat &q)
+{
+    return RotatePointQuat(v, {0.0f, 0.0f, 0.0f}, q);
 }
 
 Quat YawPitchQuat(float yaw, float pitch)
@@ -748,26 +800,9 @@ int main(int argc, char **argv)
             const float tan_fovx = tan_fovy * aspect;
 
             Quat q_model = NormalizeQuat(g_camera.model_rot);
-            Mat4 view_mat = LookAt({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f});
             Mat4 proj_mat = Perspective(fovy_deg, aspect, 0.01f, 100.0f);
-            Mat4 view_proj = Multiply(proj_mat, view_mat);
 
-            torch::Tensor view_t = Mat4ToTensorRowMajor(view_mat, device).transpose(0, 1).contiguous();
-            torch::Tensor proj_t = Mat4ToTensorRowMajor(view_proj, device).transpose(0, 1).contiguous();
-            auto cam_pos = torch::tensor({0.0f, 0.0f, 0.0f}, opts).to(device);
-
-            auto pivot = torch::tensor({g_camera.target.x, g_camera.target.y, g_camera.target.z}, opts).to(device);
-            auto rot = QuatToMat3(q_model, device);
-            means3D = (means3D - pivot).matmul(rot.transpose(0, 1)) + pivot;
-            {
-                auto q_model_t = torch::tensor({q_model.w, q_model.x, q_model.y, q_model.z}, opts)
-                                     .to(device)
-                                     .unsqueeze(0)
-                                     .expand({rotations.size(0), 4});
-                rotations = MulQuatTensor(q_model_t, rotations);
-                auto rot_norm = torch::norm(rotations, 2, 1, true).clamp_min(1e-8f);
-                rotations = rotations / rot_norm;
-            }
+            Vec3 base_offset{0.0f, 0.0f, 0.0f};
             if (g_bounds.valid)
             {
                 Vec3 center{
@@ -780,14 +815,23 @@ int main(int argc, char **argv)
                     0.5f * (g_bounds.max.z - g_bounds.min.z)};
                 const float radius = std::max({extents.x, extents.y, extents.z, 0.1f});
                 const float dist = radius * 3.0f;
-                const float offset_z = dist - center.z;
-                auto base_offset = torch::tensor({0.0f, 0.0f, offset_z}, opts).to(device);
-                auto user_offset = torch::tensor({g_camera.model_offset.x, g_camera.model_offset.y,
-                                                  g_camera.model_offset.z},
-                                                 opts)
-                                      .to(device);
-                means3D = means3D + base_offset + user_offset;
+                base_offset.z = dist - center.z;
             }
+
+            Vec3 pivot{g_camera.target.x, g_camera.target.y, g_camera.target.z};
+            Vec3 user_offset{g_camera.model_offset.x, g_camera.model_offset.y, g_camera.model_offset.z};
+            Vec3 offset = AddVec3(base_offset, user_offset);
+            Vec3 r_pivot = RotateVec3Quat(pivot, q_model);
+            Vec3 view_trans = AddVec3(SubVec3(pivot, r_pivot), offset);
+
+            Mat4 view_mat = Mat4FromQuatTranslation(q_model, view_trans);
+            Mat4 view_proj = Multiply(proj_mat, view_mat);
+
+            torch::Tensor view_ten = Mat4ToTensorRowMajor(view_mat, device).transpose(0, 1).contiguous();
+            torch::Tensor proj_t = Mat4ToTensorRowMajor(view_proj, device).transpose(0, 1).contiguous();
+
+            Vec3 cam_pos_v = CameraPosFromView(view_mat);
+            auto cam_pos = torch::tensor({cam_pos_v.x, cam_pos_v.y, cam_pos_v.z}, opts).to(device);
 
             float scale_modifier = 1.0f;
             if (const auto *header = reader.Header())
@@ -803,7 +847,7 @@ int main(int argc, char **argv)
                 scales,
                 rotations,
                 scale_modifier,
-                view_t,
+                view_ten,
                 proj_t,
                 tan_fovx,
                 tan_fovy,
