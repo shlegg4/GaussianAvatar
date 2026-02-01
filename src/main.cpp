@@ -25,312 +25,14 @@
 #include "utils/HmrInferenceUtils.h"
 #include "utils/HmrMathHelpers.h"
 #include "utils/SmplLBS.h"
-
-struct TrainSample
-{
-    int frame = -1;
-    std::string crop_path;
-    int img_w = 0;
-    int img_h = 0;
-    float crop_cx = 0.0f;
-    float crop_cy = 0.0f;
-    float crop_size = 0.0f;
-    float focal_length = 0.0f;
-    float y_sign = 1.0f;
-    std::vector<float> pose;
-    std::vector<float> betas;
-    std::vector<float> cam;
-};
-
-struct TrainOptions
-{
-    std::string jsonl_path;
-    std::string smpl_model_path = "smpl_data.pt";
-    int num_gaussians = 5000;
-    int epochs = 1;
-    float lr = 0.01f;
-    std::string output_dir = "outputs";
-    float scale_reg_weight = 0.001f;
-    float scale_max_reg_weight = 0.1f;
-    float scale_max_value = 0.02f;
-    float offset_reg_weight = 0.01f;
-    float mesh_reg_weight = 0.1f;
-    float mesh_reg_max_dist = 0.02f;
-    float color_lr = -1.0f;
-    int sh_degree = 3;
-    bool enable_viewer = false;
-    int viewer_width = 800;
-    int viewer_height = 600;
-    int viewer_every = 1;
-    std::string viewer_shm_name = "GaussianAvatarShared";
-};
-
-cv::Mat TensorToBgr(const torch::Tensor &image);
-bool IsMaskCoverageValidTensor(const torch::Tensor &render, const torch::Tensor &matte_mask,
-                               float max_outside_ratio, float render_threshold);
-
-bool ExtractStringField(const std::string &line, const std::string &key, std::string *out)
-{
-    const std::string tag = "\"" + key + "\":\"";
-    size_t start = line.find(tag);
-    if (start == std::string::npos)
-        return false;
-    start += tag.size();
-    size_t end = line.find('"', start);
-    if (end == std::string::npos)
-        return false;
-    *out = line.substr(start, end - start);
-    return true;
-}
-
-bool ExtractNumberField(const std::string &line, const std::string &key, double *out)
-{
-    const std::string tag = "\"" + key + "\":";
-    size_t start = line.find(tag);
-    if (start == std::string::npos)
-        return false;
-    start += tag.size();
-    const char *ptr = line.c_str() + start;
-    char *end = nullptr;
-    double val = std::strtod(ptr, &end);
-    if (end == ptr)
-        return false;
-    *out = val;
-    return true;
-}
-
-bool ExtractArrayField(const std::string &line, const std::string &key, std::vector<float> *out)
-{
-    const std::string tag = "\"" + key + "\":[";
-    size_t start = line.find(tag);
-    if (start == std::string::npos)
-        return false;
-    start += tag.size();
-    size_t end = line.find(']', start);
-    if (end == std::string::npos)
-        return false;
-    std::string content = line.substr(start, end - start);
-    out->clear();
-    if (content.empty())
-        return true;
-    size_t pos = 0;
-    while (pos < content.size())
-    {
-        size_t comma = content.find(',', pos);
-        std::string token = (comma == std::string::npos) ? content.substr(pos) : content.substr(pos, comma - pos);
-        if (!token.empty())
-        {
-            char *end_ptr = nullptr;
-            float val = std::strtof(token.c_str(), &end_ptr);
-            if (end_ptr != token.c_str())
-            {
-                out->push_back(val);
-            }
-        }
-        if (comma == std::string::npos)
-            break;
-        pos = comma + 1;
-    }
-    return true;
-}
-
-bool ParseTrainSample(const std::string &line, TrainSample *out)
-{
-    TrainSample sample;
-    double value = 0.0;
-    if (ExtractNumberField(line, "frame", &value))
-    {
-        sample.frame = static_cast<int>(value);
-    }
-    if (!ExtractStringField(line, "crop", &sample.crop_path))
-        return false;
-    if (sample.crop_path.empty())
-        return false;
-
-    if (!ExtractNumberField(line, "img_w", &value))
-        return false;
-    sample.img_w = static_cast<int>(value);
-    if (!ExtractNumberField(line, "img_h", &value))
-        return false;
-    sample.img_h = static_cast<int>(value);
-    if (!ExtractNumberField(line, "crop_cx", &value))
-        return false;
-    sample.crop_cx = static_cast<float>(value);
-    if (!ExtractNumberField(line, "crop_cy", &value))
-        return false;
-    sample.crop_cy = static_cast<float>(value);
-    if (!ExtractNumberField(line, "crop_size", &value))
-        return false;
-    sample.crop_size = static_cast<float>(value);
-    if (!ExtractNumberField(line, "focal_length", &value))
-        return false;
-    sample.focal_length = static_cast<float>(value);
-    if (!ExtractNumberField(line, "y_sign", &value))
-        return false;
-    sample.y_sign = static_cast<float>(value);
-
-    if (!ExtractArrayField(line, "pose", &sample.pose))
-        return false;
-    if (!ExtractArrayField(line, "betas", &sample.betas))
-        return false;
-    if (!ExtractArrayField(line, "cam", &sample.cam))
-        return false;
-
-    if (sample.pose.empty() || sample.betas.empty() || sample.cam.empty())
-        return false;
-    *out = std::move(sample);
-    return true;
-}
-
-bool ReplaceFirst(std::string *value, const std::string &from, const std::string &to)
-{
-    size_t pos = value->find(from);
-    if (pos == std::string::npos)
-        return false;
-    value->replace(pos, from.size(), to);
-    return true;
-}
-
-std::string DeriveMattePath(const std::string &crop_path)
-{
-    std::string matte_path = crop_path;
-    if (!ReplaceFirst(&matte_path, "\\crops\\", "\\mattes\\"))
-    {
-        ReplaceFirst(&matte_path, "/crops/", "/mattes/");
-    }
-    if (!ReplaceFirst(&matte_path, "crop_", "matte_"))
-    {
-        ReplaceFirst(&matte_path, "crop-", "matte-");
-    }
-    return matte_path;
-}
-
-float ComputeMedian(std::vector<float> values)
-{
-    if (values.empty())
-        return 0.0f;
-    std::sort(values.begin(), values.end());
-    const size_t mid = values.size() / 2;
-    if (values.size() % 2 == 1)
-        return values[mid];
-    return 0.5f * (values[mid - 1] + values[mid]);
-}
-
-float ComputeMad(const std::vector<float> &values, float median)
-{
-    std::vector<float> deviations;
-    deviations.reserve(values.size());
-    for (float v : values)
-    {
-        deviations.push_back(std::abs(v - median));
-    }
-    return ComputeMedian(std::move(deviations));
-}
-
-std::vector<float> ComputeAverageBetas(const std::vector<TrainSample> &samples)
-{
-    std::vector<float> sum;
-    size_t count = 0;
-    for (const auto &sample : samples)
-    {
-        if (sample.betas.empty())
-            continue;
-        if (sum.empty())
-        {
-            sum.assign(sample.betas.size(), 0.0f);
-        }
-        if (sample.betas.size() != sum.size())
-            continue;
-        for (size_t i = 0; i < sum.size(); ++i)
-        {
-            sum[i] += sample.betas[i];
-        }
-        count++;
-    }
-    if (count == 0)
-        return {};
-    for (float &v : sum)
-    {
-        v /= static_cast<float>(count);
-    }
-    return sum;
-}
-
-bool IsMaskCoverageValid(const torch::Tensor &render, const cv::Mat &matte, float max_outside_ratio)
-{
-    if (!render.defined() || matte.empty())
-        return false;
-    const int H = static_cast<int>(render.size(1));
-    const int W = static_cast<int>(render.size(2));
-
-    cv::Mat matte_gray;
-    if (matte.channels() == 4)
-    {
-        std::vector<cv::Mat> channels;
-        cv::split(matte, channels);
-        matte_gray = channels[3];
-    }
-    else if (matte.channels() == 3)
-    {
-        cv::cvtColor(matte, matte_gray, cv::COLOR_BGR2GRAY);
-    }
-    else
-    {
-        matte_gray = matte;
-    }
-
-    if (matte_gray.size() != cv::Size(W, H))
-    {
-        cv::resize(matte_gray, matte_gray, cv::Size(W, H), 0, 0, cv::INTER_NEAREST);
-    }
-
-    cv::Mat matte_mask;
-    cv::threshold(matte_gray, matte_mask, 127, 255, cv::THRESH_BINARY);
-
-    cv::Mat render_bgr = TensorToBgr(render);
-    if (render_bgr.empty())
-        return false;
-    cv::Mat render_gray;
-    cv::cvtColor(render_bgr, render_gray, cv::COLOR_BGR2GRAY);
-    cv::Mat render_mask;
-    cv::threshold(render_gray, render_mask, 3, 255, cv::THRESH_BINARY);
-
-    const int rendered_pixels = cv::countNonZero(render_mask);
-    if (rendered_pixels == 0)
-        return false;
-
-    cv::Mat outside_mask;
-    cv::bitwise_not(matte_mask, outside_mask);
-    cv::Mat outside_render;
-    cv::bitwise_and(render_mask, outside_mask, outside_render);
-    const int outside_pixels = cv::countNonZero(outside_render);
-    const float outside_ratio = static_cast<float>(outside_pixels) / static_cast<float>(rendered_pixels);
-    return outside_ratio <= max_outside_ratio;
-}
-
-bool IsMaskCoverageValidTensor(const torch::Tensor &render, const torch::Tensor &matte_mask,
-                               float max_outside_ratio, float render_threshold)
-{
-    if (!render.defined() || !matte_mask.defined())
-        return false;
-    if (render.dim() != 3 || render.size(0) != 3)
-        return false;
-    if (matte_mask.dim() != 3 || matte_mask.size(0) != 1)
-        return false;
-    if (render.size(1) != matte_mask.size(1) || render.size(2) != matte_mask.size(2))
-        return false;
-
-    auto render_gray = render.mean(0, true);
-    auto render_mask = render_gray > render_threshold;
-    auto matte_bin = matte_mask > 0.5f;
-    auto rendered_pixels = render_mask.sum().item<float>();
-    if (rendered_pixels <= 0.0f)
-        return false;
-    auto outside = render_mask.logical_and(matte_bin.logical_not());
-    auto outside_pixels = outside.sum().item<float>();
-    const float outside_ratio = outside_pixels / rendered_pixels;
-    return outside_ratio <= max_outside_ratio;
-}
+#include "utils/image/MaskUtils.h"
+#include "utils/image/TensorCvUtils.h"
+#include "utils/io/PathUtils.h"
+#include "utils/math/StatsUtils.h"
+#include "utils/render/RenderMathUtils.h"
+#include "utils/train/GaussianDensification.h"
+#include "utils/train/TrainJsonl.h"
+#include "utils/train/TrainTypes.h"
 
 bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
 {
@@ -385,8 +87,32 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->mesh_reg_max_dist = std::stof(value);
             else if (key == "--color-lr")
                 options->color_lr = std::stof(value);
+            else if (key == "--opacity-lr")
+                options->opacity_lr = std::stof(value);
             else if (key == "--sh-degree")
                 options->sh_degree = std::stoi(value);
+            else if (key == "--densify-every")
+                options->densify_every = std::stoi(value);
+            else if (key == "--densify-max")
+                options->densify_max_splits = std::stoi(value);
+            else if (key == "--densify-scale")
+                options->densify_scale_threshold = std::stof(value);
+            else if (key == "--densify-split-scale")
+                options->densify_split_scale = std::stof(value);
+            else if (key == "--densify-split-offset")
+                options->densify_split_offset = std::stof(value);
+            else if (key == "--densify-min-grad")
+                options->densify_min_grad = std::stof(value);
+            else if (key == "--densify-grow-grad")
+                options->densify_grow_grad = std::stof(value);
+            else if (key == "--densify-prune-opacity")
+                options->densify_prune_opacity = std::stof(value);
+            else if (key == "--densify-prune-max")
+                options->densify_prune_max = std::stoi(value);
+            else if (key == "--densify-reset-opacity")
+                options->densify_reset_opacity = std::stof(value);
+            else if (key == "--densify-stop-epoch")
+                options->densify_stop_epoch = std::stoi(value);
             else if (key == "--viewer")
                 options->enable_viewer = true;
             else if (key == "--headless")
@@ -433,265 +159,6 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
         return false;
     }
     return true;
-}
-
-torch::Tensor LoadImageTensor(const cv::Mat &bgr, torch::Device device)
-{
-    cv::Mat rgb;
-    cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
-    cv::Mat float_img;
-    rgb.convertTo(float_img, CV_32F, 1.0 / 255.0);
-    auto tensor = torch::from_blob(
-                      float_img.data,
-                      {float_img.rows, float_img.cols, 3},
-                      torch::kFloat)
-                      .clone();
-    tensor = tensor.permute({2, 0, 1}).contiguous().to(device);
-    return tensor;
-}
-
-torch::Tensor LoadMatteMaskTensor(const cv::Mat &matte, int target_w, int target_h, torch::Device device)
-{
-    if (matte.empty())
-        return torch::Tensor();
-
-    cv::Mat matte_gray;
-    if (matte.channels() == 4)
-    {
-        std::vector<cv::Mat> channels;
-        cv::split(matte, channels);
-        matte_gray = channels[3];
-    }
-    else if (matte.channels() == 3)
-    {
-        cv::cvtColor(matte, matte_gray, cv::COLOR_BGR2GRAY);
-    }
-    else
-    {
-        matte_gray = matte;
-    }
-
-    if (matte_gray.size() != cv::Size(target_w, target_h))
-    {
-        cv::resize(matte_gray, matte_gray, cv::Size(target_w, target_h), 0, 0, cv::INTER_NEAREST);
-    }
-
-    cv::Mat float_mask;
-    matte_gray.convertTo(float_mask, CV_32F, 1.0 / 255.0);
-    auto tensor = torch::from_blob(float_mask.data, {float_mask.rows, float_mask.cols, 1}, torch::kFloat).clone();
-    tensor = tensor.permute({2, 0, 1}).contiguous().to(device);
-    return tensor;
-}
-
-bool SaveImageTensorPng(const std::string &path, const torch::Tensor &image)
-{
-    if (!image.defined())
-        return false;
-    auto img = image.detach().clamp(0.0, 1.0).mul(255.0).to(torch::kU8).cpu();
-    if (img.dim() != 3 || img.size(0) != 3)
-        return false;
-    img = img.permute({1, 2, 0}).contiguous();
-    cv::Mat rgb(img.size(0), img.size(1), CV_8UC3, img.data_ptr<uint8_t>());
-    cv::Mat bgr;
-    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
-    return cv::imwrite(path, bgr);
-}
-
-cv::Mat TensorToBgr(const torch::Tensor &image)
-{
-    if (!image.defined())
-        return cv::Mat();
-    auto img = image.detach().clamp(0.0, 1.0).mul(255.0).to(torch::kU8).cpu();
-    if (img.dim() != 3 || img.size(0) != 3)
-        return cv::Mat();
-    img = img.permute({1, 2, 0}).contiguous();
-    cv::Mat rgb(img.size(0), img.size(1), CV_8UC3, img.data_ptr<uint8_t>());
-    cv::Mat bgr;
-    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
-    return bgr.clone();
-}
-
-std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float focal, int width, int height, torch::Device device)
-{
-    const float n = 0.01f;
-    const float f = 100.0f;
-    const float tan_fovx = (static_cast<float>(width) * 0.5f) / std::max(focal, 1e-6f);
-    const float tan_fovy = (static_cast<float>(height) * 0.5f) / std::max(focal, 1e-6f);
-
-    auto view = torch::eye(4, device);
-    auto proj = torch::zeros({4, 4}, device);
-    proj[0][0] = 1.0f / tan_fovx;
-    proj[1][1] = 1.0f / tan_fovy;
-    proj[2][2] = f / (f - n);
-    proj[2][3] = -(f * n) / (f - n);
-    proj[3][2] = 1.0f;
-
-    return {view.transpose(0, 1).contiguous(), proj.transpose(0, 1).contiguous(), tan_fovx, tan_fovy};
-}
-
-torch::Tensor ComputeTriFrames(const torch::Tensor &A, const torch::Tensor &B, const torch::Tensor &C)
-{
-    auto X = torch::nn::functional::normalize(B - A, torch::nn::functional::NormalizeFuncOptions().dim(1));
-    auto N = torch::cross(B - A, C - A, 1);
-    N = torch::nn::functional::normalize(N, torch::nn::functional::NormalizeFuncOptions().dim(1));
-    auto Y = torch::cross(N, X, 1);
-    return torch::stack({X, Y, N}, 2);
-}
-
-torch::Tensor MatrixToQuat(const torch::Tensor &rot_mat)
-{
-    using torch::indexing::Slice;
-    auto m00 = rot_mat.index({Slice(), 0, 0});
-    auto m11 = rot_mat.index({Slice(), 1, 1});
-    auto m22 = rot_mat.index({Slice(), 2, 2});
-    auto tr = m00 + m11 + m22;
-
-    const auto num = rot_mat.size(0);
-    auto q = torch::zeros({num, 4}, rot_mat.options());
-
-    auto mask1 = tr > 0;
-    if (mask1.any().item<bool>())
-    {
-        auto S = torch::sqrt(torch::clamp_min(tr.index({mask1}) + 1.0f, 0.0f)) * 2.0f;
-        q.index_put_({mask1, 0}, 0.25f * S);
-        q.index_put_({mask1, 1}, (rot_mat.index({mask1, 2, 1}) - rot_mat.index({mask1, 1, 2})) / S);
-        q.index_put_({mask1, 2}, (rot_mat.index({mask1, 0, 2}) - rot_mat.index({mask1, 2, 0})) / S);
-        q.index_put_({mask1, 3}, (rot_mat.index({mask1, 1, 0}) - rot_mat.index({mask1, 0, 1})) / S);
-    }
-
-    auto mask2 = (~mask1) & (m00 > m11) & (m00 > m22);
-    if (mask2.any().item<bool>())
-    {
-        auto S = torch::sqrt(torch::clamp_min(1.0f + m00.index({mask2}) - m11.index({mask2}) - m22.index({mask2}),
-                                              0.0f)) *
-                 2.0f;
-        q.index_put_({mask2, 0}, (rot_mat.index({mask2, 2, 1}) - rot_mat.index({mask2, 1, 2})) / S);
-        q.index_put_({mask2, 1}, 0.25f * S);
-        q.index_put_({mask2, 2}, (rot_mat.index({mask2, 0, 1}) + rot_mat.index({mask2, 1, 0})) / S);
-        q.index_put_({mask2, 3}, (rot_mat.index({mask2, 0, 2}) + rot_mat.index({mask2, 2, 0})) / S);
-    }
-
-    auto mask3 = (~mask1) & (~mask2) & (m11 > m22);
-    if (mask3.any().item<bool>())
-    {
-        auto S = torch::sqrt(torch::clamp_min(1.0f + m11.index({mask3}) - m00.index({mask3}) - m22.index({mask3}),
-                                              0.0f)) *
-                 2.0f;
-        q.index_put_({mask3, 0}, (rot_mat.index({mask3, 0, 2}) - rot_mat.index({mask3, 2, 0})) / S);
-        q.index_put_({mask3, 1}, (rot_mat.index({mask3, 0, 1}) + rot_mat.index({mask3, 1, 0})) / S);
-        q.index_put_({mask3, 2}, 0.25f * S);
-        q.index_put_({mask3, 3}, (rot_mat.index({mask3, 1, 2}) + rot_mat.index({mask3, 2, 1})) / S);
-    }
-
-    auto mask4 = (~mask1) & (~mask2) & (~mask3);
-    if (mask4.any().item<bool>())
-    {
-        auto S = torch::sqrt(torch::clamp_min(1.0f + m22.index({mask4}) - m00.index({mask4}) - m11.index({mask4}),
-                                              0.0f)) *
-                 2.0f;
-        q.index_put_({mask4, 0}, (rot_mat.index({mask4, 1, 0}) - rot_mat.index({mask4, 0, 1})) / S);
-        q.index_put_({mask4, 1}, (rot_mat.index({mask4, 0, 2}) + rot_mat.index({mask4, 2, 0})) / S);
-        q.index_put_({mask4, 2}, (rot_mat.index({mask4, 1, 2}) + rot_mat.index({mask4, 2, 1})) / S);
-        q.index_put_({mask4, 3}, 0.25f * S);
-    }
-
-    return torch::nn::functional::normalize(q, torch::nn::functional::NormalizeFuncOptions().dim(1));
-}
-
-torch::Tensor QuatMultiply(const torch::Tensor &p, const torch::Tensor &q)
-{
-    auto pw = p.select(1, 0);
-    auto px = p.select(1, 1);
-    auto py = p.select(1, 2);
-    auto pz = p.select(1, 3);
-    auto qw = q.select(1, 0);
-    auto qx = q.select(1, 1);
-    auto qy = q.select(1, 2);
-    auto qz = q.select(1, 3);
-
-    auto w = pw * qw - px * qx - py * qy - pz * qz;
-    auto x = pw * qx + px * qw + py * qz - pz * qy;
-    auto y = pw * qy - px * qz + py * qw + pz * qx;
-    auto z = pw * qz + px * qy - py * qx + pz * qw;
-
-    return torch::stack({w, x, y, z}, 1);
-}
-
-torch::Tensor QuatToMat3(const torch::Tensor &q, torch::Device device)
-{
-    auto qn = torch::nn::functional::normalize(q, torch::nn::functional::NormalizeFuncOptions().dim(1));
-    auto w = qn.select(1, 0);
-    auto x = qn.select(1, 1);
-    auto y = qn.select(1, 2);
-    auto z = qn.select(1, 3);
-
-    auto ww = w * w;
-    auto xx = x * x;
-    auto yy = y * y;
-    auto zz = z * z;
-    auto wx = w * x;
-    auto wy = w * y;
-    auto wz = w * z;
-    auto xy = x * y;
-    auto xz = x * z;
-    auto yz = y * z;
-
-    auto m00 = ww + xx - yy - zz;
-    auto m01 = 2.0f * (xy - wz);
-    auto m02 = 2.0f * (xz + wy);
-    auto m10 = 2.0f * (xy + wz);
-    auto m11 = ww - xx + yy - zz;
-    auto m12 = 2.0f * (yz - wx);
-    auto m20 = 2.0f * (xz - wy);
-    auto m21 = 2.0f * (yz + wx);
-    auto m22 = ww - xx - yy + zz;
-
-    auto row0 = torch::stack({m00, m01, m02}, 1);
-    auto row1 = torch::stack({m10, m11, m12}, 1);
-    auto row2 = torch::stack({m20, m21, m22}, 1);
-    return torch::stack({row0, row1, row2}, 1).to(device);
-}
-
-torch::Tensor RotateSH(const torch::Tensor &sh, const torch::Tensor &rotations)
-{
-    if (!sh.defined() || sh.dim() < 3 || sh.size(1) < 4)
-        return sh;
-
-    // 1. CRITICAL FIX: Normalize rotations to ensure valid rotation matrix
-    auto rots_norm = torch::nn::functional::normalize(rotations, 
-        torch::nn::functional::NormalizeFuncOptions().dim(1));
-
-    // 2. Generate Rotation Matrix from unit quaternions
-    auto rot_mats = QuatToMat3(rots_norm, sh.device());
-
-    using torch::indexing::Slice;
-    
-    // 3. Extract Y, Z, X bands (Standard 3DGS order: 1=Y, 2=Z, 3=X)
-    auto sh_d1 = sh.index({Slice(), Slice(1, 4), Slice()});
-    auto sh_y = sh_d1.index({Slice(), 0, Slice()});
-    auto sh_z = sh_d1.index({Slice(), 1, Slice()});
-    auto sh_x = sh_d1.index({Slice(), 2, Slice()});
-
-    // 4. Construct vector in (X, Y, Z) order to match Rotation Matrix
-    auto sh_vec = torch::stack({sh_x, sh_y, sh_z}, 1);
-
-    // 5. Apply Rotation (R * [x, y, z]^T)
-    auto rotated_vec = torch::bmm(rot_mats, sh_vec);
-
-    auto out_sh = sh.clone();
-
-    // 6. Unpack back to SH order: 1->Y, 2->Z, 3->X
-    // rotated_vec indices: 0->X', 1->Y', 2->Z'
-    out_sh.index_put_({Slice(), 1, Slice()}, rotated_vec.index({Slice(), 1, Slice()})); // Y gets Y'
-    out_sh.index_put_({Slice(), 2, Slice()}, rotated_vec.index({Slice(), 2, Slice()})); // Z gets Z' 
-    out_sh.index_put_({Slice(), 3, Slice()}, -rotated_vec.index({Slice(), 0, Slice()})); // -X -> X (Inverted)
-    // Zero out higher degrees (if any) as they aren't rotated here
-    if (sh.size(1) > 4)
-    {
-        out_sh.index_put_({Slice(), Slice(4, torch::indexing::None), Slice()}, 0.0f);
-    }
-
-    return out_sh;
 }
 
 torch::Tensor CropRenderToTarget(const torch::Tensor &full_render, int crop_w, int crop_h,
@@ -954,8 +421,14 @@ int main(int argc, char *argv[])
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
                      " [--scale-reg <float>] [--scale-max-reg <float>] [--scale-max <float>]"
                      " [--offset-reg <float>] [--mesh-reg <float>]"
-                     " [--mesh-max-dist <float>] [--color-lr <float>]"
+                     " [--mesh-max-dist <float>] [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
+                     " [--densify-every <int>] [--densify-max <int>] [--densify-scale <float>]"
+                     " [--densify-split-scale <float>] [--densify-split-offset <float>]"
+                     " [--densify-min-grad <float>] [--densify-grow-grad <float>]"
+                     " [--densify-prune-opacity <float>]"
+                     " [--densify-prune-max <int>] [--densify-reset-opacity <float>]"
+                     " [--densify-stop-epoch <int>]"
                      " [--viewer|--headless] [--viewer-width <int>] [--viewer-height <int>]"
                      " [--viewer-every <int>] [--viewer-shm <name>]\n";
         return -1;
@@ -984,8 +457,10 @@ int main(int argc, char *argv[])
     const float mesh_reg_weight = options.mesh_reg_weight;
     const float mesh_reg_max_dist = options.mesh_reg_max_dist;
     const float color_lr = options.color_lr;
+    const float opacity_lr = (options.opacity_lr < 0.0f) ? lr : options.opacity_lr;
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
+    const int densify_every = std::max(1, options.densify_every);
     const float pose_lr = 1e-4f;
     const float outside_mask_weight = 0.1f;
     const float render_scale_modifier = 0.000001f;
@@ -1113,17 +588,37 @@ int main(int argc, char *argv[])
     std::vector<float> shared_buffer;
     uint64_t shared_frame = 0;
 
+    DensificationConfig densify_cfg;
+    densify_cfg.every = densify_every;
+    densify_cfg.max_splits = std::max(0, options.densify_max_splits);
+    densify_cfg.scale_threshold = (options.densify_scale_threshold > 0.0f)
+                                      ? options.densify_scale_threshold
+                                      : scale_max_value;
+    densify_cfg.split_scale_factor = options.densify_split_scale;
+    densify_cfg.split_offset_scale = options.densify_split_offset;
+    densify_cfg.min_grad_norm = options.densify_min_grad;
+    densify_cfg.grow_grad_threshold = options.densify_grow_grad;
+    densify_cfg.prune_opacity_threshold = options.densify_prune_opacity;
+    densify_cfg.prune_max = std::max(0, options.densify_prune_max);
+    densify_cfg.reset_opacity = options.densify_reset_opacity;
+    const int densify_stop_epoch = options.densify_stop_epoch;
+    DensificationState densify_state;
+    int64_t global_step = 0;
+
     std::vector<torch::Tensor> base_params = {
         avatar.g_scales,
         avatar.g_rots,
-        avatar.g_opacities,
         avatar.g_offsets};
     std::vector<torch::Tensor> color_params = {use_sh ? avatar.g_sh : avatar.g_colors};
+    std::vector<torch::Tensor> opacity_params = {avatar.g_opacities};
     std::vector<torch::Tensor> pose_params = {pose_offsets};
     torch::optim::Adam optimizer(base_params, torch::optim::AdamOptions(lr));
     optimizer.add_param_group({color_params});
     auto &color_group = optimizer.param_groups().back();
     static_cast<torch::optim::AdamOptions &>(color_group.options()).lr(color_lr);
+    optimizer.add_param_group({opacity_params});
+    auto &opacity_group = optimizer.param_groups().back();
+    static_cast<torch::optim::AdamOptions &>(opacity_group.options()).lr(opacity_lr);
     optimizer.add_param_group({pose_params});
     auto &pose_group = optimizer.param_groups().back();
     static_cast<torch::optim::AdamOptions &>(pose_group.options()).lr(pose_lr);
@@ -1336,21 +831,37 @@ int main(int argc, char *argv[])
             auto loss = recon_loss + scale_reg_weight * scale_reg + offset_reg_weight * offset_reg +
                         mesh_reg_weight * mesh_reg + scale_max_reg_weight * scale_max_reg;
             loss.backward();
+            densify_state.Accumulate(avatar.g_offsets, avatar.g_scales);
             optimizer.step();
+            global_step++;
 
-            if (use_sh && (batch_step % 10 == 0))
+            if (epoch < densify_stop_epoch &&
+                densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
+                (global_step % densify_cfg.every) == 0)
             {
-                auto sh_abs_mean = avatar.g_sh.abs().mean().item<float>();
-                auto sh_std = avatar.g_sh.std().item<float>();
-                auto sh_min = avatar.g_sh.min().item<float>();
-                auto sh_max = avatar.g_sh.max().item<float>();
-                std::cout << "SH stats batch " << batch_step
-                          << " abs_mean=" << sh_abs_mean
-                          << " std=" << sh_std
-                          << " min=" << sh_min
-                          << " max=" << sh_max
-                          << std::endl;
+                auto stats = DensifyGaussians(avatar.g_scales,
+                                              avatar.g_rots,
+                                              avatar.g_opacities,
+                                              avatar.g_colors,
+                                              avatar.g_offsets,
+                                              avatar.g_sh,
+                                              avatar.g_bary_coords,
+                                              avatar.g_face_indices,
+                                              render_scale_modifier,
+                                              densify_cfg,
+                                              &densify_state);
+                if (stats.splits > 0)
+                {
+                    std::cout << "Densify step " << global_step
+                              << ": split " << stats.splits << " gaussians." << std::endl;
+                }
+                if (stats.pruned > 0)
+                {
+                    std::cout << "Densify step " << global_step
+                              << ": pruned " << stats.pruned << " gaussians." << std::endl;
+                }
             }
+ 
 
             if (best_inlier_idx >= 0)
             {
@@ -1362,18 +873,7 @@ int main(int argc, char *argv[])
                     const auto &sample = batch_samples[sample_idx];
                     const int H = static_cast<int>(last_render.size(1));
                     const int W = static_cast<int>(last_render.size(2));
-                    std::cout << "Debug batch " << batch_step
-                              << " img_w=" << sample.img_w << " img_h=" << sample.img_h
-                              << " crop_w=" << W << " crop_h=" << H
-                              << " crop_cx=" << sample.crop_cx << " crop_cy=" << sample.crop_cy
-                              << " crop_size=" << sample.crop_size
-                              << " focal=" << sample.focal_length
-                              << " f_render=" << sample.focal_length
-                              << " y_sign=" << sample.y_sign
-                              << " skipped_malformed=" << skipped_malformed
-                              << " skipped_mask=" << skipped_mask
-                              << " skipped_outlier=" << skipped_outlier
-                              << std::endl;
+                    
 
                     cv::Mat render_bgr = TensorToBgr(last_render);
                     if (!render_bgr.empty())
@@ -1386,19 +886,8 @@ int main(int argc, char *argv[])
                         cv::Mat side_by_side;
                         cv::hconcat(target_bgr, render_bgr, side_by_side);
                         const auto &sample = batch_samples[sample_idx];
-                        const std::string label = "frame=" + std::to_string(sample.frame) +
-                                                  " loss=" + std::to_string(best_inlier_loss);
-                        const int left_x = 10;
-                        const int right_x = target_bgr.cols + 10;
-                        const int y = 30;
-                        cv::putText(side_by_side, label, cv::Point(left_x, y),
-                                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-                        cv::putText(side_by_side, label, cv::Point(left_x, y),
-                                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-                        cv::putText(side_by_side, label, cv::Point(right_x, y),
-                                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-                        cv::putText(side_by_side, label, cv::Point(right_x, y),
-                                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+                         
+                        
                         std::filesystem::path pair_path = out_dir_path /
                                                           ("pair_e" + std::to_string(epoch) + "_b" + std::to_string(batch_step) + ".png");
                         cv::imwrite(pair_path.string(), side_by_side);

@@ -84,6 +84,13 @@ add_subdirectory(third_party/diff-gaussian-rasterization)
 add_executable(smpl_test
     main.cpp
     utils/HmrMathHelpers.cpp
+    utils/image/MaskUtils.cpp
+    utils/image/TensorCvUtils.cpp
+    utils/io/PathUtils.cpp
+    utils/math/StatsUtils.cpp
+    utils/render/RenderMathUtils.cpp
+    utils/train/TrainJsonl.cpp
+    utils/train/GaussianDensification.cpp
 )
 
 target_link_libraries(smpl_test 
@@ -92,6 +99,7 @@ target_link_libraries(smpl_test
     GaussianRasterizer
     ${OpenCV_LIBS}
 )
+target_include_directories(smpl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(ENABLE_VIEWER)
     target_compile_definitions(smpl_test PRIVATE GAUSS_VIEWER)
     target_link_libraries(smpl_test PRIVATE OpenGL::GL glfw)
@@ -104,8 +112,10 @@ target_compile_definitions(smpl_test PRIVATE NOMINMAX)
 if(ENABLE_VIEWER)
     add_executable(gaussian_viewer
         gaussian_viewer.cpp
+        utils/viewer/ViewerMath.cpp
     )
     target_link_libraries(gaussian_viewer PRIVATE OpenGL::GL glfw "${TORCH_LIBRARIES}" GaussianRasterizer)
+    target_include_directories(gaussian_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(gaussian_viewer PRIVATE NOMINMAX)
 endif()
 
@@ -123,6 +133,7 @@ add_executable(hmr_inference
     utils/YoloPersonDetector.cpp
     utils/ModNetMatte.cpp
 )
+target_include_directories(hmr_inference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(MSVC)
     target_link_libraries(hmr_inference 
