@@ -92,10 +92,10 @@ Vec3 ComputeColorFromSH(int degree, const float *sh, const Vec3 &pos, const Vec3
     {
         const float x = dir.x;
         const float y = dir.y;
-        const float z = dir.z;
-        result = AddScaled(result, LoadCoeff(sh, 1), -kShC1 * y);
-        result = AddScaled(result, LoadCoeff(sh, 2), kShC1 * z);
-        result = AddScaled(result, LoadCoeff(sh, 3), -kShC1 * x);
+        const float z = dir.z; 
+        result = AddScaled(result, LoadCoeff(sh, 1), kShC1 * y);  
+        result = AddScaled(result, LoadCoeff(sh, 2), kShC1 * z); 
+        result = AddScaled(result, LoadCoeff(sh, 3), kShC1 * x);
 
         if (degree > 1)
         {

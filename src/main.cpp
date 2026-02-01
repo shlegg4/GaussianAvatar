@@ -657,21 +657,41 @@ torch::Tensor RotateSH(const torch::Tensor &sh, const torch::Tensor &rotations)
     if (!sh.defined() || sh.dim() < 3 || sh.size(1) < 4)
         return sh;
 
-    auto rot_mats = QuatToMat3(rotations, sh.device());
+    // 1. CRITICAL FIX: Normalize rotations to ensure valid rotation matrix
+    auto rots_norm = torch::nn::functional::normalize(rotations, 
+        torch::nn::functional::NormalizeFuncOptions().dim(1));
+
+    // 2. Generate Rotation Matrix from unit quaternions
+    auto rot_mats = QuatToMat3(rots_norm, sh.device());
 
     using torch::indexing::Slice;
-    auto sh_d1 = sh.index({Slice(), Slice(1, 4), Slice()}).clone();
-    auto sh_x = sh_d1.index({Slice(), 2, Slice()});
+    
+    // 3. Extract Y, Z, X bands (Standard 3DGS order: 1=Y, 2=Z, 3=X)
+    auto sh_d1 = sh.index({Slice(), Slice(1, 4), Slice()});
     auto sh_y = sh_d1.index({Slice(), 0, Slice()});
     auto sh_z = sh_d1.index({Slice(), 1, Slice()});
+    auto sh_x = sh_d1.index({Slice(), 2, Slice()});
+
+    // 4. Construct vector in (X, Y, Z) order to match Rotation Matrix
     auto sh_vec = torch::stack({sh_x, sh_y, sh_z}, 1);
 
+    // 5. Apply Rotation (R * [x, y, z]^T)
     auto rotated_vec = torch::bmm(rot_mats, sh_vec);
 
     auto out_sh = sh.clone();
-    out_sh.index_put_({Slice(), 1, Slice()}, rotated_vec.index({Slice(), 1, Slice()}));
-    out_sh.index_put_({Slice(), 2, Slice()}, rotated_vec.index({Slice(), 2, Slice()}));
-    out_sh.index_put_({Slice(), 3, Slice()}, rotated_vec.index({Slice(), 0, Slice()}));
+
+    // 6. Unpack back to SH order: 1->Y, 2->Z, 3->X
+    // rotated_vec indices: 0->X', 1->Y', 2->Z'
+    out_sh.index_put_({Slice(), 1, Slice()}, rotated_vec.index({Slice(), 1, Slice()})); // Y gets Y'
+    out_sh.index_put_({Slice(), 2, Slice()}, rotated_vec.index({Slice(), 2, Slice()})); // Z gets Z'
+    out_sh.index_put_({Slice(), 3, Slice()}, rotated_vec.index({Slice(), 0, Slice()})); // X gets X'
+
+    // Zero out higher degrees (if any) as they aren't rotated here
+    if (sh.size(1) > 4)
+    {
+        out_sh.index_put_({Slice(), Slice(4, torch::indexing::None), Slice()}, 0.0f);
+    }
+
     return out_sh;
 }
 
@@ -868,7 +888,7 @@ struct GaussianAvatar : torch::nn::Module
         if (sh_degree > 0)
         {
             const int sh_coeffs = (sh_degree + 1) * (sh_degree + 1);
-            g_sh = torch::zeros({num_gaussians, sh_coeffs, 3}, torch::requires_grad().device(device)); 
+            g_sh = torch::zeros({num_gaussians, sh_coeffs, 3}, torch::requires_grad().device(device));
         }
         else
         {
@@ -1319,6 +1339,20 @@ int main(int argc, char *argv[])
             loss.backward();
             optimizer.step();
 
+            if (use_sh && (batch_step % 10 == 0))
+            {
+                auto sh_abs_mean = avatar.g_sh.abs().mean().item<float>();
+                auto sh_std = avatar.g_sh.std().item<float>();
+                auto sh_min = avatar.g_sh.min().item<float>();
+                auto sh_max = avatar.g_sh.max().item<float>();
+                std::cout << "SH stats batch " << batch_step
+                          << " abs_mean=" << sh_abs_mean
+                          << " std=" << sh_std
+                          << " min=" << sh_min
+                          << " max=" << sh_max
+                          << std::endl;
+            }
+
             if (best_inlier_idx >= 0)
             {
                 const size_t sample_idx = static_cast<size_t>(best_inlier_idx);
@@ -1426,4 +1460,4 @@ int main(int argc, char *argv[])
     }
 
     return 0;
-} 
+}
