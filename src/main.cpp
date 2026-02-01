@@ -91,6 +91,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->mesh_reg_max_dist = std::stof(value);
             else if (key == "--alpha-loss")
                 options->alpha_loss_weight = std::stof(value);
+            else if (key == "--opacity-binarize")
+                options->opacity_binarize_weight = std::stof(value);
             else if (key == "--color-lr")
                 options->color_lr = std::stof(value);
             else if (key == "--opacity-lr")
@@ -420,7 +422,8 @@ int main(int argc, char *argv[])
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
                      " [--scale-reg <float>] [--scale-max-reg <float>] [--scale-max <float>]"
                      " [--offset-reg <float>] [--mesh-reg <float>]"
-                     " [--mesh-max-dist <float>] [--alpha-loss <float>] [--color-lr <float>] [--opacity-lr <float>]"
+                     " [--mesh-max-dist <float>] [--alpha-loss <float>] [--opacity-binarize <float>]"
+                     " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
                      " [--densify-every <int>] [--densify-max <int>] [--densify-scale <float>]"
                      " [--densify-split-scale <float>] [--densify-split-offset <float>]"
@@ -455,12 +458,13 @@ int main(int argc, char *argv[])
     const float offset_reg_weight = options.offset_reg_weight;
     const float mesh_reg_weight = options.mesh_reg_weight;
     const float mesh_reg_max_dist = options.mesh_reg_max_dist;
+    const float opacity_binarize_weight = options.opacity_binarize_weight;
     const float color_lr = options.color_lr;
     const float opacity_lr = (options.opacity_lr < 0.0f) ? lr : options.opacity_lr;
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
     const int densify_every = std::max(1, options.densify_every);
-    const float pose_lr = 1e-5f;
+    const float pose_lr = 1e-3f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
     const float render_scale_modifier = 1.0f;
@@ -740,7 +744,16 @@ int main(int argc, char *argv[])
                 torch::Tensor proj_mat;
                 float tan_fovx = 0.0f;
                 float tan_fovy = 0.0f;
-                std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) = BuildProjection(f_render, full_w, full_h, device);
+                const int render_w = W;
+                const int render_h = H;
+                const float full_cx = static_cast<float>(full_w) * 0.5f;
+                const float full_cy = static_cast<float>(full_h) * 0.5f;
+                const float x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
+                const float y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
+                const float cx_crop = full_cx - x0;
+                const float cy_crop = full_cy - y0;
+                std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) =
+                    BuildProjection(f_render, render_w, render_h, cx_crop, cy_crop, device);
 
                 auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.g_colors;
                 auto outputs = GaussianRasterizer::apply(
@@ -754,16 +767,14 @@ int main(int argc, char *argv[])
                     proj_mat,
                     tan_fovx,
                     tan_fovy,
-                    full_h,
-                    full_w,
+                    render_h,
+                    render_w,
                     current_sh,
                     use_sh ? sh_degree : 0,
                     cam_pos,
                     false);
-                auto image_full = outputs[0];
-                auto alpha_full = outputs[1];
-                auto image = CropRenderToTarget(image_full, W, H, sample.crop_cx, sample.crop_cy);
-                auto alpha = CropRenderToTarget(alpha_full, W, H, sample.crop_cx, sample.crop_cy);
+                auto image = outputs[0];
+                auto alpha = outputs[1];
                 if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
                     image.size(1) != H || image.size(2) != W ||
                     !alpha.defined() || alpha.dim() != 3 || alpha.size(0) != 1 ||
@@ -780,9 +791,9 @@ int main(int argc, char *argv[])
 
                 auto outside_mask = 1.0f - cached_entry.matte_mask;
                 auto outside_loss = torch::mean(image * outside_mask);
-                auto alpha_loss = torch::mse_loss(alpha, cached_entry.matte_mask);
+                auto alpha_loss = torch::l1_loss(alpha, cached_entry.matte_mask);
 
-                auto recon_loss = torch::mse_loss(image, target);
+                auto recon_loss = torch::l1_loss(image, target);
                 auto loss_value = recon_loss.item<float>();
                 auto outside_value = outside_loss.item<float>();
                 auto alpha_value = alpha_loss.item<float>();
@@ -868,11 +879,10 @@ int main(int argc, char *argv[])
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
             auto scale_vals = torch::exp(avatar.g_scales) * render_scale_modifier;
             auto scale_reg = torch::mean(scale_vals.pow(2));
-            auto offset_reg = torch::mean(avatar.g_offsets.pow(2));
-            auto offset_norm = torch::sqrt(avatar.g_offsets.pow(2).sum(1) + 1e-12f);
-            auto mesh_reg = torch::mean(torch::relu(offset_norm - mesh_reg_max_dist).pow(2));
-            auto loss = recon_loss + offset_reg_weight * offset_reg + scale_reg_weight * scale_reg +
-                        mesh_reg_weight * mesh_reg;
+            auto offset_reg = torch::mean(avatar.g_offsets.pow(2)); 
+            auto opacity_clamped = avatar.g_opacities.clamp(0.0f, 1.0f);
+            auto opacity_binarize = torch::mean(opacity_clamped * (1.0f - opacity_clamped));
+            auto loss = recon_loss + offset_reg_weight * offset_reg + scale_reg_weight * scale_reg;
             loss.backward();
             densify_state.Accumulate(avatar.g_offsets, avatar.g_scales);
             optimizer.step();
@@ -1023,7 +1033,16 @@ int main(int argc, char *argv[])
             torch::Tensor proj_mat;
             float tan_fovx = 0.0f;
             float tan_fovy = 0.0f;
-            std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) = BuildProjection(f_render, full_w, full_h, device);
+            const int render_w = W;
+            const int render_h = H;
+            const float full_cx = static_cast<float>(full_w) * 0.5f;
+            const float full_cy = static_cast<float>(full_h) * 0.5f;
+            const float x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
+            const float y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
+            const float cx_crop = full_cx - x0;
+            const float cy_crop = full_cy - y0;
+            std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) =
+                BuildProjection(f_render, render_w, render_h, cx_crop, cy_crop, device);
 
             auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.g_colors;
             auto outputs = GaussianRasterizer::apply(
@@ -1037,15 +1056,13 @@ int main(int argc, char *argv[])
                 proj_mat,
                 tan_fovx,
                 tan_fovy,
-                full_h,
-                full_w,
+                render_h,
+                render_w,
                 current_sh,
                 use_sh ? sh_degree : 0,
                 cam_pos,
                 false);
-
-            auto image_full = outputs[0];
-            auto image = CropRenderToTarget(image_full, W, H, sample.crop_cx, sample.crop_cy);
+            auto image = outputs[0];
             if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
                 image.size(1) != H || image.size(2) != W)
             {

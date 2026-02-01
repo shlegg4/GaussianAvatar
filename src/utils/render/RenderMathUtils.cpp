@@ -21,6 +21,27 @@ std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float foc
     return {view.transpose(0, 1).contiguous(), proj.transpose(0, 1).contiguous(), tan_fovx, tan_fovy};
 }
 
+std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float focal, int width, int height,
+                                                                       float cx, float cy, torch::Device device)
+{
+    const float n = 0.01f;
+    const float f = 100.0f;
+    const float tan_fovx = (static_cast<float>(width) * 0.5f) / std::max(focal, 1e-6f);
+    const float tan_fovy = (static_cast<float>(height) * 0.5f) / std::max(focal, 1e-6f);
+
+    auto view = torch::eye(4, device);
+    auto proj = torch::zeros({4, 4}, device);
+    proj[0][0] = 1.0f / tan_fovx;
+    proj[1][1] = 1.0f / tan_fovy;
+    proj[0][2] = (2.0f * cx - static_cast<float>(width)) / std::max(static_cast<float>(width), 1e-6f);
+    proj[1][2] = (2.0f * cy - static_cast<float>(height)) / std::max(static_cast<float>(height), 1e-6f);
+    proj[2][2] = f / (f - n);
+    proj[2][3] = -(f * n) / (f - n);
+    proj[3][2] = 1.0f;
+
+    return {view.transpose(0, 1).contiguous(), proj.transpose(0, 1).contiguous(), tan_fovx, tan_fovy};
+}
+
 torch::Tensor ComputeTriFrames(const torch::Tensor &A, const torch::Tensor &B, const torch::Tensor &C)
 {
     auto X = torch::nn::functional::normalize(B - A, torch::nn::functional::NormalizeFuncOptions().dim(1));

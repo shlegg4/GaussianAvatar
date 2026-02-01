@@ -35,6 +35,7 @@ struct TrainOptions
     float mesh_reg_weight = 0.1f;
     float mesh_reg_max_dist = 0.02f;
     float alpha_loss_weight = 0.1f;
+    float opacity_binarize_weight = 0.0f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;
     int sh_degree = 3;
