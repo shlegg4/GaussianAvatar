@@ -89,6 +89,7 @@ add_executable(smpl_test
     utils/io/PathUtils.cpp
     utils/math/StatsUtils.cpp
     utils/render/RenderMathUtils.cpp
+    utils/train/TrainImageSaver.cpp
     utils/train/TrainJsonl.cpp
     utils/train/GaussianDensification.cpp
 )
