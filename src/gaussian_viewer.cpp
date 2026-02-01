@@ -203,6 +203,7 @@ int main(int argc, char **argv)
     bool randomize_colors = false;
     torch::Tensor random_colors;
     int64_t random_colors_count = 0;
+    float render_scale_modifier = 1.0f;
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
@@ -254,6 +255,7 @@ int main(int argc, char **argv)
             if (const auto *header = reader.Header())
             {
                 sh_degree = header->sh_degree;
+                render_scale_modifier = header->render_scale_modifier;
             }
             uint64_t version = 0;
             uint64_t frame = 0;
@@ -423,7 +425,7 @@ int main(int argc, char **argv)
             }
             scale_modifier *= options.point_size;
 
-            auto image = GaussianRasterizer::apply(
+            auto outputs = GaussianRasterizer::apply(
                 means3D,
                 colors,
                 opacities,
@@ -440,6 +442,7 @@ int main(int argc, char **argv)
                 use_sh ? static_cast<int>(sh_degree) : 0,
                 cam_pos,
                 false);
+            auto image = outputs[0];
 
             auto img = image.detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kU8).cpu();
             img = img.permute({1, 2, 0}).contiguous();

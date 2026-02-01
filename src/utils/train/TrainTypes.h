@@ -28,6 +28,7 @@ struct TrainOptions
     float lr = 0.01f;
     std::string output_dir = "outputs";
     float scale_reg_weight = 0.001f;
+    float scale_lr = -1.0f;
     float scale_max_reg_weight = 0.1f;
     float scale_max_value = 0.02f;
     float offset_reg_weight = 0.01f;

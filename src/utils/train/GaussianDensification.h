@@ -33,14 +33,14 @@ struct DensifyStats
     int64_t pruned = 0;
 };
 
-DensifyStats DensifyGaussians(torch::Tensor g_scales,
-                              torch::Tensor g_rots,
-                              torch::Tensor g_opacities,
-                              torch::Tensor g_colors,
-                              torch::Tensor g_offsets,
-                              torch::Tensor g_sh,
-                              torch::Tensor g_bary_coords,
-                              torch::Tensor g_face_indices,
+DensifyStats DensifyGaussians(torch::Tensor &g_scales,
+                              torch::Tensor &g_rots,
+                              torch::Tensor &g_opacities,
+                              torch::Tensor &g_colors,
+                              torch::Tensor &g_offsets,
+                              torch::Tensor &g_sh,
+                              torch::Tensor &g_bary_coords,
+                              torch::Tensor &g_face_indices,
                               float render_scale_modifier,
                               const DensificationConfig &cfg,
                               DensificationState *state);

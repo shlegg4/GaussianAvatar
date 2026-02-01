@@ -61,7 +61,7 @@ RasterizeGaussiansBackwardCUDA(
 
 class GaussianRasterizer : public torch::autograd::Function<GaussianRasterizer> {
 public:
-    static torch::Tensor forward(
+    static torch::autograd::variable_list forward(
         torch::autograd::AutogradContext *ctx,
         const torch::Tensor& means3D,
         const torch::Tensor& colors,
@@ -115,11 +115,14 @@ public:
         ctx->saved_data["debug"] = debug;
         ctx->saved_data["R"] = num_rendered;
 
-        return out_color;
+        return {out_color, out_alpha};
     }
 
     static torch::autograd::variable_list backward(torch::autograd::AutogradContext *ctx, torch::autograd::variable_list grad_outputs) {
-        auto dL_dout_color = grad_outputs[0]; 
+        auto dL_dout_color = grad_outputs[0];
+        torch::Tensor dL_dout_alpha;
+        if (grad_outputs.size() > 1 && grad_outputs[1].defined())
+            dL_dout_alpha = grad_outputs[1];
 
         auto saved = ctx->get_saved_variables();
         
@@ -147,7 +150,8 @@ public:
         int R = ctx->saved_data["R"].toInt();
 
         auto dL_dout_depth = torch::zeros_like(out_depth);
-        auto dL_dout_alpha = torch::zeros_like(alpha);
+        if (!dL_dout_alpha.defined())
+            dL_dout_alpha = torch::zeros_like(alpha);
  
         int H = out_depth.size(1);
         int W = out_depth.size(2);

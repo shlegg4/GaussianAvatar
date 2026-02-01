@@ -75,6 +75,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->output_dir = value;
             else if (key == "--scale-reg")
                 options->scale_reg_weight = std::stof(value);
+            else if (key == "--scale-lr")
+                options->scale_lr = std::stof(value);
             else if (key == "--scale-max-reg")
                 options->scale_max_reg_weight = std::stof(value);
             else if (key == "--scale-max")
@@ -168,7 +170,8 @@ torch::Tensor CropRenderToTarget(const torch::Tensor &full_render, int crop_w, i
     {
         return torch::Tensor();
     }
-    auto output = torch::zeros({3, crop_h, crop_w}, full_render.options());
+    const int channels = static_cast<int>(full_render.size(0));
+    auto output = torch::zeros({channels, crop_h, crop_w}, full_render.options());
 
     const int full_h = static_cast<int>(full_render.size(1));
     const int full_w = static_cast<int>(full_render.size(2));
@@ -316,7 +319,7 @@ struct GaussianAvatar : torch::nn::Module
         auto ab = face_b - face_a;
         auto ac = face_c - face_a;
         auto cross = torch::cross(ab, ac, 1);
-        auto face_area = 0.5f * torch::norm(cross, 2, 1);
+        auto face_area = 0.5f * torch::norm(cross, 2, 1) * 0.01f;
         auto face_prob = face_area + 1e-12f;
         face_prob = face_prob / face_prob.sum();
         g_face_indices = torch::multinomial(face_prob, num_gaussians, true);
@@ -451,7 +454,7 @@ int main(int argc, char *argv[])
     const float lr = options.lr;
     const std::string &output_dir = options.output_dir;
     const float scale_reg_weight = options.scale_reg_weight;
-    const float scale_max_reg_weight = options.scale_max_reg_weight;
+    const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
     const float scale_max_value = options.scale_max_value;
     const float offset_reg_weight = options.offset_reg_weight;
     const float mesh_reg_weight = options.mesh_reg_weight;
@@ -463,7 +466,8 @@ int main(int argc, char *argv[])
     const int densify_every = std::max(1, options.densify_every);
     const float pose_lr = 1e-4f;
     const float outside_mask_weight = 0.1f;
-    const float render_scale_modifier = 0.000001f;
+    const float alpha_loss_weight = 0.1f;
+    const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
     const int batch_size = 4;
 
@@ -593,7 +597,7 @@ int main(int argc, char *argv[])
     densify_cfg.max_splits = std::max(0, options.densify_max_splits);
     densify_cfg.scale_threshold = (options.densify_scale_threshold > 0.0f)
                                       ? options.densify_scale_threshold
-                                      : scale_max_value;
+                                      : std::numeric_limits<float>::infinity();
     densify_cfg.split_scale_factor = options.densify_split_scale;
     densify_cfg.split_offset_scale = options.densify_split_offset;
     densify_cfg.min_grad_norm = options.densify_min_grad;
@@ -606,13 +610,16 @@ int main(int argc, char *argv[])
     int64_t global_step = 0;
 
     std::vector<torch::Tensor> base_params = {
-        avatar.g_scales,
         avatar.g_rots,
         avatar.g_offsets};
+    std::vector<torch::Tensor> scale_params = {avatar.g_scales};
     std::vector<torch::Tensor> color_params = {use_sh ? avatar.g_sh : avatar.g_colors};
     std::vector<torch::Tensor> opacity_params = {avatar.g_opacities};
     std::vector<torch::Tensor> pose_params = {pose_offsets};
     torch::optim::Adam optimizer(base_params, torch::optim::AdamOptions(lr));
+    optimizer.add_param_group({scale_params});
+    auto &scale_group = optimizer.param_groups().back();
+    static_cast<torch::optim::AdamOptions &>(scale_group.options()).lr(scale_lr);
     optimizer.add_param_group({color_params});
     auto &color_group = optimizer.param_groups().back();
     static_cast<torch::optim::AdamOptions &>(color_group.options()).lr(color_lr);
@@ -622,6 +629,27 @@ int main(int argc, char *argv[])
     optimizer.add_param_group({pose_params});
     auto &pose_group = optimizer.param_groups().back();
     static_cast<torch::optim::AdamOptions &>(pose_group.options()).lr(pose_lr);
+
+    auto rebuild_optimizer = [&]()
+    {
+        base_params = {avatar.g_rots, avatar.g_offsets};
+        scale_params = {avatar.g_scales};
+        color_params = {use_sh ? avatar.g_sh : avatar.g_colors};
+        opacity_params = {avatar.g_opacities};
+        optimizer = torch::optim::Adam(base_params, torch::optim::AdamOptions(lr));
+        optimizer.add_param_group({scale_params});
+        auto &new_scale_group = optimizer.param_groups().back();
+        static_cast<torch::optim::AdamOptions &>(new_scale_group.options()).lr(scale_lr);
+        optimizer.add_param_group({color_params});
+        auto &new_color_group = optimizer.param_groups().back();
+        static_cast<torch::optim::AdamOptions &>(new_color_group.options()).lr(color_lr);
+        optimizer.add_param_group({opacity_params});
+        auto &new_opacity_group = optimizer.param_groups().back();
+        static_cast<torch::optim::AdamOptions &>(new_opacity_group.options()).lr(opacity_lr);
+        optimizer.add_param_group({pose_params});
+        auto &new_pose_group = optimizer.param_groups().back();
+        static_cast<torch::optim::AdamOptions &>(new_pose_group.options()).lr(pose_lr);
+    };
 
     torch::Tensor last_render;
     std::filesystem::path out_dir_path(output_dir);
@@ -649,6 +677,7 @@ int main(int argc, char *argv[])
 
             std::vector<torch::Tensor> recon_losses;
             std::vector<torch::Tensor> outside_losses;
+            std::vector<torch::Tensor> alpha_losses;
             std::vector<float> recon_values;
             std::vector<TrainSample> batch_samples;
             std::vector<cv::Mat> batch_crops;
@@ -717,7 +746,7 @@ int main(int argc, char *argv[])
                 std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) = BuildProjection(f_render, full_w, full_h, device);
 
                 auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.g_colors;
-                auto image_full = GaussianRasterizer::apply(
+                auto outputs = GaussianRasterizer::apply(
                     means3D,
                     colors,
                     avatar.g_opacities,
@@ -734,26 +763,33 @@ int main(int argc, char *argv[])
                     use_sh ? sh_degree : 0,
                     cam_pos,
                     false);
+                auto image_full = outputs[0];
+                auto alpha_full = outputs[1];
                 auto image = CropRenderToTarget(image_full, W, H, sample.crop_cx, sample.crop_cy);
+                auto alpha = CropRenderToTarget(alpha_full, W, H, sample.crop_cx, sample.crop_cy);
                 if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
-                    image.size(1) != H || image.size(2) != W)
+                    image.size(1) != H || image.size(2) != W ||
+                    !alpha.defined() || alpha.dim() != 3 || alpha.size(0) != 1 ||
+                    alpha.size(1) != H || alpha.size(2) != W)
                 {
                     skipped_malformed++;
                     continue;
                 }
-                // if (!IsMaskCoverageValidTensor(image, cached_entry.matte_mask, 0.3f, render_threshold))
-                // {
-                //     skipped_mask++;
-                //     continue;
-                // }
+                if (!IsMaskCoverageValidTensor(image, cached_entry.matte_mask, 0.3f, render_threshold))
+                {
+                    skipped_mask++;
+                    continue;
+                }
 
                 auto outside_mask = 1.0f - cached_entry.matte_mask;
                 auto outside_loss = torch::mean(image * outside_mask);
+                auto alpha_loss = torch::mse_loss(alpha, cached_entry.matte_mask);
 
                 auto recon_loss = torch::mse_loss(image, target);
                 auto loss_value = recon_loss.item<float>();
                 auto outside_value = outside_loss.item<float>();
-                if (!std::isfinite(loss_value) || !std::isfinite(outside_value))
+                auto alpha_value = alpha_loss.item<float>();
+                if (!std::isfinite(loss_value) || !std::isfinite(outside_value) || !std::isfinite(alpha_value))
                 {
                     skipped_malformed++;
                     continue;
@@ -761,6 +797,7 @@ int main(int argc, char *argv[])
 
                 recon_losses.push_back(recon_loss);
                 outside_losses.push_back(outside_loss);
+                alpha_losses.push_back(alpha_loss);
                 recon_values.push_back(loss_value);
                 batch_samples.push_back(sample);
                 batch_crops.push_back(cached_entry.crop_bgr);
@@ -800,7 +837,9 @@ int main(int argc, char *argv[])
                     skipped_outlier++;
                     continue;
                 }
-                recon_sum = recon_sum + recon_losses[i] + outside_mask_weight * outside_losses[i];
+                recon_sum = recon_sum + recon_losses[i] +
+                            outside_mask_weight * outside_losses[i] +
+                            alpha_loss_weight * alpha_losses[i];
                 inlier_count++;
                 last_inlier_idx = static_cast<int>(i);
                 if (recon_values[i] < best_inlier_loss)
@@ -824,21 +863,21 @@ int main(int argc, char *argv[])
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
             auto scale_vals = torch::exp(avatar.g_scales) * render_scale_modifier;
             auto scale_reg = torch::mean(scale_vals.pow(2));
-            auto scale_max_reg = torch::mean(torch::relu(scale_vals - scale_max_value).pow(2));
             auto offset_reg = torch::mean(avatar.g_offsets.pow(2));
             auto offset_norm = torch::sqrt(avatar.g_offsets.pow(2).sum(1) + 1e-12f);
             auto mesh_reg = torch::mean(torch::relu(offset_norm - mesh_reg_max_dist).pow(2));
-            auto loss = recon_loss + scale_reg_weight * scale_reg + offset_reg_weight * offset_reg +
-                        mesh_reg_weight * mesh_reg + scale_max_reg_weight * scale_max_reg;
+            auto loss = recon_loss + offset_reg_weight * offset_reg + scale_reg_weight * scale_reg +
+                        mesh_reg_weight * mesh_reg;
             loss.backward();
             densify_state.Accumulate(avatar.g_offsets, avatar.g_scales);
             optimizer.step();
             global_step++;
 
-            if (epoch < densify_stop_epoch &&
+            if (
                 densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
                 (global_step % densify_cfg.every) == 0)
             {
+                const auto prev_count = avatar.g_scales.size(0);
                 auto stats = DensifyGaussians(avatar.g_scales,
                                               avatar.g_rots,
                                               avatar.g_opacities,
@@ -850,15 +889,23 @@ int main(int argc, char *argv[])
                                               render_scale_modifier,
                                               densify_cfg,
                                               &densify_state);
+                if (avatar.g_scales.size(0) != prev_count || stats.splits > 0 || stats.pruned > 0)
+                {
+                    rebuild_optimizer();
+                }
                 if (stats.splits > 0)
                 {
                     std::cout << "Densify step " << global_step
                               << ": split " << stats.splits << " gaussians." << std::endl;
+                    std::cout << "Densify total gaussians: " << avatar.g_scales.size(0)
+                              << " (added " << stats.splits << ")" << std::endl;
                 }
                 if (stats.pruned > 0)
                 {
                     std::cout << "Densify step " << global_step
                               << ": pruned " << stats.pruned << " gaussians." << std::endl;
+                    std::cout << "Densify total gaussians: " << avatar.g_scales.size(0)
+                              << " (pruned " << stats.pruned << ")" << std::endl;
                 }
             }
  
@@ -894,6 +941,12 @@ int main(int argc, char *argv[])
                     }
                     std::cout << "Epoch " << epoch << " Batch " << batch_step
                               << " Loss: " << loss.item<float>() << std::endl;
+                    auto scale_vals_log = (torch::exp(avatar.g_scales) * render_scale_modifier).detach();
+                    const float scale_min = scale_vals_log.min().item<float>();
+                    const float scale_max = scale_vals_log.max().item<float>();
+                    const float scale_mean = scale_vals_log.mean().item<float>();
+                    std::cout << "Scale stats (min/mean/max): "
+                              << scale_min << " / " << scale_mean << " / " << scale_max << std::endl;
                 }
 
                 if (publish_viewer && (batch_step % viewer_every == 0))
