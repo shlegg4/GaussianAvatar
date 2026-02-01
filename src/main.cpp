@@ -683,9 +683,8 @@ torch::Tensor RotateSH(const torch::Tensor &sh, const torch::Tensor &rotations)
     // 6. Unpack back to SH order: 1->Y, 2->Z, 3->X
     // rotated_vec indices: 0->X', 1->Y', 2->Z'
     out_sh.index_put_({Slice(), 1, Slice()}, rotated_vec.index({Slice(), 1, Slice()})); // Y gets Y'
-    out_sh.index_put_({Slice(), 2, Slice()}, rotated_vec.index({Slice(), 2, Slice()})); // Z gets Z'
-    out_sh.index_put_({Slice(), 3, Slice()}, rotated_vec.index({Slice(), 0, Slice()})); // X gets X'
-
+    out_sh.index_put_({Slice(), 2, Slice()}, rotated_vec.index({Slice(), 2, Slice()})); // Z gets Z' 
+    out_sh.index_put_({Slice(), 3, Slice()}, -rotated_vec.index({Slice(), 0, Slice()})); // -X -> X (Inverted)
     // Zero out higher degrees (if any) as they aren't rotated here
     if (sh.size(1) > 4)
     {
