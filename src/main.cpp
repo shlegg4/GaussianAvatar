@@ -77,6 +77,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->output_dir = value;
             else if (key == "--scale-reg")
                 options->scale_reg_weight = std::stof(value);
+            else if (key == "--log-scale-l2")
+                options->log_scale_l2_weight = std::stof(value);
             else if (key == "--scale-lr")
                 options->scale_lr = std::stof(value);
             else if (key == "--scale-max-reg")
@@ -103,6 +105,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->densify_every = std::stoi(value);
             else if (key == "--densify-max")
                 options->densify_max_splits = std::stoi(value);
+            else if (key == "--densify-max-clones")
+                options->densify_max_clones = std::stoi(value);
             else if (key == "--densify-scale")
                 options->densify_scale_threshold = std::stof(value);
             else if (key == "--densify-split-scale")
@@ -425,7 +429,8 @@ int main(int argc, char *argv[])
                      " [--mesh-max-dist <float>] [--alpha-loss <float>] [--opacity-binarize <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
-                     " [--densify-every <int>] [--densify-max <int>] [--densify-scale <float>]"
+                     " [--densify-every <int>] [--densify-max <int>] [--densify-max-clones <int>]"
+                     " [--densify-scale <float>]"
                      " [--densify-split-scale <float>] [--densify-split-offset <float>]"
                      " [--densify-min-grad <float>] [--densify-grow-grad <float>]"
                      " [--densify-prune-opacity <float>]"
@@ -453,7 +458,9 @@ int main(int argc, char *argv[])
     const float lr = options.lr;
     const std::string &output_dir = options.output_dir;
     const float scale_reg_weight = options.scale_reg_weight;
+    const float log_scale_l2_weight = options.log_scale_l2_weight;
     const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
+    const float scale_max_reg_weight = options.scale_max_reg_weight;
     const float scale_max_value = options.scale_max_value;
     const float offset_reg_weight = options.offset_reg_weight;
     const float mesh_reg_weight = options.mesh_reg_weight;
@@ -470,6 +477,17 @@ int main(int argc, char *argv[])
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
     const int batch_size = 4;
+    const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
+    const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
+    auto capped_scales = [&](const torch::Tensor &log_scales)
+    {
+        auto scales = torch::exp(log_scales);
+        if (scale_cap > 0.0f)
+        {
+            scales = torch::clamp(scales, 0.0f, scale_cap);
+        }
+        return scales;
+    };
 
     std::ifstream input(jsonl_path);
     if (!input.is_open())
@@ -595,9 +613,10 @@ int main(int argc, char *argv[])
     DensificationConfig densify_cfg;
     densify_cfg.every = densify_every;
     densify_cfg.max_splits = std::max(0, options.densify_max_splits);
+    densify_cfg.max_clones = std::max(0, options.densify_max_clones);
     densify_cfg.scale_threshold = (options.densify_scale_threshold > 0.0f)
                                       ? options.densify_scale_threshold
-                                      : std::numeric_limits<float>::infinity();
+                                      : 0.0f;
     densify_cfg.split_scale_factor = options.densify_split_scale;
     densify_cfg.split_offset_scale = options.densify_split_offset;
     densify_cfg.min_grad_norm = options.densify_min_grad;
@@ -760,7 +779,7 @@ int main(int argc, char *argv[])
                     means3D,
                     colors,
                     avatar.g_opacities,
-                    torch::exp(avatar.g_scales),
+                    capped_scales(avatar.g_scales),
                     current_rots,
                     render_scale_modifier,
                     view_mat,
@@ -878,17 +897,33 @@ int main(int argc, char *argv[])
 
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
             auto scale_vals = torch::exp(avatar.g_scales) * render_scale_modifier;
-            auto scale_reg = torch::mean(scale_vals.pow(2));
-            auto offset_reg = torch::mean(avatar.g_offsets.pow(2)); 
-            auto opacity_clamped = avatar.g_opacities.clamp(0.0f, 1.0f);
-            auto opacity_binarize = torch::mean(opacity_clamped * (1.0f - opacity_clamped));
-            auto loss = recon_loss + offset_reg_weight * offset_reg + scale_reg_weight * scale_reg;
+            auto scale_mag = std::get<0>(scale_vals.max(1));
+            auto sorted = std::get<0>(scale_mag.flatten().sort());
+            const int64_t scale_count = sorted.numel();
+            const float scale_percentile = 0.9f;
+            const int64_t scale_idx = std::min<int64_t>(scale_count - 1,
+                                                        static_cast<int64_t>(std::floor(scale_percentile * (scale_count - 1))));
+            auto scale_thresh = sorted.index({scale_idx});
+            auto scale_overflow = torch::relu(scale_mag - scale_thresh);
+            auto scale_reg = torch::mean(scale_overflow.pow(2)); 
+            torch::Tensor scale_max_reg = torch::zeros({}, scale_vals.options());
+            if (scale_max_value > 0.0f)
+            {
+                auto overflow = torch::relu(scale_vals - scale_max_value);
+                scale_max_reg = torch::mean(overflow.pow(2));
+            }
+            auto offset_reg = torch::mean(avatar.g_offsets.pow(2));
+            auto loss = recon_loss +
+                        offset_reg_weight * offset_reg +
+                        scale_reg_weight * scale_reg;
             loss.backward();
             densify_state.Accumulate(avatar.g_offsets, avatar.g_scales);
             optimizer.step();
             global_step++;
 
-            if (global_step <= 1000 &&
+            const bool densify_enabled = (densify_stop_epoch <= 0) || (epoch < densify_stop_epoch);
+            if (densify_enabled &&
+                global_step <= 1000 &&
                 densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
                 (global_step % densify_cfg.every) == 0)
             {
@@ -908,12 +943,13 @@ int main(int argc, char *argv[])
                 {
                     rebuild_optimizer();
                 }
-                if (stats.splits > 0)
+                if (stats.splits > 0 || stats.clones > 0)
                 {
                     std::cout << "Densify step " << global_step
-                              << ": split " << stats.splits << " gaussians." << std::endl;
+                              << ": split " << stats.splits
+                              << ", cloned " << stats.clones << " gaussians." << std::endl;
                     std::cout << "Densify total gaussians: " << avatar.g_scales.size(0)
-                              << " (added " << stats.splits << ")" << std::endl;
+                              << " (added " << (stats.splits + stats.clones) << ")" << std::endl;
                 }
                 if (stats.pruned > 0)
                 {
@@ -932,8 +968,10 @@ int main(int argc, char *argv[])
                 if (batch_step % 10 == 0)
                 {
                     std::cout << "Epoch " << epoch << " Batch " << batch_step
-                              << " Loss: " << loss.item<float>() << std::endl;
-                    auto scale_vals_log = (torch::exp(avatar.g_scales) * render_scale_modifier).detach();
+                              << " Loss: " << loss.item<float>() << " Offset Reg: "
+                              << offset_reg.item<float>() * offset_reg_weight << " Scale Reg: " 
+                              << scale_reg.item<float>() * scale_reg_weight   << " Recon loss: " << recon_loss.item<float>() << std::endl;
+                    auto scale_vals_log = (capped_scales(avatar.g_scales) * render_scale_modifier).detach();
                     const float scale_min = scale_vals_log.min().item<float>();
                     const float scale_max = scale_vals_log.max().item<float>();
                     const float scale_mean = scale_vals_log.mean().item<float>();
@@ -957,7 +995,7 @@ int main(int argc, char *argv[])
                         colors = avatar.g_colors;
                     }
                     auto opacities = avatar.g_opacities;
-                    auto scales = torch::exp(avatar.g_scales);
+                    auto scales = capped_scales(avatar.g_scales);
                     torch::Tensor sh_to_send = sh;
                     if (use_sh && sh_degree > 0)
                     {
@@ -1049,7 +1087,7 @@ int main(int argc, char *argv[])
                 means3D,
                 colors,
                 avatar.g_opacities,
-                torch::exp(avatar.g_scales),
+                capped_scales(avatar.g_scales),
                 current_rots,
                 render_scale_modifier,
                 view_mat,

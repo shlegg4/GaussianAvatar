@@ -5,8 +5,9 @@
 struct DensificationConfig
 {
     int every = 500;
-    int max_splits = 64;
-    float scale_threshold = 0.02f;
+    int max_splits = 10000;
+    int max_clones = 10000;
+    float scale_threshold = 0.001f;
     float split_scale_factor = 0.7f;
     float split_offset_scale = 0.5f;
     float min_grad_norm = 0.0f;
@@ -30,6 +31,7 @@ struct DensificationState
 struct DensifyStats
 {
     int64_t splits = 0;
+    int64_t clones = 0;
     int64_t pruned = 0;
 };
 

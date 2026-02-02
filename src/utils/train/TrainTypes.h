@@ -28,6 +28,7 @@ struct TrainOptions
     float lr = 0.01f;
     std::string output_dir = "outputs";
     float scale_reg_weight = 0.001f;
+    float log_scale_l2_weight = 0.001f;
     float scale_lr = -1.0f;
     float scale_max_reg_weight = 0.1f;
     float scale_max_value = 0.02f;
@@ -41,11 +42,12 @@ struct TrainOptions
     int sh_degree = 3;
     int densify_every = 500;
     int densify_max_splits = 64;
-    float densify_scale_threshold = -1.0f;
+    int densify_max_clones = 64;
+    float densify_scale_threshold = 0.01f;
     float densify_split_scale = 0.7f;
     float densify_split_offset = 0.5f;
     float densify_min_grad = 0.0f;
-    float densify_grow_grad = 1e-4f;
+    float densify_grow_grad = 5e-4f;
     float densify_prune_opacity = 0.01f;
     int densify_prune_max = 256;
     float densify_reset_opacity = 0.001f;
