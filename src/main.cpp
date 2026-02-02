@@ -465,7 +465,7 @@ int main(int argc, char *argv[])
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
     const int densify_every = std::max(1, options.densify_every);
-    const float pose_lr = 1e-3f;
+    const float pose_lr = 1e-4f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
     const float render_scale_modifier = 1.0f;
@@ -890,8 +890,15 @@ int main(int argc, char *argv[])
             }
 
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
-            auto scale_vals = torch::exp(avatar.g_scales) * render_scale_modifier;
-            auto scale_reg = torch::mean(scale_vals.pow(2));
+            // --- Top-K Scale Regularization (Safety Valve) ---
+            auto current_scales = torch::exp(avatar.g_scales) * render_scale_modifier;
+            using torch::indexing::Slice;
+            auto tan_scales_sq = current_scales.index({Slice(), Slice(0, 2)}).pow(2).sum(1);
+            const int64_t num_gaussians = tan_scales_sq.size(0);
+            const int64_t k = std::min<int64_t>(num_gaussians, std::max<int64_t>(64, num_gaussians / 200));
+            auto topk_result = torch::topk(tan_scales_sq, k, /*dim=*/0, /*largest=*/true, /*sorted=*/false);
+            auto top_k_values = std::get<0>(topk_result);
+            auto scale_reg = torch::mean(top_k_values);
             auto offset_reg = torch::mean(avatar.g_offsets.pow(2));
             auto loss = recon_loss +
                         offset_reg_weight * offset_reg +
