@@ -77,12 +77,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->output_dir = value;
             else if (key == "--scale-reg")
                 options->scale_reg_weight = std::stof(value);
-            else if (key == "--log-scale-l2")
-                options->log_scale_l2_weight = std::stof(value);
             else if (key == "--scale-lr")
                 options->scale_lr = std::stof(value);
-            else if (key == "--scale-max-reg")
-                options->scale_max_reg_weight = std::stof(value);
             else if (key == "--scale-max")
                 options->scale_max_value = std::stof(value);
             else if (key == "--offset-reg")
@@ -424,7 +420,7 @@ int main(int argc, char *argv[])
     {
         std::cout << "Usage: gaussian_train --jsonl <path> [--smpl <path>] [--num-gaussians <int>]"
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
-                     " [--scale-reg <float>] [--scale-max-reg <float>] [--scale-max <float>]"
+                     " [--scale-reg <float>] [--scale-max <float>]"
                      " [--offset-reg <float>] [--mesh-reg <float>]"
                      " [--mesh-max-dist <float>] [--alpha-loss <float>] [--opacity-binarize <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
@@ -458,9 +454,7 @@ int main(int argc, char *argv[])
     const float lr = options.lr;
     const std::string &output_dir = options.output_dir;
     const float scale_reg_weight = options.scale_reg_weight;
-    const float log_scale_l2_weight = options.log_scale_l2_weight;
     const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
-    const float scale_max_reg_weight = options.scale_max_reg_weight;
     const float scale_max_value = options.scale_max_value;
     const float offset_reg_weight = options.offset_reg_weight;
     const float mesh_reg_weight = options.mesh_reg_weight;
@@ -897,21 +891,7 @@ int main(int argc, char *argv[])
 
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
             auto scale_vals = torch::exp(avatar.g_scales) * render_scale_modifier;
-            auto scale_mag = std::get<0>(scale_vals.max(1));
-            auto sorted = std::get<0>(scale_mag.flatten().sort());
-            const int64_t scale_count = sorted.numel();
-            const float scale_percentile = 0.9f;
-            const int64_t scale_idx = std::min<int64_t>(scale_count - 1,
-                                                        static_cast<int64_t>(std::floor(scale_percentile * (scale_count - 1))));
-            auto scale_thresh = sorted.index({scale_idx});
-            auto scale_overflow = torch::relu(scale_mag - scale_thresh);
-            auto scale_reg = torch::mean(scale_overflow.pow(2)); 
-            torch::Tensor scale_max_reg = torch::zeros({}, scale_vals.options());
-            if (scale_max_value > 0.0f)
-            {
-                auto overflow = torch::relu(scale_vals - scale_max_value);
-                scale_max_reg = torch::mean(overflow.pow(2));
-            }
+            auto scale_reg = torch::mean(scale_vals.pow(2));
             auto offset_reg = torch::mean(avatar.g_offsets.pow(2));
             auto loss = recon_loss +
                         offset_reg_weight * offset_reg +
@@ -969,8 +949,8 @@ int main(int argc, char *argv[])
                 {
                     std::cout << "Epoch " << epoch << " Batch " << batch_step
                               << " Loss: " << loss.item<float>() << " Offset Reg: "
-                              << offset_reg.item<float>() * offset_reg_weight << " Scale Reg: " 
-                              << scale_reg.item<float>() * scale_reg_weight   << " Recon loss: " << recon_loss.item<float>() << std::endl;
+                              << offset_reg.item<float>() * offset_reg_weight << " Scale Reg: "
+                              << scale_reg.item<float>() * scale_reg_weight << " Recon loss: " << recon_loss.item<float>() << std::endl;
                     auto scale_vals_log = (capped_scales(avatar.g_scales) * render_scale_modifier).detach();
                     const float scale_min = scale_vals_log.min().item<float>();
                     const float scale_max = scale_vals_log.max().item<float>();
@@ -1110,8 +1090,11 @@ int main(int argc, char *argv[])
             return image.detach();
         };
 
-        const int saved_pairs = SaveEpochViewPairs(samples, cached, out_dir_path, epoch, render_view);
-        std::cout << "Epoch " << epoch << " saved " << saved_pairs << " view pairs." << std::endl;
+        if ((epoch + 1) % 5 == 0 || epoch == (epochs - 1))
+        {
+            const int saved_pairs = SaveEpochViewPairs(samples, cached, out_dir_path, epoch, render_view);
+            std::cout << "Epoch " << epoch << " saved " << saved_pairs << " view pairs." << std::endl;
+        }
     }
 
     std::filesystem::path out_path = out_dir_path / "final_render.png";
