@@ -20,7 +20,7 @@
                 "--scale-reg", "10.0",
                 "--scale-max", "0.01", 
                 "--offset-reg", "10.0",
-                "--densify-every", "100000",
+                "--densify-every", "100",
                 "--densify-max-clones", "100000",
                 "--densify-max", "100000",
                 "--densify-scale", "0.001", 
@@ -28,9 +28,10 @@
                 "--densify-reset-opacity", "0", 
                 "--densify-prune-opacity", "0.001",
                 "--densify-prune-max", "100000",
-                "--num-gaussians", "120000",
+                "--num-gaussians", "40000",
                 "--viewer",
-                "--sh-degree", "1"
+                "--sh-degree", "1",
+                "--tensorboard"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",

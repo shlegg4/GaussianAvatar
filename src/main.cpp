@@ -1,4 +1,4 @@
-#include <torch/torch.h>
+﻿#include <torch/torch.h>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -902,9 +902,34 @@ int main(int argc, char *argv[])
                         offset_reg_weight * offset_reg +
                         scale_reg_weight * scale_reg +
                         pose_reg_weight * pose_reg;
+                        
             loss.backward();
+ 
+            if (avatar.g_scales.grad().defined())
+            {
+                torch::NoGradGuard no_grad; 
+                auto mask = torch::tensor({1.0f, 1.0f, 0.0f}, avatar.g_scales.options());
+                avatar.g_scales.grad().mul_(mask);
+            }
+
             densify_state.Accumulate(avatar.g_offsets, avatar.g_scales);
             optimizer.step();
+ 
+            {
+                torch::NoGradGuard no_grad;
+ 
+                auto rot_norm = avatar.g_rots.norm(2, 1, true); 
+                rot_norm = torch::clamp_min(rot_norm, 1e-9);
+                avatar.g_rots.div_(rot_norm);
+ 
+                float target_thickness = 0.001f;
+                float target_log_scale = std::log(target_thickness);
+
+                using torch::indexing::Slice;
+                // Set all Z-scales (index 2) to the target thickness
+                avatar.g_scales.index_put_({Slice(), 2}, target_log_scale);
+            }
+
             global_step++;
 
             // const bool densify_enabled = (densify_stop_epoch <= 0) || (epoch < densify_stop_epoch);
