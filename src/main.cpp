@@ -83,14 +83,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->scale_max_value = std::stof(value);
             else if (key == "--offset-reg")
                 options->offset_reg_weight = std::stof(value);
-            else if (key == "--mesh-reg")
-                options->mesh_reg_weight = std::stof(value);
-            else if (key == "--mesh-max-dist")
-                options->mesh_reg_max_dist = std::stof(value);
+            else if (key == "--pose-reg")
+                options->pose_reg_weight = std::stof(value);
             else if (key == "--alpha-loss")
                 options->alpha_loss_weight = std::stof(value);
-            else if (key == "--opacity-binarize")
-                options->opacity_binarize_weight = std::stof(value);
             else if (key == "--color-lr")
                 options->color_lr = std::stof(value);
             else if (key == "--opacity-lr")
@@ -125,10 +121,6 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->enable_viewer = true;
             else if (key == "--headless")
                 options->enable_viewer = false;
-            else if (key == "--viewer-width")
-                options->viewer_width = std::stoi(value);
-            else if (key == "--viewer-height")
-                options->viewer_height = std::stoi(value);
             else if (key == "--viewer-every")
                 options->viewer_every = std::stoi(value);
             else if (key == "--viewer-shm")
@@ -421,8 +413,7 @@ int main(int argc, char *argv[])
         std::cout << "Usage: gaussian_train --jsonl <path> [--smpl <path>] [--num-gaussians <int>]"
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
                      " [--scale-reg <float>] [--scale-max <float>]"
-                     " [--offset-reg <float>] [--mesh-reg <float>]"
-                     " [--mesh-max-dist <float>] [--alpha-loss <float>] [--opacity-binarize <float>]"
+                     " [--offset-reg <float>] [--pose-reg <float>] [--alpha-loss <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
                      " [--densify-every <int>] [--densify-max <int>] [--densify-max-clones <int>]"
@@ -432,7 +423,7 @@ int main(int argc, char *argv[])
                      " [--densify-prune-opacity <float>]"
                      " [--densify-prune-max <int>] [--densify-reset-opacity <float>]"
                      " [--densify-stop-epoch <int>]"
-                     " [--viewer|--headless] [--viewer-width <int>] [--viewer-height <int>]"
+                     " [--viewer|--headless]"
                      " [--viewer-every <int>] [--viewer-shm <name>]\n";
         return -1;
     }
@@ -457,9 +448,7 @@ int main(int argc, char *argv[])
     const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
     const float scale_max_value = options.scale_max_value;
     const float offset_reg_weight = options.offset_reg_weight;
-    const float mesh_reg_weight = options.mesh_reg_weight;
-    const float mesh_reg_max_dist = options.mesh_reg_max_dist;
-    const float opacity_binarize_weight = options.opacity_binarize_weight;
+    const float pose_reg_weight = options.pose_reg_weight;
     const float color_lr = options.color_lr;
     const float opacity_lr = (options.opacity_lr < 0.0f) ? lr : options.opacity_lr;
     const int sh_degree = options.sh_degree;
@@ -470,7 +459,7 @@ int main(int argc, char *argv[])
     const float alpha_loss_weight = options.alpha_loss_weight;
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
-    const int batch_size = 4;
+    const int batch_size = 8;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -565,6 +554,10 @@ int main(int argc, char *argv[])
     avatar.init_gaussians(num_gaussians, faces, render_scale_modifier, options.sh_degree);
     auto pose_offsets = torch::zeros({static_cast<int64_t>(samples.size()), 24, 3},
                                      torch::TensorOptions().device(device).dtype(torch::kFloat).requires_grad(true));
+    auto global_rot_offsets = torch::zeros({static_cast<int64_t>(samples.size()), 3},
+                                           torch::TensorOptions().device(device).dtype(torch::kFloat).requires_grad(true));
+    auto global_trans_offsets = torch::zeros({static_cast<int64_t>(samples.size()), 3},
+                                             torch::TensorOptions().device(device).dtype(torch::kFloat).requires_grad(true));
     const auto avg_betas = ComputeAverageBetas(samples);
     torch::Tensor canonical_betas;
     if (!avg_betas.empty())
@@ -628,7 +621,7 @@ int main(int argc, char *argv[])
     std::vector<torch::Tensor> scale_params = {avatar.g_scales};
     std::vector<torch::Tensor> color_params = {use_sh ? avatar.g_sh : avatar.g_colors};
     std::vector<torch::Tensor> opacity_params = {avatar.g_opacities};
-    std::vector<torch::Tensor> pose_params = {pose_offsets};
+    std::vector<torch::Tensor> pose_params = {pose_offsets, global_rot_offsets, global_trans_offsets};
     torch::optim::Adam optimizer(base_params, torch::optim::AdamOptions(lr));
     optimizer.add_param_group({scale_params});
     auto &scale_group = optimizer.param_groups().back();
@@ -649,6 +642,7 @@ int main(int argc, char *argv[])
         scale_params = {avatar.g_scales};
         color_params = {use_sh ? avatar.g_sh : avatar.g_colors};
         opacity_params = {avatar.g_opacities};
+        pose_params = {pose_offsets, global_rot_offsets, global_trans_offsets};
         optimizer = torch::optim::Adam(base_params, torch::optim::AdamOptions(lr));
         optimizer.add_param_group({scale_params});
         auto &new_scale_group = optimizer.param_groups().back();
@@ -729,12 +723,17 @@ int main(int argc, char *argv[])
                 auto pose = PoseToAxisAngle(res).to(device);
                 auto pose_offset = pose_offsets.index({static_cast<int64_t>(indices[idx])}).unsqueeze(0);
                 pose = pose + pose_offset;
+                auto global_rot = global_rot_offsets.index({static_cast<int64_t>(indices[idx])}).unsqueeze(0);
+                pose.index_put_({0, 0, torch::indexing::Slice()},
+                                pose.index({0, 0, torch::indexing::Slice()}) + global_rot.squeeze(0));
                 cv::Vec3f trans_cv = EstimateTranslation(res.camera, sample.crop_cx, sample.crop_cy,
                                                          sample.crop_size, sample.focal_length,
                                                          static_cast<float>(sample.img_w),
                                                          static_cast<float>(sample.img_h));
                 auto trans = torch::tensor({trans_cv[0], trans_cv[1], trans_cv[2]},
                                            torch::TensorOptions().device(device).dtype(torch::kFloat));
+                auto trans_offset = global_trans_offsets.index({static_cast<int64_t>(indices[idx])});
+                trans = trans + trans_offset;
 
                 torch::Tensor means3D;
                 torch::Tensor current_rots;
@@ -842,7 +841,7 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            const float outlier_percentile = 0.8f;
+            const float outlier_percentile = 0.95f;
             float outlier_threshold = std::numeric_limits<float>::infinity();
             if (!total_values.empty())
             {
@@ -890,26 +889,26 @@ int main(int argc, char *argv[])
             }
 
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
-            // --- Top-K Scale Regularization (Safety Valve) ---
             auto current_scales = torch::exp(avatar.g_scales) * render_scale_modifier;
-            using torch::indexing::Slice;
-            auto tan_scales_sq = current_scales.index({Slice(), Slice(0, 2)}).pow(2).sum(1);
-            const int64_t num_gaussians = tan_scales_sq.size(0);
-            const int64_t k = std::min<int64_t>(num_gaussians, std::max<int64_t>(64, num_gaussians / 200));
-            auto topk_result = torch::topk(tan_scales_sq, k, /*dim=*/0, /*largest=*/true, /*sorted=*/false);
-            auto top_k_values = std::get<0>(topk_result);
-            auto scale_reg = torch::mean(top_k_values);
+
+            auto all_scales_sq = current_scales.pow(2).sum(1);
+            auto scale_reg = torch::mean(all_scales_sq);
+
             auto offset_reg = torch::mean(avatar.g_offsets.pow(2));
+            auto pose_reg = torch::mean(pose_offsets.pow(2)) +
+                            torch::mean(global_rot_offsets.pow(2)) +
+                            torch::mean(global_trans_offsets.pow(2));
             auto loss = recon_loss +
                         offset_reg_weight * offset_reg +
-                        scale_reg_weight * scale_reg;
+                        scale_reg_weight * scale_reg +
+                        pose_reg_weight * pose_reg;
             loss.backward();
             densify_state.Accumulate(avatar.g_offsets, avatar.g_scales);
             optimizer.step();
             global_step++;
 
-            const bool densify_enabled = (densify_stop_epoch <= 0) || (epoch < densify_stop_epoch);
-            if (densify_enabled &&
+            // const bool densify_enabled = (densify_stop_epoch <= 0) || (epoch < densify_stop_epoch);
+            if (
                 global_step <= 1000 &&
                 densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
                 (global_step % densify_cfg.every) == 0)
@@ -957,13 +956,16 @@ int main(int argc, char *argv[])
                     std::cout << "Epoch " << epoch << " Batch " << batch_step
                               << " Loss: " << loss.item<float>() << " Offset Reg: "
                               << offset_reg.item<float>() * offset_reg_weight << " Scale Reg: "
-                              << scale_reg.item<float>() * scale_reg_weight << " Recon loss: " << recon_loss.item<float>() << std::endl;
+                              << scale_reg.item<float>() * scale_reg_weight << " Pose Reg: "
+                              << pose_reg.item<float>() * pose_reg_weight << " Recon loss: "
+                              << recon_loss.item<float>() << std::endl;
                     auto scale_vals_log = (capped_scales(avatar.g_scales) * render_scale_modifier).detach();
                     const float scale_min = scale_vals_log.min().item<float>();
                     const float scale_max = scale_vals_log.max().item<float>();
                     const float scale_mean = scale_vals_log.mean().item<float>();
                     std::cout << "Scale stats (min/mean/max): "
                               << scale_min << " / " << scale_mean << " / " << scale_max << std::endl;
+                    std::cout << "Global step: " << global_step << std::endl;
                 }
 
                 if (publish_viewer && (batch_step % viewer_every == 0))
@@ -1030,12 +1032,17 @@ int main(int argc, char *argv[])
             auto pose = PoseToAxisAngle(res).to(device);
             auto pose_offset = pose_offsets.index({static_cast<int64_t>(sample_index)}).unsqueeze(0);
             pose = pose + pose_offset;
+            auto global_rot = global_rot_offsets.index({static_cast<int64_t>(sample_index)}).unsqueeze(0);
+            pose.index_put_({0, 0, torch::indexing::Slice()},
+                            pose.index({0, 0, torch::indexing::Slice()}) + global_rot.squeeze(0));
             cv::Vec3f trans_cv = EstimateTranslation(res.camera, sample.crop_cx, sample.crop_cy,
                                                      sample.crop_size, sample.focal_length,
                                                      static_cast<float>(sample.img_w),
                                                      static_cast<float>(sample.img_h));
             auto trans = torch::tensor({trans_cv[0], trans_cv[1], trans_cv[2]},
                                        torch::TensorOptions().device(device).dtype(torch::kFloat));
+            auto trans_offset = global_trans_offsets.index({static_cast<int64_t>(sample_index)});
+            trans = trans + trans_offset;
 
             torch::Tensor means3D;
             torch::Tensor current_rots;

@@ -10,23 +10,20 @@
             "args": [
                 "--jsonl", "${workspaceFolder}/outputs/gaussian_train.jsonl",
                 "--smpl", "${workspaceFolder}/src/smpl_data.pt", 
-                "--epochs", "50",
-                "--lr", "0.0005",
+                "--epochs", "500",
+                "--lr", "0.0001",
                 "--color-lr", "0.01",
                 "--opacity-lr", "0.01",
-                "--scale-lr", "0.01",
-                "--alpha-loss", "10.0",
-                "--output-dir", "D:/Dissertation/Compiled_GaussianAvatar/outputs/gaussian_renders",
-                "--scale-reg", "200000.0",
+                "--scale-lr", "0.0005",
+                "--alpha-loss", "50.0",
+                "--output-dir", "C:/Users/Sam/Documents/GaussianAvatar/outputs/gaussian_renders",
+                "--scale-reg", "10.0",
                 "--scale-max", "0.01", 
                 "--offset-reg", "10.0",
-                "--opacity-binarize", "0",
-                "--mesh-reg", "0.0",
-                "--mesh-max-dist", "0.02",
                 "--densify-every", "100000",
                 "--densify-max-clones", "100000",
-                "--densify-max", "10000",
-                "--densify-scale", "1.0", 
+                "--densify-max", "100000",
+                "--densify-scale", "0.001", 
                 "--densify-min-grad", "0.001",
                 "--densify-reset-opacity", "0", 
                 "--densify-prune-opacity", "0.001",
@@ -40,7 +37,7 @@
             "environment": [
                 {
                     "name": "PATH",
-                    "value": "D:/cudnn-windows-x86_64-8.9.7.29_cuda12-archive/bin;D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
+                    "value": "C:/Program Files/NVIDIA/CUDNN/v9.18/bin;C:/opencv/build/x64/vc16/bin;C:/libtorch/lib;${env:PATH}"
 
                 }
             ],
@@ -53,13 +50,16 @@
             "preLaunchTask": "CMake: Build (Ninja)",
             "program": "${workspaceFolder}/src/build/hmr_inference.exe", 
             "args": [
-                "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx", 
-                "D:/Dissertation/videos/IMG_3845.MOV",
-                "--output", "D:/Dissertation/Compiled_GaussianAvatar/outputs/",
-                "--rtmpose", "D:/Dissertation/Compiled_GaussianAvatar/rtmpose26.onnx", 
-                "--yolo", "D:/Dissertation/Compiled_GaussianAvatar/yolov8n.onnx",
-                "--modnet", "D:/Dissertation/Compiled_GaussianAvatar/modnet.onnx",
-                "--frame-stride", "2",
+                "C:/Users/Sam/Documents/GaussianAvatar/cliff_hr48_static.onnx", 
+                "C:/Users/Sam/Documents/GaussianAvatar/2026-02-02 13-28-06.mp4",
+                "--output", "C:/Users/Sam/Documents/GaussianAvatar/outputs/",
+                "--rtmpose", "C:/Users/Sam/Documents/GaussianAvatar/rtmpose26.onnx", 
+                "--rtmpose-cuda",
+                "--yolo", "C:/Users/Sam/Documents/GaussianAvatar/yolov8n.onnx",
+                "--yolo-cuda",
+                "--modnet", "C:/Users/Sam/Documents/GaussianAvatar/modnet.onnx",
+                "--modnet-cuda",
+                "--frame-stride", "10",
                 "--smplify-requires-yolo"
             ],
             "stopAtEntry": false,
@@ -67,7 +67,7 @@
             "environment": [
                 {
                     "name": "PATH", 
-                    "value": "D:/cudnn-windows-x86_64-8.9.7.29_cuda12-archive/bin;D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
+                    "value": "C:/Program Files/NVIDIA/CUDNN/v9.18/bin;C:/opencv/build/x64/vc16/bin;C:/libtorch/lib;${env:PATH}"
                 }
             ],
             "console": "integratedTerminal"

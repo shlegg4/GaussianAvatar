@@ -20,6 +20,7 @@ struct HmrOutputOptions {
     bool save_outputs = false;
     bool use_rtmpose = true;
     std::string rtmpose_model_path = "rtmpose26.onnx";
+    bool rtmpose_use_cuda = false;
     bool use_yolo = false;
     std::string yolo_model_path = "yolov8n.onnx";
     float yolo_conf_threshold = 0.25f;

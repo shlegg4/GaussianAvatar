@@ -70,26 +70,16 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
 
     const float steps = static_cast<float>(std::max<int64_t>(1, state->steps));
     auto grad_offsets = state->grad_offsets_accum / steps;
-    auto grad_scales = state->grad_scales_accum / steps;
-    auto grad_norm = torch::norm(grad_offsets, 2, 1) + torch::norm(grad_scales, 2, 1);
-    auto grad_scale_mean = grad_scales.mean(1);
+    
+    // FIX: Use only positional gradients for densification to avoid noise from scale optimization
+    auto grad_norm = torch::norm(grad_offsets, 2, 1);
 
     int64_t total = g_scales.size(0);
     auto scale_vals = torch::exp(g_scales) * render_scale_modifier;
     auto scale_mean = scale_vals.mean(1);
-
     auto opacities = g_opacities.squeeze(1);
-    const float grad_norm_min = grad_norm.min().item<float>();
-    const float grad_norm_mean = grad_norm.mean().item<float>();
-    const float grad_norm_max = grad_norm.max().item<float>();
-    const float grad_scale_min = grad_scale_mean.min().item<float>();
-    const float grad_scale_mean_val = grad_scale_mean.mean().item<float>();
-    const float grad_scale_max = grad_scale_mean.max().item<float>();
-    std::cout << "Densify grads (norm min/mean/max): "
-              << grad_norm_min << " / " << grad_norm_mean << " / " << grad_norm_max
-              << " | scale-grad mean min/mean/max: "
-              << grad_scale_min << " / " << grad_scale_mean_val << " / " << grad_scale_max
-              << std::endl;
+
+    // --- PRUNING LOGIC ---
     auto keep_mask = torch::ones({total}, torch::TensorOptions().device(g_scales.device()).dtype(torch::kBool));
     if (cfg.prune_opacity_threshold > 0.0f && cfg.prune_max > 0)
     {
@@ -114,6 +104,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
         return stats;
     }
 
+    // Filter all attributes
     auto kept_scales = g_scales.index_select(0, keep_indices);
     auto kept_rots = g_rots.index_select(0, keep_indices);
     auto kept_opacities = g_opacities.index_select(0, keep_indices);
@@ -127,13 +118,14 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
         kept_sh = g_sh.index_select(0, keep_indices);
     }
 
-    auto kept_grad_offsets = grad_offsets.index_select(0, keep_indices);
     auto kept_grad_norm = grad_norm.index_select(0, keep_indices);
-    auto kept_offset_grad_norm = torch::norm(kept_grad_offsets, 2, 1);
     auto kept_scale_mean = scale_mean.index_select(0, keep_indices);
     auto kept_opacity_flat = opacities.index_select(0, keep_indices);
-    const int64_t base_count = kept_scales.size(0);
+    
+    // Store count before splits/clones for opacity reset logic later
+    const int64_t count_after_prune = kept_scales.size(0);
 
+    // --- SPLITTING LOGIC ---
     auto split_mask = kept_grad_norm > cfg.min_grad_norm;
     if (cfg.scale_threshold > 0.0f)
     {
@@ -157,7 +149,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
         auto topk = torch::topk(cand_scores, k);
         auto parent_local = split_indices.index_select(0, std::get<1>(topk));
 
-        const float safe_scale_factor = std::max(cfg.split_scale_factor, 1e-6f);
+        const float safe_scale_factor = std::max(cfg.split_scale_factor, 1.001f);
         auto delta_log = torch::tensor(std::log(safe_scale_factor), g_scales.options());
 
         auto parent_scales = kept_scales.index_select(0, parent_local);
@@ -173,22 +165,23 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
             parent_sh = kept_sh.index_select(0, parent_local);
         }
 
-        auto parent_grad = kept_grad_offsets.index_select(0, parent_local);
-        auto grad_len = torch::norm(parent_grad, 2, 1, true);
-        auto rand_dir = torch::randn_like(parent_grad);
+        // Generate split direction
+        auto rand_dir = torch::randn_like(parent_offsets);
         rand_dir = rand_dir / (torch::norm(rand_dir, 2, 1, true) + 1e-8f);
-        auto dir = torch::where(grad_len > 1e-8f, parent_grad / grad_len, rand_dir);
 
         auto scale_mag = kept_scale_mean.index_select(0, parent_local).unsqueeze(1);
-        auto delta = dir * (scale_mag * cfg.split_offset_scale);
+        auto delta = rand_dir * (scale_mag * cfg.split_offset_scale);
 
-        auto new_scale = parent_scales + delta_log;
+        // FIX: Subtract log to shrink, 0.5 opacity for both
+        auto new_scale = parent_scales - delta_log;
         auto new_opacity = parent_opacities * 0.5f;
 
+        // Update Parent
         kept_scales.index_put_({parent_local}, new_scale);
         kept_offsets.index_put_({parent_local}, parent_offsets + delta);
         kept_opacities.index_put_({parent_local}, new_opacity);
 
+        // Append Child
         auto child_scales = new_scale;
         auto child_offsets = parent_offsets - delta;
         auto child_rots = parent_rots;
@@ -209,57 +202,51 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
             kept_sh = torch::cat({kept_sh, parent_sh}, 0);
         }
     }
+    
+    // Store count after splits to distinguish between split-children and clones
+    const int64_t count_after_split = kept_scales.size(0);
 
+    // --- CLONING LOGIC ---
     int64_t clones = 0;
     if (cfg.grow_grad_threshold > 0.0f && cfg.scale_threshold > 0.0f)
     {
-        auto clone_mask = (kept_offset_grad_norm > cfg.grow_grad_threshold) & (kept_scale_mean < cfg.scale_threshold) &
-                  (~split_mask);
-        if (cfg.prune_opacity_threshold > 0.0f)
-        {
+        // Re-calculate gradients for current set (normalized)
+        auto current_grad_norm = torch::norm(state->grad_offsets_accum.index_select(0, keep_indices), 2, 1) / steps;
+        
+        auto clone_mask = (current_grad_norm > cfg.grow_grad_threshold) & 
+                          (kept_scale_mean < cfg.scale_threshold) & 
+                          (~split_mask);
+                          
+        if (cfg.prune_opacity_threshold > 0.0f) {
             clone_mask = clone_mask & (kept_opacity_flat >= cfg.prune_opacity_threshold);
         }
+
         auto clone_indices = torch::nonzero(clone_mask).squeeze(1);
         if (clone_indices.defined() && clone_indices.numel() > 0)
         {
             int64_t remaining = std::max<int64_t>(0, cfg.max_splits - k);
             int64_t clone_cap = std::max<int64_t>(0, cfg.max_clones);
             clones = std::min<int64_t>(std::min<int64_t>(remaining, clone_cap), clone_indices.size(0));
+            
             if (clones > 0)
             {
-                auto cand_scores = kept_offset_grad_norm.index_select(0, clone_indices);
+                auto cand_scores = current_grad_norm.index_select(0, clone_indices);
                 auto topk = torch::topk(cand_scores, clones);
                 auto parent_local = clone_indices.index_select(0, std::get<1>(topk));
-
-                auto parent_scales = kept_scales.index_select(0, parent_local);
-                auto parent_offsets = kept_offsets.index_select(0, parent_local);
-                auto parent_rots = kept_rots.index_select(0, parent_local);
-                auto parent_colors = kept_colors.index_select(0, parent_local);
-                auto parent_opacities = kept_opacities.index_select(0, parent_local);
-                auto parent_bary = kept_bary.index_select(0, parent_local);
-                auto parent_faces = kept_faces.index_select(0, parent_local);
+ 
+                auto child_scales = kept_scales.index_select(0, parent_local);
+                auto child_offsets = kept_offsets.index_select(0, parent_local);
+ 
+                auto child_rots = kept_rots.index_select(0, parent_local);
+                auto child_colors = kept_colors.index_select(0, parent_local);
+                auto child_opacities = kept_opacities.index_select(0, parent_local);
+                auto child_bary = kept_bary.index_select(0, parent_local);
+                auto child_faces = kept_faces.index_select(0, parent_local);
                 torch::Tensor parent_sh;
                 if (kept_sh.defined() && kept_sh.numel() > 0)
                 {
                     parent_sh = kept_sh.index_select(0, parent_local);
                 }
-
-                auto parent_grad = kept_grad_offsets.index_select(0, parent_local);
-                auto grad_len = torch::norm(parent_grad, 2, 1, true);
-                auto rand_dir = torch::randn_like(parent_grad);
-                rand_dir = rand_dir / (torch::norm(rand_dir, 2, 1, true) + 1e-8f);
-                auto dir = torch::where(grad_len > 1e-8f, parent_grad / grad_len, rand_dir);
-
-                auto scale_mag = kept_scale_mean.index_select(0, parent_local).unsqueeze(1);
-                auto delta = dir * (scale_mag * (cfg.split_offset_scale * 0.5f));
-
-                auto child_scales = parent_scales;
-                auto child_offsets = parent_offsets + delta;
-                auto child_rots = parent_rots;
-                auto child_colors = parent_colors;
-                auto child_opacities = parent_opacities;
-                auto child_bary = parent_bary;
-                auto child_faces = parent_faces;
 
                 kept_scales = torch::cat({kept_scales, child_scales}, 0);
                 kept_offsets = torch::cat({kept_offsets, child_offsets}, 0);
@@ -287,12 +274,14 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
     {
         g_sh = kept_sh.detach().clone().set_requires_grad(true);
     }
+ 
 
-    if (cfg.reset_opacity > 0.0f && g_opacities.size(0) > base_count)
+    // FIX: Only reset opacity for CLONES (indices appended after splits)
+    if (cfg.reset_opacity > 0.0f && g_opacities.size(0) > count_after_split)
     {
-        auto new_opacity = torch::full({g_opacities.size(0) - base_count, 1}, cfg.reset_opacity,
+        auto new_opacity = torch::full({g_opacities.size(0) - count_after_split, 1}, cfg.reset_opacity,
                                        g_opacities.options());
-        g_opacities.index_put_({torch::indexing::Slice(base_count, g_opacities.size(0))}, new_opacity);
+        g_opacities.index_put_({torch::indexing::Slice(count_after_split, g_opacities.size(0))}, new_opacity);
     }
 
     stats.splits = k;

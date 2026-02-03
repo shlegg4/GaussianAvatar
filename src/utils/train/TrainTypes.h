@@ -31,10 +31,8 @@ struct TrainOptions
     float scale_lr = -1.0f;
     float scale_max_value = 0.02f;
     float offset_reg_weight = 0.01f;
-    float mesh_reg_weight = 0.1f;
-    float mesh_reg_max_dist = 0.02f;
+    float pose_reg_weight = 0.01f;
     float alpha_loss_weight = 0.1f;
-    float opacity_binarize_weight = 0.0f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;
     int sh_degree = 3;
@@ -51,8 +49,6 @@ struct TrainOptions
     float densify_reset_opacity = 0.001f;
     int densify_stop_epoch = 15;
     bool enable_viewer = false;
-    int viewer_width = 800;
-    int viewer_height = 600;
     int viewer_every = 1;
     std::string viewer_shm_name = "GaussianAvatarShared";
 };

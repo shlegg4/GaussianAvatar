@@ -13,9 +13,11 @@ void PrintUsage() {
         << "  --output <dir>                 Save outputs to directory\n"
         << "  --rtmpose <model.onnx>          RTMPose model path\n"
         << "  --yolo <model.onnx>             YOLO model path\n"
+        << "  --yolo-cuda                    Enable CUDA for YOLO (if available)\n"
         << "  --modnet <model.onnx>           MODNet matting model path\n"
         << "  --modnet-cuda                   Enable CUDA for MODNet (if available)\n"
         << "  --modnet-input <int>            MODNet input size if model is dynamic\n"
+        << "  --rtmpose-cuda                  Enable CUDA for RTMPose (if available)\n"
         << "  --focal-scale <float>           Focal length scale (default 1.2)\n"
         << "  --frame-stride <int>            Process every Nth frame (default 1)\n"
         << "  --smplify-requires-yolo         Only run Smplify when YOLO detects a person\n"
@@ -67,6 +69,10 @@ int main(int argc, char* argv[]) {
             options.yolo_model_path = argv[++i];
             continue;
         }
+        if (arg == "--yolo-cuda") {
+            options.yolo_use_cuda = true;
+            continue;
+        }
         if (arg == "--modnet" && i + 1 < argc) {
             options.use_modnet = true;
             options.modnet_model_path = argv[++i];
@@ -74,6 +80,10 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--modnet-cuda") {
             options.modnet_use_cuda = true;
+            continue;
+        }
+        if (arg == "--rtmpose-cuda") {
+            options.rtmpose_use_cuda = true;
             continue;
         }
         if (arg == "--modnet-input" && i + 1 < argc) {

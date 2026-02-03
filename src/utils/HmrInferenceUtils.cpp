@@ -437,6 +437,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
     }
 
     RtmPoseDetectorOptions pose_opts;
+    pose_opts.use_cuda = options.rtmpose_use_cuda;
     if (save_outputs) {
         pose_opts.save_debug_input = false;
     }
