@@ -35,6 +35,7 @@
 #include "utils/train/TrainImageSaver.h"
 #include "utils/train/TrainJsonl.h"
 #include "utils/train/TrainTypes.h"
+#include "utils/train/ViewerExport.h"
 
 bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
 {
@@ -75,6 +76,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->lr = std::stof(value);
             else if (key == "--output-dir")
                 options->output_dir = value;
+            else if (key == "--train-dir")
+                options->output_dir = value;
+            else if (key == "--viewer-export-dir")
+                options->viewer_export_dir = value;
             else if (key == "--scale-reg")
                 options->scale_reg_weight = std::stof(value);
             else if (key == "--scale-lr")
@@ -412,6 +417,7 @@ int main(int argc, char *argv[])
     {
         std::cout << "Usage: gaussian_train --jsonl <path> [--smpl <path>] [--num-gaussians <int>]"
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
+                     " [--train-dir <path>] [--viewer-export-dir <path>]"
                      " [--scale-reg <float>] [--scale-max <float>]"
                      " [--offset-reg <float>] [--pose-reg <float>] [--alpha-loss <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
@@ -444,6 +450,7 @@ int main(int argc, char *argv[])
     const int epochs = options.epochs;
     const float lr = options.lr;
     const std::string &output_dir = options.output_dir;
+    const std::string &viewer_export_dir = options.viewer_export_dir;
     const float scale_reg_weight = options.scale_reg_weight;
     const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
     const float scale_max_value = options.scale_max_value;
@@ -668,6 +675,19 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    std::filesystem::path viewer_out_path;
+    if (!viewer_export_dir.empty())
+    {
+        viewer_out_path = std::filesystem::path(viewer_export_dir);
+        std::error_code viewer_ec;
+        std::filesystem::create_directories(viewer_out_path, viewer_ec);
+        if (viewer_ec)
+        {
+            std::cerr << "Failed to create viewer export dir: " << viewer_export_dir << std::endl;
+            return -1;
+        }
+    }
+
     std::mt19937 rng(static_cast<unsigned int>(std::random_device{}()));
     for (int epoch = 0; epoch < epochs; ++epoch)
     {
@@ -841,7 +861,7 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            const float outlier_percentile = 0.95f;
+            const float outlier_percentile = 0.7f;
             float outlier_threshold = std::numeric_limits<float>::infinity();
             if (!total_values.empty())
             {
@@ -894,7 +914,7 @@ int main(int argc, char *argv[])
             auto all_scales_sq = current_scales.pow(2).sum(1);
             auto scale_reg = torch::mean(all_scales_sq);
 
-            auto offset_reg = torch::mean(avatar.g_offsets.pow(2));
+            auto offset_reg = torch::mean(torch::abs(avatar.g_offsets));
             auto pose_reg = torch::mean(pose_offsets.pow(2)) +
                             torch::mean(global_rot_offsets.pow(2)) +
                             torch::mean(global_trans_offsets.pow(2));
@@ -902,7 +922,7 @@ int main(int argc, char *argv[])
                         offset_reg_weight * offset_reg +
                         scale_reg_weight * scale_reg +
                         pose_reg_weight * pose_reg;
-                        
+            // 1. BACKWARD PASS
             loss.backward();
  
             if (avatar.g_scales.grad().defined())
@@ -1020,6 +1040,11 @@ int main(int argc, char *argv[])
                     {
                         shared_writer.Write(shared_buffer.data(), static_cast<uint32_t>(positions.size(0)),
                                             shared_frame++);
+                    }
+                    if (!viewer_export_dir.empty())
+                    {
+                        SaveViewerData(viewer_out_path, epoch, positions, colors, opacities, scales, rotations,
+                                       sh_to_send, sh_degree);
                     }
                 }
 

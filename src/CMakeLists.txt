@@ -92,6 +92,7 @@ add_executable(smpl_test
     utils/train/TrainImageSaver.cpp
     utils/train/TrainJsonl.cpp
     utils/train/GaussianDensification.cpp
+    utils/train/ViewerExport.cpp
 )
 
 target_link_libraries(smpl_test 
