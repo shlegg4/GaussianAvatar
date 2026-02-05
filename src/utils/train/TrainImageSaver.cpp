@@ -62,8 +62,12 @@ int SaveEpochViewPairs(const std::vector<TrainSample> &samples,
             cv::resize(render_bgr, render_bgr, target_bgr.size(), 0, 0, cv::INTER_AREA);
         }
 
+        cv::Mat diff_bgr;
+        cv::absdiff(target_bgr, render_bgr, diff_bgr);
+
         cv::Mat side_by_side;
-        cv::hconcat(target_bgr, render_bgr, side_by_side);
+        std::vector<cv::Mat> panels = {target_bgr, render_bgr, diff_bgr};
+        cv::hconcat(panels, side_by_side);
 
         std::ostringstream name;
         name << "view_" << std::setw(5) << std::setfill('0') << i;

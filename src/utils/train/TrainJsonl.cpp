@@ -96,6 +96,14 @@ bool ParseTrainSample(const std::string &line, TrainSample *out)
     if (!ExtractNumberField(line, "crop_size", &value))
         return false;
     sample.crop_size = static_cast<float>(value);
+    if (ExtractNumberField(line, "crop_x0", &value))
+        sample.crop_x0 = static_cast<float>(value);
+    if (ExtractNumberField(line, "crop_y0", &value))
+        sample.crop_y0 = static_cast<float>(value);
+    if (ExtractNumberField(line, "crop_w", &value))
+        sample.crop_w = static_cast<float>(value);
+    if (ExtractNumberField(line, "crop_h", &value))
+        sample.crop_h = static_cast<float>(value);
     if (!ExtractNumberField(line, "focal_length", &value))
         return false;
     sample.focal_length = static_cast<float>(value);

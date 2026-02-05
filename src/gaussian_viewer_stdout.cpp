@@ -1,6 +1,7 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -156,6 +157,7 @@ std::mutex g_smpl_mutex;
 std::vector<float> g_smpl_pose(72, 0.0f);
 std::array<float, 3> g_smpl_trans{{0.0f, 0.0f, 0.0f}};
 bool g_smpl_dirty = true;
+std::atomic<bool> g_show_pose{true};
 
 struct BoundsState
 {
@@ -212,13 +214,37 @@ void InputListenLoop()
         const Quat qz = AxisAngleQuat({0.0f, 0.0f, 1.0f}, roll);
         return NormalizeQuat(MulQuat(qy, MulQuat(qx, qz)));
     };
+    auto parse_bool = [&](const std::string& src, bool *out) -> bool {
+        if (src.find("true") != std::string::npos || src.find("on") != std::string::npos ||
+            src.find("1") != std::string::npos)
+        {
+            *out = true;
+            return true;
+        }
+        if (src.find("false") != std::string::npos || src.find("off") != std::string::npos ||
+            src.find("0") != std::string::npos)
+        {
+            *out = false;
+            return true;
+        }
+        return false;
+    };
 
     while (std::getline(std::cin, line))
     {
         std::lock_guard<std::mutex> lock(g_camera_mutex);
         bool changed = false;
 
-        if (line.find("smpl_pose") != std::string::npos)
+        if (line.find("show_pose") != std::string::npos || line.find("pose_display") != std::string::npos)
+        {
+            bool value = g_show_pose.load();
+            if (!parse_bool(line, &value))
+            {
+                value = !value;
+            }
+            g_show_pose.store(value);
+        }
+        else if (line.find("smpl_pose") != std::string::npos)
         {
             const bool is_delta = (line.find("smpl_pose_delta") != std::string::npos);
             const auto vals = extract_floats(line);
@@ -677,8 +703,9 @@ int main(int argc, char **argv)
             bool use_smpl_deform = smpl_ready && bind_bary.defined() && bind_offsets.defined() &&
                                    bind_rots.defined() && bind_face_indices.defined() &&
                                    bind_betas_t.defined() && (bind_bary.size(0) == point_count);
+            const bool apply_pose = use_smpl_deform && g_show_pose.load();
 
-            if (use_smpl_deform)
+            if (apply_pose)
             {
                 if (smpl_pose_dirty)
                 {
@@ -725,7 +752,7 @@ int main(int argc, char **argv)
                 rotations = QuatMultiply(q_skin, bind_rots);
             }
 
-            if (use_smpl_deform && colors.numel() == 0 && raw_gpu.defined() && !use_sh)
+            if (apply_pose && colors.numel() == 0 && raw_gpu.defined() && !use_sh)
             {
                 using namespace torch::indexing;
                 colors = raw_gpu.index({Slice(), Slice(3, 6)}).contiguous();

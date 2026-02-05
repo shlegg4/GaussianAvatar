@@ -301,6 +301,7 @@ void WriteTrainRecord(std::ofstream& out,
                       const std::string& input_path,
                       const std::string& overlay_path,
                       float crop_cx, float crop_cy, float crop_size,
+                      float crop_x0, float crop_y0, float crop_w, float crop_h,
                       float focal_length, float y_sign,
                       int img_w, int img_h) {
     out << std::fixed << std::setprecision(8);
@@ -315,6 +316,10 @@ void WriteTrainRecord(std::ofstream& out,
     out << "\"crop_cx\":" << crop_cx << ",";
     out << "\"crop_cy\":" << crop_cy << ",";
     out << "\"crop_size\":" << crop_size << ",";
+    out << "\"crop_x0\":" << crop_x0 << ",";
+    out << "\"crop_y0\":" << crop_y0 << ",";
+    out << "\"crop_w\":" << crop_w << ",";
+    out << "\"crop_h\":" << crop_h << ",";
     out << "\"focal_length\":" << focal_length << ",";
     out << "\"y_sign\":" << y_sign << ",";
     out << "\"pose\":[";
@@ -536,6 +541,10 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         float crop_cx = base_frame.cols * 0.5f;
         float crop_cy = base_frame.rows * 0.5f;
         float crop_size = static_cast<float>(std::max(base_frame.cols, base_frame.rows));
+        float crop_x0 = 0.0f;
+        float crop_y0 = 0.0f;
+        float crop_w = 0.0f;
+        float crop_h = 0.0f;
         std::optional<cv::Rect2f> pose_bbox;
         std::optional<cv::Rect> pose_crop;
         std::vector<cv::Point2f> pose_keypoints;
@@ -587,8 +596,31 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                     const int size_i = static_cast<int>(std::ceil(crop_res->scale_size));
                     pose_crop = cv::Rect(x0, y0, size_i, size_i) &
                                 cv::Rect(0, 0, base_frame.cols, base_frame.rows);
+                    crop_x0 = static_cast<float>(pose_crop->x);
+                    crop_y0 = static_cast<float>(pose_crop->y);
+                    crop_w = static_cast<float>(pose_crop->width);
+                    crop_h = static_cast<float>(pose_crop->height);
                 }
             }
+        }
+        if (!pose_crop) {
+            const float half = crop_size * 0.5f;
+            float x0 = std::floor(crop_cx - half);
+            float y0 = std::floor(crop_cy - half);
+            float w = std::ceil(crop_size);
+            float h = std::ceil(crop_size);
+            if (w > 0.0f && h > 0.0f) {
+                const float max_w = static_cast<float>(base_frame.cols);
+                const float max_h = static_cast<float>(base_frame.rows);
+                x0 = std::max(0.0f, std::min(x0, max_w - 1.0f));
+                y0 = std::max(0.0f, std::min(y0, max_h - 1.0f));
+                w = std::max(0.0f, std::min(w, max_w - x0));
+                h = std::max(0.0f, std::min(h, max_h - y0));
+            }
+            crop_x0 = x0;
+            crop_y0 = y0;
+            crop_w = w;
+            crop_h = h;
         }
         const float f_geo = std::max(base_frame.cols, base_frame.rows) * options.focal_length_scale;
         const float f_render = f_geo;
@@ -720,6 +752,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                                  std::string(),
                                  out_path.generic_string(),
                                  crop_cx, crop_cy, crop_size,
+                                 crop_x0, crop_y0, crop_w, crop_h,
                                  f_geo, smplify_y_sign,
                                  base_frame.cols, base_frame.rows);
 

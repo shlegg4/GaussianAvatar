@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -54,7 +55,7 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
             }
             else
             {
-                if (key != "--viewer" && key != "--headless")
+                if (key != "--viewer" && key != "--headless" && key != "--viewer-stream-poses")
                 {
                     if (i + 1 >= argc)
                     {
@@ -132,6 +133,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->enable_viewer = true;
             else if (key == "--headless")
                 options->enable_viewer = false;
+            else if (key == "--viewer-stream-poses")
+                options->viewer_stream_poses = true;
             else if (key == "--viewer-every")
                 options->viewer_every = std::stoi(value);
             else if (key == "--viewer-shm")
@@ -212,6 +215,22 @@ torch::Tensor CropRenderToTarget(const torch::Tensor &full_render, int crop_w, i
     output.index_put_({Slice(), Slice(dst_y0, dst_y0 + src_h), Slice(dst_x0, dst_x0 + src_w)},
                       full_render.index({Slice(), Slice(src_y0, src_y0 + src_h), Slice(src_x0, src_x0 + src_w)}));
     return output;
+}
+
+// Input: [C, H, W], Output: [N, C, size, size]
+torch::Tensor UnfoldTiles(const torch::Tensor &input, int size, int stride)
+{
+    if (!input.defined() || input.dim() != 3)
+    {
+        return torch::Tensor();
+    }
+    if (input.size(1) < size || input.size(2) < size)
+    {
+        return torch::Tensor();
+    }
+    auto patches = input.unfold(1, size, stride).unfold(2, size, stride);
+    patches = patches.permute({1, 2, 0, 3, 4}).contiguous();
+    return patches.view({-1, input.size(0), size, size});
 }
 
 bool BuildSharedGaussianBuffer(const torch::Tensor &positions, const torch::Tensor &colors,
@@ -443,7 +462,7 @@ int main(int argc, char *argv[])
                      " [--densify-stop-epoch <int>]"
                      " [--viewer|--headless]"
                      " [--viewer-every <int>] [--viewer-shm <name>] [--viewer-pose-shm <name>]"
-                     " [--viewer-bind-shm <name>]\n";
+                     " [--viewer-bind-shm <name>] [--viewer-stream-poses]\n";
         return -1;
     }
     if (!torch::cuda::is_available())
@@ -476,13 +495,18 @@ int main(int argc, char *argv[])
     const float opacity_lr = (options.opacity_lr < 0.0f) ? lr : options.opacity_lr;
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
+    const bool viewer_stream_poses = options.viewer_stream_poses;
     const int densify_every = std::max(1, options.densify_every);
-    const float pose_lr = 1e-3f;
+    const float pose_lr = 5e-4f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
-    const int batch_size = 4;
+    const int tile_size = 64;
+    const float tile_outlier_mult = 3.0f;
+    const float tile_mask_min = 0.01f;
+    const float tile_median_min = 1e-4f;
+    const int batch_size = 8;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -773,6 +797,12 @@ int main(int argc, char *argv[])
             std::vector<torch::Tensor> batch_trans;
             int skipped_malformed = 0;
             int skipped_mask = 0;
+            int64_t tiles_total = 0;
+            int64_t tiles_mask_valid = 0;
+            int64_t tiles_outlier_valid = 0;
+            int64_t tiles_final = 0;
+            float tiles_median_sum = 0.0f;
+            int tiles_median_count = 0;
 
             for (size_t idx = batch_start; idx < batch_end; ++idx)
             {
@@ -837,8 +867,13 @@ int main(int argc, char *argv[])
                 const int render_h = H;
                 const float full_cx = static_cast<float>(full_w) * 0.5f;
                 const float full_cy = static_cast<float>(full_h) * 0.5f;
-                const float x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
-                const float y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
+                float x0 = sample.crop_x0;
+                float y0 = sample.crop_y0;
+                if (sample.crop_w <= 0.0f || sample.crop_h <= 0.0f)
+                {
+                    x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
+                    y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
+                }
                 const float cx_crop = full_cx - x0;
                 const float cy_crop = full_cy - y0;
                 std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) =
@@ -878,11 +913,64 @@ int main(int argc, char *argv[])
                     continue;
                 }
 
-                auto outside_mask = 1.0f - cached_entry.matte_mask;
-                auto outside_loss = torch::mean(image * outside_mask);
-                auto alpha_loss = torch::l1_loss(alpha, cached_entry.matte_mask);
+                using torch::indexing::Slice;
+                const int tile_h = (H / tile_size) * tile_size;
+                const int tile_w = (W / tile_size) * tile_size;
+                if (tile_h < tile_size || tile_w < tile_size)
+                {
+                    skipped_malformed++;
+                    continue;
+                }
 
-                auto recon_loss = torch::l1_loss(image, target);
+                auto image_crop = image.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
+                auto target_crop = target.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
+                auto matte_crop = cached_entry.matte_mask.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
+                auto alpha_crop = alpha.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
+
+                auto outside_mask = 1.0f - matte_crop;
+                auto outside_loss = torch::mean(image_crop * outside_mask);
+                auto alpha_loss = torch::l1_loss(alpha_crop, matte_crop);
+
+                auto image_tiles = UnfoldTiles(image_crop, tile_size, tile_size);
+                auto target_tiles = UnfoldTiles(target_crop, tile_size, tile_size);
+                auto mask_tiles = UnfoldTiles(matte_crop, tile_size, tile_size);
+                if (!image_tiles.defined() || !target_tiles.defined() || !mask_tiles.defined() || image_tiles.numel() == 0)
+                {
+                    skipped_malformed++;
+                    continue;
+                }
+
+                auto diff = torch::abs(image_tiles - target_tiles);
+                auto loss_per_tile = diff.mean({1, 2, 3});
+                auto mask_sums = mask_tiles.sum({1, 2, 3});
+                auto valid_tile_mask = mask_sums > tile_mask_min;
+                auto valid_losses = loss_per_tile.index({valid_tile_mask});
+                float median_tile_loss = 0.0f;
+                if (valid_losses.defined() && valid_losses.numel() > 0)
+                {
+                    median_tile_loss = torch::median(valid_losses).item<float>();
+                }
+                auto outlier_tile_mask = torch::ones_like(valid_tile_mask);
+                if (median_tile_loss >= tile_median_min)
+                {
+                    const float outlier_thresh = median_tile_loss * tile_outlier_mult;
+                    outlier_tile_mask = loss_per_tile <= outlier_thresh;
+                }
+                auto final_mask = valid_tile_mask & outlier_tile_mask;
+                const int64_t valid_tiles = final_mask.sum().item<int64_t>();
+                tiles_total += loss_per_tile.size(0);
+                tiles_mask_valid += valid_tile_mask.sum().item<int64_t>();
+                tiles_outlier_valid += outlier_tile_mask.sum().item<int64_t>();
+                tiles_final += valid_tiles;
+                tiles_median_sum += median_tile_loss;
+                tiles_median_count++;
+                if (valid_tiles <= 0)
+                {
+                    skipped_malformed++;
+                    continue;
+                }
+
+                auto recon_loss = loss_per_tile.index({final_mask}).mean();
                 auto loss_value = recon_loss.item<float>();
                 auto outside_value = outside_loss.item<float>();
                 auto alpha_value = alpha_loss.item<float>();
@@ -913,12 +1001,23 @@ int main(int argc, char *argv[])
                 {
                     std::cout << "Dropped samples in last 10 batches: "
                               << dropped_since_log << std::endl;
+                    if (tiles_total > 0)
+                    {
+                        const float avg_median = (tiles_median_count > 0)
+                                                     ? (tiles_median_sum / static_cast<float>(tiles_median_count))
+                                                     : 0.0f;
+                        std::cout << "Tile stats: total=" << tiles_total
+                                  << " mask_valid=" << tiles_mask_valid
+                                  << " outlier_valid=" << tiles_outlier_valid
+                                  << " final=" << tiles_final
+                                  << " avg_median=" << avg_median << std::endl;
+                    }
                     dropped_since_log = 0;
                 }
                 continue;
             }
 
-            const float outlier_percentile = 0.7f;
+            const float outlier_percentile = 1.0f;
             float outlier_threshold = std::numeric_limits<float>::infinity();
             if (!total_values.empty())
             {
@@ -1010,8 +1109,7 @@ int main(int argc, char *argv[])
             global_step++;
 
             // const bool densify_enabled = (densify_stop_epoch <= 0) || (epoch < densify_stop_epoch);
-            if (
-                global_step <= 1000 &&
+            if ( 
                 densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
                 (global_step % densify_cfg.every) == 0)
             {
@@ -1079,6 +1177,17 @@ int main(int argc, char *argv[])
                     std::cout << "Scale stats (min/mean/max): "
                               << scale_min << " / " << scale_mean << " / " << scale_max << std::endl;
                     std::cout << "Global step: " << global_step << std::endl;
+                    if (tiles_total > 0)
+                    {
+                        const float avg_median = (tiles_median_count > 0)
+                                                     ? (tiles_median_sum / static_cast<float>(tiles_median_count))
+                                                     : 0.0f;
+                        std::cout << "Tile stats: total=" << tiles_total
+                                  << " mask_valid=" << tiles_mask_valid
+                                  << " outlier_valid=" << tiles_outlier_valid
+                                  << " final=" << tiles_final
+                                  << " avg_median=" << avg_median << std::endl;
+                    }
                 }
  
                 dropped_since_log += skipped_malformed + skipped_mask + skipped_outlier;
@@ -1217,6 +1326,35 @@ int main(int argc, char *argv[])
             auto trans_offset = global_trans_offsets.index({static_cast<int64_t>(sample_index)});
             trans = trans + trans_offset;
 
+            if (viewer_stream_poses)
+            {
+                auto pose_cpu = pose.detach().to(torch::kCPU).contiguous();
+                const float *pose_ptr = pose_cpu.data_ptr<float>();
+                std::ostringstream pose_line;
+                pose_line.setf(std::ios::fixed);
+                pose_line << std::setprecision(6);
+                pose_line << "smpl_pose: [";
+                for (int i = 0; i < 72; ++i)
+                {
+                    if (i > 0)
+                        pose_line << ", ";
+                    pose_line << pose_ptr[i];
+                }
+                pose_line << "]";
+                std::cout << pose_line.str() << "\n";
+
+                auto trans_cpu = trans.detach().to(torch::kCPU).contiguous();
+                const float tx = trans_cpu[0].item<float>();
+                const float ty = trans_cpu[1].item<float>();
+                const float tz = trans_cpu[2].item<float>();
+                std::ostringstream trans_line;
+                trans_line.setf(std::ios::fixed);
+                trans_line << std::setprecision(6);
+                trans_line << "smpl_trans: [" << tx << ", " << ty << ", " << tz << "]";
+                std::cout << trans_line.str() << "\n";
+                std::cout.flush();
+            }
+
             torch::Tensor means3D;
             torch::Tensor current_rots;
             std::tie(means3D, current_rots) =
@@ -1242,8 +1380,13 @@ int main(int argc, char *argv[])
             const int render_h = H;
             const float full_cx = static_cast<float>(full_w) * 0.5f;
             const float full_cy = static_cast<float>(full_h) * 0.5f;
-            const float x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
-            const float y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
+            float x0 = sample.crop_x0;
+            float y0 = sample.crop_y0;
+            if (sample.crop_w <= 0.0f || sample.crop_h <= 0.0f)
+            {
+                x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
+                y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
+            }
             const float cx_crop = full_cx - x0;
             const float cy_crop = full_cy - y0;
             std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) =

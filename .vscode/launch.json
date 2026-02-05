@@ -31,7 +31,7 @@
                 "--densify-reset-opacity", "0", 
                 "--densify-prune-opacity", "0.0001",
                 "--densify-prune-max", "100000",
-                "--num-gaussians", "100000",
+                "--num-gaussians", "80000",
                 "--viewer",
                 "--sh-degree", "1"
             ],

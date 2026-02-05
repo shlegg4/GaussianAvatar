@@ -12,6 +12,10 @@ struct TrainSample
     float crop_cx = 0.0f;
     float crop_cy = 0.0f;
     float crop_size = 0.0f;
+    float crop_x0 = 0.0f;
+    float crop_y0 = 0.0f;
+    float crop_w = 0.0f;
+    float crop_h = 0.0f;
     float focal_length = 0.0f;
     float y_sign = 1.0f;
     std::vector<float> pose;
@@ -57,4 +61,5 @@ struct TrainOptions
     std::string viewer_shm_name = "GaussianAvatarShared";
     std::string viewer_pose_shm_name;
     std::string viewer_bind_shm_name;
+    bool viewer_stream_poses = false;
 };
