@@ -1,5 +1,4 @@
 #include <GLFW/glfw3.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -201,9 +200,18 @@ int main(int argc, char **argv)
     bool prev_z = false;
     bool prev_r = false;
     bool randomize_colors = false;
+    
+    float render_scale_modifier = 1.0f;
+    uint64_t last_version = 0;
+
+    // --- Persistent GPU State ---
+    torch::Tensor raw_gpu;
+    torch::Tensor means3D, colors, opacities, scales, rotations, sh_tensor;
     torch::Tensor random_colors;
     int64_t random_colors_count = 0;
-    float render_scale_modifier = 1.0f;
+    bool gpu_data_dirty = false;
+    const uint32_t base_stride = shared_gaussian::kSharedStrideFloats + 7u;
+
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
@@ -234,12 +242,15 @@ int main(int argc, char **argv)
             randomize_colors = !randomize_colors;
             random_colors = torch::Tensor();
             random_colors_count = 0;
+            gpu_data_dirty = true; // Force color update
         }
         prev_r = key_r;
         if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS)
         {
             FrameCameraToBounds();
         }
+
+        // --- Reader Update Logic ---
         if (!reader.IsOpen())
         {
             auto now = std::chrono::steady_clock::now();
@@ -249,19 +260,27 @@ int main(int argc, char **argv)
                 reader.Open(options.shm_name);
             }
         }
+        
         uint32_t sh_degree = 0;
         if (reader.IsOpen())
         {
-            if (const auto *header = reader.Header())
+            const auto *header = reader.Header();
+            if (header)
             {
                 sh_degree = header->sh_degree;
                 render_scale_modifier = header->render_scale_modifier;
-            }
-            uint64_t version = 0;
-            uint64_t frame = 0;
-            if (reader.ReadLatest(&points, &point_count, &stride, &frame, &version))
-            {
-                (void)frame;
+                const uint64_t current_version = header->data_version.load(std::memory_order_acquire);
+                if (current_version != last_version)
+                {
+                    uint64_t version = 0;
+                    uint64_t frame = 0;
+                    if (reader.ReadLatest(&points, &point_count, &stride, &frame, &version))
+                    {
+                        last_version = version;
+                        (void)frame;
+                        gpu_data_dirty = true; // New data arrived, mark for upload
+                    }
+                }
             }
         }
 
@@ -271,136 +290,98 @@ int main(int argc, char **argv)
         glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        const float fovy_deg = 45.0f;
-
-        const uint32_t sh_coeffs = (sh_degree > 0) ? (sh_degree + 1) * (sh_degree + 1) : 0;
-        const uint32_t base_stride = shared_gaussian::kSharedStrideFloats + 7u;
-        const uint32_t sh_stride = base_stride + sh_coeffs * 3u;
-        const bool use_sh = (sh_degree > 0) && (stride >= sh_stride) && !randomize_colors;
-
         if (point_count > 0 && stride >= base_stride)
         {
-            const float *ptr = points.data();
-            std::vector<float> pos_data;
-            std::vector<float> col_data;
-            std::vector<float> opa_data;
-            std::vector<float> scale_data;
-            std::vector<float> rot_data;
-            std::vector<float> sh_data;
-
-            pos_data.resize(static_cast<size_t>(point_count) * 3u);
-            col_data.resize(static_cast<size_t>(point_count) * 3u);
-            opa_data.resize(static_cast<size_t>(point_count));
-            scale_data.resize(static_cast<size_t>(point_count) * 3u);
-            rot_data.resize(static_cast<size_t>(point_count) * 4u);
-            if (use_sh)
+            const uint32_t sh_coeffs = (sh_degree > 0) ? (sh_degree + 1) * (sh_degree + 1) : 0;
+            const uint32_t sh_stride = base_stride + sh_coeffs * 3u;
+            const bool use_sh = (sh_degree > 0) && (stride >= sh_stride) && !randomize_colors;
+            
+            // --- OPTIMIZATION 1: Conditional Upload & GPU Slicing ---
+            // We only run this block if new data arrived from Shared Memory.
+            // Otherwise, we reuse 'means3D', 'colors', etc., which stay on VRAM.
+            if (gpu_data_dirty)
             {
-                sh_data.resize(static_cast<size_t>(point_count) * sh_coeffs * 3u);
-            }
+                // Upload ONE large contiguous blob. No CPU loop!
+                auto opts_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+                
+                // Copy points -> GPU raw tensor
+                raw_gpu = torch::from_blob(points.data(), 
+                    {static_cast<int64_t>(point_count), static_cast<int64_t>(stride)}, 
+                    opts_cpu).to(device, /*non_blocking=*/false, /*copy=*/true);
 
-            Vec3 min_v{std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(),
-                       std::numeric_limits<float>::infinity()};
-            Vec3 max_v{-std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
-                       -std::numeric_limits<float>::infinity()};
-            for (uint32_t i = 0; i < point_count; ++i)
-            {
-                const float *p = ptr + static_cast<size_t>(i) * stride;
-                const size_t base = static_cast<size_t>(i) * 3u;
-                pos_data[base + 0] = p[0];
-                pos_data[base + 1] = p[1];
-                pos_data[base + 2] = p[2];
-                min_v.x = std::min(min_v.x, p[0]);
-                min_v.y = std::min(min_v.y, p[1]);
-                min_v.z = std::min(min_v.z, p[2]);
-                max_v.x = std::max(max_v.x, p[0]);
-                max_v.y = std::max(max_v.y, p[1]);
-                max_v.z = std::max(max_v.z, p[2]);
-                col_data[base + 0] = p[3];
-                col_data[base + 1] = p[4];
-                col_data[base + 2] = p[5];
-                opa_data[i] = p[6];
-                scale_data[base + 0] = p[8];
-                scale_data[base + 1] = p[9];
-                scale_data[base + 2] = p[10];
-                const size_t rot_base = static_cast<size_t>(i) * 4u;
-                rot_data[rot_base + 0] = p[11];
-                rot_data[rot_base + 1] = p[12];
-                rot_data[rot_base + 2] = p[13];
-                rot_data[rot_base + 3] = p[14];
+                using namespace torch::indexing;
+                
+                // Create views/slices on GPU (Instant)
+                means3D   = raw_gpu.index({Slice(), Slice(0, 3)}).contiguous();
+                // Colors are temporarily extracted even if SH is used, just to be safe
+                colors    = raw_gpu.index({Slice(), Slice(3, 6)}).contiguous();
+                opacities = raw_gpu.index({Slice(), Slice(6, 7)}).contiguous();
+                scales    = raw_gpu.index({Slice(), Slice(8, 11)}).contiguous();
+                rotations = raw_gpu.index({Slice(), Slice(11, 15)}).contiguous();
 
+                // Handle SH or Random Colors
                 if (use_sh)
                 {
-                    const float *sh_ptr = p + base_stride;
-                    const size_t sh_base = static_cast<size_t>(i) * sh_coeffs * 3u;
-                    std::memcpy(sh_data.data() + sh_base, sh_ptr,
-                                static_cast<size_t>(sh_coeffs) * 3u * sizeof(float));
+                    auto sh_flat = raw_gpu.index({Slice(), Slice(static_cast<int64_t>(base_stride), 
+                                                                 static_cast<int64_t>(base_stride + sh_coeffs * 3))});
+                    sh_tensor = sh_flat.view({static_cast<int64_t>(point_count), 
+                                              static_cast<int64_t>(sh_coeffs), 3}).contiguous();
+                    // Rasterizer usually ignores 'colors' if sh_degree > 0, but we can clear it to save memory/confusion
+                    colors = torch::zeros({0}, device);
                 }
-            }
-            g_bounds.valid = true;
-            g_bounds.min = min_v;
-            g_bounds.max = max_v;
-
-            torch::NoGradGuard no_grad;
-            auto opts = torch::TensorOptions().dtype(torch::kFloat32);
-            auto means3D = torch::from_blob(pos_data.data(), {static_cast<int64_t>(point_count), 3}, opts)
-                               .clone()
-                               .to(device);
-            auto colors = torch::from_blob(col_data.data(), {static_cast<int64_t>(point_count), 3}, opts)
-                              .clone()
-                              .to(device);
-            auto opacities = torch::from_blob(opa_data.data(), {static_cast<int64_t>(point_count), 1}, opts)
-                                 .clone()
-                                 .to(device);
-            auto scales = torch::from_blob(scale_data.data(), {static_cast<int64_t>(point_count), 3}, opts)
-                              .clone()
-                              .to(device);
-            auto rotations = torch::from_blob(rot_data.data(), {static_cast<int64_t>(point_count), 4}, opts)
-                                 .clone()
-                                 .to(device);
-
-            torch::Tensor sh_tensor = torch::zeros({0}, opts).to(device);
-            if (use_sh)
-            {
-                sh_tensor = torch::from_blob(sh_data.data(),
-                                             {static_cast<int64_t>(point_count), static_cast<int64_t>(sh_coeffs), 3},
-                                             opts)
-                                .clone()
-                                .to(device);
-                colors = torch::zeros({0}, opts).to(device);
-            }
-            else if (randomize_colors)
-            {
-                if (!random_colors.defined() || random_colors_count != static_cast<int64_t>(point_count))
+                else
                 {
-                    random_colors = torch::rand({static_cast<int64_t>(point_count), 3}, opts).to(device);
-                    random_colors_count = static_cast<int64_t>(point_count);
+                    sh_tensor = torch::zeros({0}, device);
+                    
+                    if (randomize_colors)
+                    {
+                        if (!random_colors.defined() || random_colors_count != static_cast<int64_t>(point_count))
+                        {
+                            random_colors = torch::rand({static_cast<int64_t>(point_count), 3}, device);
+                            random_colors_count = static_cast<int64_t>(point_count);
+                        }
+                        colors = random_colors;
+                        // Reset opacities to full if needed, or keep original
+                        opacities = torch::ones({static_cast<int64_t>(point_count), 1}, device);
+                    }
                 }
-                colors = random_colors;
-                opacities = torch::ones({static_cast<int64_t>(point_count), 1}, opts).to(device);
+
+                // Update Bounds (Lazy CPU check just for "Frame Camera")
+                // We do a strided check to avoid iterating 100k points on CPU
+                if (!g_bounds.valid) 
+                {
+                    Vec3 min_v{points[0], points[1], points[2]};
+                    Vec3 max_v{points[0], points[1], points[2]};
+                    // Sample every 100th point for speed
+                    for(size_t i = 0; i < points.size(); i += stride * 100) {
+                        min_v.x = std::min(min_v.x, points[i+0]); min_v.y = std::min(min_v.y, points[i+1]); min_v.z = std::min(min_v.z, points[i+2]);
+                        max_v.x = std::max(max_v.x, points[i+0]); max_v.y = std::max(max_v.y, points[i+1]); max_v.z = std::max(max_v.z, points[i+2]);
+                    }
+                    g_bounds.min = min_v; g_bounds.max = max_v; g_bounds.valid = true;
+                }
+
+                gpu_data_dirty = false;
             }
 
+            // --- RENDER ---
             const float aspect = (height > 0) ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+            const float fovy_deg = 45.0f;
             const float fovy_rad = fovy_deg * 3.14159265f / 180.0f;
             const float tan_fovy = std::tan(fovy_rad * 0.5f);
             const float tan_fovx = tan_fovy * aspect;
 
+            // ... Matrix math (Same as before) ...
             Quat q_model = NormalizeQuat(g_camera.model_rot);
             Mat4 proj_mat = Perspective(fovy_deg, aspect, 0.01f, 100.0f);
 
             Vec3 base_offset{0.0f, 0.0f, 0.0f};
             if (g_bounds.valid)
             {
-                Vec3 center{
-                    0.5f * (g_bounds.min.x + g_bounds.max.x),
-                    0.5f * (g_bounds.min.y + g_bounds.max.y),
-                    0.5f * (g_bounds.min.z + g_bounds.max.z)};
-                Vec3 extents{
-                    0.5f * (g_bounds.max.x - g_bounds.min.x),
-                    0.5f * (g_bounds.max.y - g_bounds.min.y),
-                    0.5f * (g_bounds.max.z - g_bounds.min.z)};
-                const float radius = std::max({extents.x, extents.y, extents.z, 0.1f});
-                const float dist = radius * 3.0f;
-                base_offset.z = dist - center.z;
+                 // Simple framing logic
+                 Vec3 center{0.5f * (g_bounds.min.x + g_bounds.max.x), 0.5f * (g_bounds.min.y + g_bounds.max.y), 0.5f * (g_bounds.min.z + g_bounds.max.z)};
+                 Vec3 extents{0.5f * (g_bounds.max.x - g_bounds.min.x), 0.5f * (g_bounds.max.y - g_bounds.min.y), 0.5f * (g_bounds.max.z - g_bounds.min.z)};
+                 const float radius = std::max({extents.x, extents.y, extents.z, 0.1f});
+                 base_offset.z = (radius * 3.0f) - center.z;
             }
 
             Vec3 pivot{g_camera.target.x, g_camera.target.y, g_camera.target.z};
@@ -416,36 +397,24 @@ int main(int argc, char **argv)
             torch::Tensor proj_t = Mat4ToTensorRowMajor(view_proj, device).transpose(0, 1).contiguous();
 
             Vec3 cam_pos_v = CameraPosFromView(view_mat);
-            auto cam_pos = torch::tensor({cam_pos_v.x, cam_pos_v.y, cam_pos_v.z}, opts).to(device);
+            auto cam_pos = torch::tensor({cam_pos_v.x, cam_pos_v.y, cam_pos_v.z}, device);
 
-            float scale_modifier = 1.0f;
-            if (const auto *header = reader.Header())
-            {
-                scale_modifier = header->render_scale_modifier;
-            }
-            scale_modifier *= options.point_size;
+            float scale_final = render_scale_modifier * options.point_size;
 
             auto outputs = GaussianRasterizer::apply(
-                means3D,
-                colors,
-                opacities,
-                scales,
-                rotations,
-                scale_modifier,
-                view_ten,
-                proj_t,
-                tan_fovx,
-                tan_fovy,
-                height,
-                width,
+                means3D, colors, opacities, scales, rotations,
+                scale_final,
+                view_ten, proj_t, tan_fovx, tan_fovy,
+                height, width,
                 sh_tensor,
                 use_sh ? static_cast<int>(sh_degree) : 0,
                 cam_pos,
                 false);
-            auto image = outputs[0];
 
-            auto img = image.detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kU8).cpu();
-            img = img.permute({1, 2, 0}).contiguous();
+            // --- OPTIMIZATION 2: GPU Permute ---
+            // Perform CHW -> HWC on GPU, then download. Fixes OpenMP spin.
+            auto img_tensor = outputs[0].detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kU8)
+                  .permute({1, 2, 0}).contiguous().cpu();
 
             glMatrixMode(GL_PROJECTION);
             glLoadIdentity();
@@ -453,7 +422,7 @@ int main(int argc, char **argv)
             glLoadIdentity();
             glRasterPos2f(-1.0f, -1.0f);
             glPixelZoom(1.0f, 1.0f);
-            glDrawPixels(width, height, GL_RGB, GL_UNSIGNED_BYTE, img.data_ptr<uint8_t>());
+            glDrawPixels(width, height, GL_RGB, GL_UNSIGNED_BYTE, img_tensor.data_ptr<uint8_t>());
         }
 
         glfwSwapBuffers(window);

@@ -74,6 +74,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->epochs = std::stoi(value);
             else if (key == "--lr")
                 options->lr = std::stof(value);
+            else if (key == "--lr-decay-epoch")
+                options->lr_decay_epoch = std::stoi(value);
             else if (key == "--output-dir")
                 options->output_dir = value;
             else if (key == "--train-dir")
@@ -86,6 +88,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->scale_lr = std::stof(value);
             else if (key == "--scale-max")
                 options->scale_max_value = std::stof(value);
+            else if (key == "--rot-lr")
+                options->rot_lr = std::stof(value);
+            else if (key == "--offset-lr")
+                options->offset_lr = std::stof(value);
             else if (key == "--offset-reg")
                 options->offset_reg_weight = std::stof(value);
             else if (key == "--pose-reg")
@@ -130,6 +136,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->viewer_every = std::stoi(value);
             else if (key == "--viewer-shm")
                 options->viewer_shm_name = value;
+            else if (key == "--viewer-pose-shm")
+                options->viewer_pose_shm_name = value;
+            else if (key == "--viewer-bind-shm")
+                options->viewer_bind_shm_name = value;
             else
             {
                 std::cerr << "Unknown argument: " << key << std::endl;
@@ -322,7 +332,7 @@ struct GaussianAvatar : torch::nn::Module
         auto ab = face_b - face_a;
         auto ac = face_c - face_a;
         auto cross = torch::cross(ab, ac, 1);
-        auto face_area = 0.5f * torch::norm(cross, 2, 1) * 0.01f;
+        auto face_area = 0.5f * torch::norm(cross, 2, 1);
         auto face_prob = face_area + 1e-12f;
         face_prob = face_prob / face_prob.sum();
         g_face_indices = torch::multinomial(face_prob, num_gaussians, true);
@@ -417,8 +427,10 @@ int main(int argc, char *argv[])
     {
         std::cout << "Usage: gaussian_train --jsonl <path> [--smpl <path>] [--num-gaussians <int>]"
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
+                     " [--lr-decay-epoch <int>]"
                      " [--train-dir <path>] [--viewer-export-dir <path>]"
                      " [--scale-reg <float>] [--scale-max <float>]"
+                     " [--rot-lr <float>] [--offset-lr <float>]"
                      " [--offset-reg <float>] [--pose-reg <float>] [--alpha-loss <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
@@ -430,7 +442,8 @@ int main(int argc, char *argv[])
                      " [--densify-prune-max <int>] [--densify-reset-opacity <float>]"
                      " [--densify-stop-epoch <int>]"
                      " [--viewer|--headless]"
-                     " [--viewer-every <int>] [--viewer-shm <name>]\n";
+                     " [--viewer-every <int>] [--viewer-shm <name>] [--viewer-pose-shm <name>]"
+                     " [--viewer-bind-shm <name>]\n";
         return -1;
     }
     if (!torch::cuda::is_available())
@@ -449,11 +462,14 @@ int main(int argc, char *argv[])
     const int num_gaussians = options.num_gaussians;
     const int epochs = options.epochs;
     const float lr = options.lr;
+    const int lr_decay_epoch = options.lr_decay_epoch;
     const std::string &output_dir = options.output_dir;
     const std::string &viewer_export_dir = options.viewer_export_dir;
     const float scale_reg_weight = options.scale_reg_weight;
     const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
     const float scale_max_value = options.scale_max_value;
+    const float rot_lr = (options.rot_lr < 0.0f) ? lr : options.rot_lr;
+    const float offset_lr = (options.offset_lr < 0.0f) ? lr : options.offset_lr;
     const float offset_reg_weight = options.offset_reg_weight;
     const float pose_reg_weight = options.pose_reg_weight;
     const float color_lr = options.color_lr;
@@ -461,12 +477,12 @@ int main(int argc, char *argv[])
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
     const int densify_every = std::max(1, options.densify_every);
-    const float pose_lr = 1e-4f;
+    const float pose_lr = 1e-3f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
-    const int batch_size = 8;
+    const int batch_size = 4;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -591,6 +607,10 @@ int main(int argc, char *argv[])
                                    (use_sh ? static_cast<uint32_t>((sh_degree + 1) * (sh_degree + 1) * 3) : 0u);
     shared_gaussian::SharedGaussianWriter shared_writer;
     bool publish_viewer = options.enable_viewer;
+    const std::string bind_shm_name = options.viewer_bind_shm_name.empty()
+                                          ? (options.viewer_shm_name + "_bind")
+                                          : options.viewer_bind_shm_name;
+    shared_gaussian::SharedBindWriter bind_writer;
     if (publish_viewer)
     {
         if (!shared_writer.Init(options.viewer_shm_name, static_cast<uint32_t>(num_gaussians),
@@ -600,9 +620,20 @@ int main(int argc, char *argv[])
             std::cerr << "Failed to open shared memory mapping: " << options.viewer_shm_name << std::endl;
             publish_viewer = false;
         }
+        if (publish_viewer)
+        {
+            const uint32_t betas_count = static_cast<uint32_t>(canonical_betas.numel());
+            if (!bind_writer.Init(bind_shm_name, static_cast<uint32_t>(num_gaussians),
+                                  shared_gaussian::kSharedBindStrideFloats, betas_count))
+            {
+                std::cerr << "Failed to open bind shared memory mapping: " << bind_shm_name << std::endl;
+            }
+        }
     }
     std::vector<float> shared_buffer;
     uint64_t shared_frame = 0;
+    std::vector<float> bind_buffer;
+    std::vector<float> bind_betas_buffer;
 
     DensificationConfig densify_cfg;
     densify_cfg.every = densify_every;
@@ -622,47 +653,65 @@ int main(int argc, char *argv[])
     DensificationState densify_state;
     int64_t global_step = 0;
 
-    std::vector<torch::Tensor> base_params = {
-        avatar.g_rots,
-        avatar.g_offsets};
+    std::vector<torch::Tensor> rot_params = {avatar.g_rots};
+    std::vector<torch::Tensor> offset_params = {avatar.g_offsets};
     std::vector<torch::Tensor> scale_params = {avatar.g_scales};
     std::vector<torch::Tensor> color_params = {use_sh ? avatar.g_sh : avatar.g_colors};
     std::vector<torch::Tensor> opacity_params = {avatar.g_opacities};
     std::vector<torch::Tensor> pose_params = {pose_offsets, global_rot_offsets, global_trans_offsets};
-    torch::optim::Adam optimizer(base_params, torch::optim::AdamOptions(lr));
+    float lr_multiplier = 1.0f;
+    torch::optim::Adam optimizer(rot_params, torch::optim::AdamOptions(rot_lr * lr_multiplier));
+    optimizer.add_param_group({offset_params});
+    auto &offset_group = optimizer.param_groups().back();
+    static_cast<torch::optim::AdamOptions &>(offset_group.options()).lr(offset_lr * lr_multiplier);
     optimizer.add_param_group({scale_params});
     auto &scale_group = optimizer.param_groups().back();
-    static_cast<torch::optim::AdamOptions &>(scale_group.options()).lr(scale_lr);
+    static_cast<torch::optim::AdamOptions &>(scale_group.options()).lr(scale_lr * lr_multiplier);
     optimizer.add_param_group({color_params});
     auto &color_group = optimizer.param_groups().back();
-    static_cast<torch::optim::AdamOptions &>(color_group.options()).lr(color_lr);
+    static_cast<torch::optim::AdamOptions &>(color_group.options()).lr(color_lr * lr_multiplier);
     optimizer.add_param_group({opacity_params});
     auto &opacity_group = optimizer.param_groups().back();
-    static_cast<torch::optim::AdamOptions &>(opacity_group.options()).lr(opacity_lr);
+    static_cast<torch::optim::AdamOptions &>(opacity_group.options()).lr(opacity_lr * lr_multiplier);
     optimizer.add_param_group({pose_params});
     auto &pose_group = optimizer.param_groups().back();
-    static_cast<torch::optim::AdamOptions &>(pose_group.options()).lr(pose_lr);
+    static_cast<torch::optim::AdamOptions &>(pose_group.options()).lr(pose_lr * lr_multiplier);
+
+    auto apply_lr_multiplier = [&](float multiplier)
+    {
+        lr_multiplier = multiplier;
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(rot_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(offset_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * lr_multiplier);
+    };
 
     auto rebuild_optimizer = [&]()
     {
-        base_params = {avatar.g_rots, avatar.g_offsets};
+        rot_params = {avatar.g_rots};
+        offset_params = {avatar.g_offsets};
         scale_params = {avatar.g_scales};
         color_params = {use_sh ? avatar.g_sh : avatar.g_colors};
         opacity_params = {avatar.g_opacities};
         pose_params = {pose_offsets, global_rot_offsets, global_trans_offsets};
-        optimizer = torch::optim::Adam(base_params, torch::optim::AdamOptions(lr));
+        optimizer = torch::optim::Adam(rot_params, torch::optim::AdamOptions(rot_lr * lr_multiplier));
+        optimizer.add_param_group({offset_params});
+        auto &new_offset_group = optimizer.param_groups().back();
+        static_cast<torch::optim::AdamOptions &>(new_offset_group.options()).lr(offset_lr * lr_multiplier);
         optimizer.add_param_group({scale_params});
         auto &new_scale_group = optimizer.param_groups().back();
-        static_cast<torch::optim::AdamOptions &>(new_scale_group.options()).lr(scale_lr);
+        static_cast<torch::optim::AdamOptions &>(new_scale_group.options()).lr(scale_lr * lr_multiplier);
         optimizer.add_param_group({color_params});
         auto &new_color_group = optimizer.param_groups().back();
-        static_cast<torch::optim::AdamOptions &>(new_color_group.options()).lr(color_lr);
+        static_cast<torch::optim::AdamOptions &>(new_color_group.options()).lr(color_lr * lr_multiplier);
         optimizer.add_param_group({opacity_params});
         auto &new_opacity_group = optimizer.param_groups().back();
-        static_cast<torch::optim::AdamOptions &>(new_opacity_group.options()).lr(opacity_lr);
+        static_cast<torch::optim::AdamOptions &>(new_opacity_group.options()).lr(opacity_lr * lr_multiplier);
         optimizer.add_param_group({pose_params});
         auto &new_pose_group = optimizer.param_groups().back();
-        static_cast<torch::optim::AdamOptions &>(new_pose_group.options()).lr(pose_lr);
+        static_cast<torch::optim::AdamOptions &>(new_pose_group.options()).lr(pose_lr * lr_multiplier);
     };
 
     torch::Tensor last_render;
@@ -689,8 +738,16 @@ int main(int argc, char *argv[])
     }
 
     std::mt19937 rng(static_cast<unsigned int>(std::random_device{}()));
+    bool lr_decay_applied = false;
     for (int epoch = 0; epoch < epochs; ++epoch)
     {
+        if (!lr_decay_applied && lr_decay_epoch >= 0 && epoch >= lr_decay_epoch)
+        {
+            apply_lr_multiplier(lr_multiplier * 0.5f);
+            lr_decay_applied = true;
+            std::cout << "Applied LR decay at epoch " << epoch
+                      << ": multiplier " << lr_multiplier << std::endl;
+        }
         std::vector<size_t> indices(samples.size());
         std::iota(indices.begin(), indices.end(), 0);
         std::shuffle(indices.begin(), indices.end(), rng);
@@ -924,24 +981,24 @@ int main(int argc, char *argv[])
                         pose_reg_weight * pose_reg;
             // 1. BACKWARD PASS
             loss.backward();
- 
+
             if (avatar.g_scales.grad().defined())
             {
-                torch::NoGradGuard no_grad; 
+                torch::NoGradGuard no_grad;
                 auto mask = torch::tensor({1.0f, 1.0f, 0.0f}, avatar.g_scales.options());
                 avatar.g_scales.grad().mul_(mask);
             }
 
             densify_state.Accumulate(avatar.g_offsets, avatar.g_scales);
             optimizer.step();
- 
+
             {
                 torch::NoGradGuard no_grad;
- 
-                auto rot_norm = avatar.g_rots.norm(2, 1, true); 
+
+                auto rot_norm = avatar.g_rots.norm(2, 1, true);
                 rot_norm = torch::clamp_min(rot_norm, 1e-9);
                 avatar.g_rots.div_(rot_norm);
- 
+
                 float target_thickness = 0.001f;
                 float target_log_scale = std::log(target_thickness);
 
@@ -1004,6 +1061,17 @@ int main(int argc, char *argv[])
                               << scale_reg.item<float>() * scale_reg_weight << " Pose Reg: "
                               << pose_reg.item<float>() * pose_reg_weight << " Recon loss: "
                               << recon_loss.item<float>() << std::endl;
+                    // Calculate components for the BEST inlier sample (or average them if you prefer)
+                    float l1_val = recon_losses[best_inlier_idx].item<float>();
+                    float alpha_val = alpha_losses[best_inlier_idx].item<float>();
+                    float mask_val = outside_losses[best_inlier_idx].item<float>();
+
+                    std::cout << "Epoch " << epoch << " Batch " << batch_step
+                              << " Total: " << total_values[best_inlier_idx]
+                              << " | RGB L1: " << l1_val                       // <--- The true "visual" loss
+                              << " | Alpha: " << alpha_val * alpha_loss_weight // <--- Likely the culprit
+                              << " | Mask: " << mask_val * outside_mask_weight
+                              << std::endl;
                     auto scale_vals_log = (capped_scales(avatar.g_scales) * render_scale_modifier).detach();
                     const float scale_min = scale_vals_log.min().item<float>();
                     const float scale_max = scale_vals_log.max().item<float>();
@@ -1012,42 +1080,7 @@ int main(int argc, char *argv[])
                               << scale_min << " / " << scale_mean << " / " << scale_max << std::endl;
                     std::cout << "Global step: " << global_step << std::endl;
                 }
-
-                if (publish_viewer && (batch_step % viewer_every == 0))
-                {
-                    torch::Tensor positions;
-                    torch::Tensor rotations;
-                    std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
-                    torch::Tensor colors;
-                    if (use_sh)
-                    {
-                        using torch::indexing::Slice;
-                        colors = avatar.g_sh.index({Slice(), 0, Slice()});
-                    }
-                    else
-                    {
-                        colors = avatar.g_colors;
-                    }
-                    auto opacities = avatar.g_opacities;
-                    auto scales = capped_scales(avatar.g_scales);
-                    torch::Tensor sh_to_send = sh;
-                    if (use_sh && sh_degree > 0)
-                    {
-                        sh_to_send = RotateSH(avatar.g_sh, rotations);
-                    }
-                    if (BuildSharedGaussianBuffer(positions, colors, opacities, scales, rotations, sh_to_send, sh_degree,
-                                                  &shared_buffer))
-                    {
-                        shared_writer.Write(shared_buffer.data(), static_cast<uint32_t>(positions.size(0)),
-                                            shared_frame++);
-                    }
-                    if (!viewer_export_dir.empty())
-                    {
-                        SaveViewerData(viewer_out_path, epoch, positions, colors, opacities, scales, rotations,
-                                       sh_to_send, sh_degree);
-                    }
-                }
-
+ 
                 dropped_since_log += skipped_malformed + skipped_mask + skipped_outlier;
                 if ((batch_step + 1) % 10 == 0)
                 {
@@ -1057,6 +1090,96 @@ int main(int argc, char *argv[])
                 }
             }
         }
+
+        // --- MODIFIED SECTION START ---
+
+        // 1. Always calculate canonical geometry for saving/viewing
+        torch::Tensor positions, rotations;
+        std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
+
+        torch::Tensor colors;
+        if (use_sh)
+        {
+            using torch::indexing::Slice;
+            colors = avatar.g_sh.index({Slice(), 0, Slice()});
+        }
+        else
+        {
+            colors = avatar.g_colors;
+        }
+        auto opacities = avatar.g_opacities;
+        auto scales = capped_scales(avatar.g_scales);
+
+        torch::Tensor sh_to_send = sh;
+        if (use_sh && sh_degree > 0)
+        {
+            sh_to_send = RotateSH(avatar.g_sh, rotations);
+        }
+
+        // 2. Handle Shared Memory Viewer (Only if enabled)
+        if (publish_viewer)
+        {
+            const int64_t bind_count = avatar.g_offsets.size(0);
+            if (bind_count > 0)
+            {
+                auto bary_cpu = avatar.g_bary_coords.to(torch::kCPU).contiguous();
+                auto offsets_cpu = avatar.g_offsets.to(torch::kCPU).contiguous();
+                auto rots_cpu = avatar.g_rots.to(torch::kCPU).contiguous();
+                auto faces_cpu = avatar.g_face_indices.to(torch::kCPU).contiguous();
+
+                const float *bary_ptr = bary_cpu.data_ptr<float>();
+                const float *off_ptr = offsets_cpu.data_ptr<float>();
+                const float *rot_ptr = rots_cpu.data_ptr<float>();
+                const int64_t *face_ptr = faces_cpu.data_ptr<int64_t>();
+
+                const uint32_t stride = shared_gaussian::kSharedBindStrideFloats;
+                bind_buffer.resize(static_cast<size_t>(bind_count) * stride);
+                for (int64_t i = 0; i < bind_count; ++i)
+                {
+                    const size_t base = static_cast<size_t>(i) * stride;
+                    const size_t base3 = static_cast<size_t>(i) * 3u;
+                    const size_t base4 = static_cast<size_t>(i) * 4u;
+                    bind_buffer[base + 0] = bary_ptr[base3 + 0];
+                    bind_buffer[base + 1] = bary_ptr[base3 + 1];
+                    bind_buffer[base + 2] = bary_ptr[base3 + 2];
+                    bind_buffer[base + 3] = off_ptr[base3 + 0];
+                    bind_buffer[base + 4] = off_ptr[base3 + 1];
+                    bind_buffer[base + 5] = off_ptr[base3 + 2];
+                    bind_buffer[base + 6] = rot_ptr[base4 + 0];
+                    bind_buffer[base + 7] = rot_ptr[base4 + 1];
+                    bind_buffer[base + 8] = rot_ptr[base4 + 2];
+                    bind_buffer[base + 9] = rot_ptr[base4 + 3];
+                    bind_buffer[base + 10] = static_cast<float>(face_ptr[i]);
+                }
+
+                auto betas_cpu = canonical_betas.to(torch::kCPU).contiguous();
+                const int64_t betas_count = betas_cpu.numel();
+                bind_betas_buffer.resize(static_cast<size_t>(betas_count));
+                std::memcpy(bind_betas_buffer.data(), betas_cpu.data_ptr<float>(),
+                            static_cast<size_t>(betas_count) * sizeof(float));
+
+                bind_writer.Write(bind_betas_buffer.data(), static_cast<uint32_t>(betas_count),
+                                  bind_buffer.data(), static_cast<uint32_t>(bind_count));
+            }
+            if (BuildSharedGaussianBuffer(positions, colors, opacities, scales, rotations, sh_to_send, sh_degree,
+                                          &shared_buffer))
+            {
+                shared_writer.Write(shared_buffer.data(), static_cast<uint32_t>(positions.size(0)),
+                                    shared_frame++);
+            }
+        }
+
+        // 3. Save to Disk (Every epoch, Overwrite)
+        {
+            // Use viewer_export_dir if provided, otherwise default to output_dir
+            std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path;
+
+            // Overwrite a constant epoch index on each save.
+            SaveViewerDataOverwrite(save_dir, positions, colors, opacities, scales, rotations,
+                                    sh_to_send, sh_degree);
+        }
+
+        // --- MODIFIED SECTION END ---
 
         auto render_view = [&](size_t sample_index,
                                const TrainSample &sample,

@@ -119,6 +119,14 @@ if(ENABLE_VIEWER)
     target_link_libraries(gaussian_viewer PRIVATE OpenGL::GL glfw "${TORCH_LIBRARIES}" GaussianRasterizer)
     target_include_directories(gaussian_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(gaussian_viewer PRIVATE NOMINMAX)
+
+    add_executable(gaussian_viewer_stdout
+        gaussian_viewer_stdout.cpp
+        utils/viewer/ViewerMath.cpp
+    )
+    target_link_libraries(gaussian_viewer_stdout PRIVATE OpenGL::GL glfw "${TORCH_LIBRARIES}" GaussianRasterizer)
+    target_include_directories(gaussian_viewer_stdout PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(gaussian_viewer_stdout PRIVATE NOMINMAX)
 endif()
 
 # ==========================================

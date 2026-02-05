@@ -206,3 +206,15 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
     std::cout << "Saved viewer data to " << epoch_dir.string() << std::endl;
     return true;
 }
+
+bool SaveViewerDataOverwrite(const std::filesystem::path &output_dir,
+                             const torch::Tensor &positions,
+                             const torch::Tensor &colors,
+                             const torch::Tensor &opacities,
+                             const torch::Tensor &scales,
+                             const torch::Tensor &rotations,
+                             const torch::Tensor &sh,
+                             int sh_degree)
+{
+    return SaveViewerData(output_dir, 0, positions, colors, opacities, scales, rotations, sh, sh_degree);
+}

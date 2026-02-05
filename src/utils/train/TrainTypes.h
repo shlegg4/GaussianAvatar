@@ -26,11 +26,14 @@ struct TrainOptions
     int num_gaussians = 5000;
     int epochs = 1;
     float lr = 0.01f;
+    int lr_decay_epoch = -1;
     std::string output_dir = "outputs";
     std::string viewer_export_dir;
     float scale_reg_weight = 200.0f;
     float scale_lr = -1.0f;
     float scale_max_value = 0.02f;
+    float rot_lr = -1.0f;
+    float offset_lr = -1.0f;
     float offset_reg_weight = 0.01f;
     float pose_reg_weight = 0.01f;
     float alpha_loss_weight = 0.1f;
@@ -52,4 +55,6 @@ struct TrainOptions
     bool enable_viewer = false;
     int viewer_every = 1;
     std::string viewer_shm_name = "GaussianAvatarShared";
+    std::string viewer_pose_shm_name;
+    std::string viewer_bind_shm_name;
 };
