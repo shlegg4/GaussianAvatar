@@ -24,6 +24,17 @@ struct SmplifyLiteOptions {
     float target_height = 1.77f;
     float height_weight = 1000.0f; 
     bool lock_wrist_ankle = true;
+    float reproj_robust_sigma = 50.0f;
+};
+
+struct SmplifyMultiViewObservation {
+    std::vector<cv::Point2f> keypoints;
+    std::vector<float> keypoint_scores;
+    cv::Matx33f K;
+    cv::Matx33f R;
+    cv::Vec3f t;
+    float img_w = 0.0f;
+    float img_h = 0.0f;
 };
 
 bool SmplifyLite(SMPLLayer& smpl_layer,
@@ -37,3 +48,9 @@ bool SmplifyLite(SMPLLayer& smpl_layer,
                  const cv::Mat* render_frame = nullptr,
                  const std::string* render_dir = nullptr,
                  int frame_idx = 0);
+
+bool SmplifyLiteMultiView(SMPLLayer& smpl_layer,
+                          const std::vector<SmplifyMultiViewObservation>& views,
+                          SmplResult* io_res,
+                          const SmplifyLiteOptions& options = {},
+                          float* out_y_sign = nullptr);

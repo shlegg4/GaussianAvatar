@@ -1,6 +1,7 @@
 #include "SmplifyLite.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
@@ -137,6 +138,17 @@ namespace
         return torch::from_blob(target_xy.data(), {static_cast<int64_t>(target_xy.size() / 2), 2},
                                 torch::kFloat)
             .clone();
+    }
+
+    torch::Tensor Matx33fToTensor(const cv::Matx33f& m, torch::Device device)
+    {
+        return torch::from_blob((void*)m.val, {3, 3}, torch::kFloat).clone().to(device);
+    }
+
+    torch::Tensor Vec3fToTensor(const cv::Vec3f& v, torch::Device device)
+    {
+        std::array<float, 3> data = {v[0], v[1], v[2]};
+        return torch::from_blob(data.data(), {3}, torch::kFloat).clone().to(device);
     }
 
     void DrawJointsOverlayMetric(cv::Mat &frame,
@@ -448,5 +460,193 @@ bool SmplifyLite(SMPLLayer &smpl_layer,
     }
 
     std::cout << "[SmplifyLite] Done." << std::endl;
+    return true;
+}
+
+bool SmplifyLiteMultiView(SMPLLayer& smpl_layer,
+                          const std::vector<SmplifyMultiViewObservation>& views,
+                          SmplResult* io_res,
+                          const SmplifyLiteOptions& options,
+                          float* out_y_sign)
+{
+    if (!io_res || views.empty())
+    {
+        std::cout << "[SmplifyLiteMultiView] Skipping: invalid inputs." << std::endl;
+        return false;
+    }
+
+    const auto device = smpl_layer.v_template.device();
+
+    struct ViewData
+    {
+        torch::Tensor target_xy;
+        torch::Tensor weights;
+        torch::Tensor idx_tensor;
+        torch::Tensor R;
+        torch::Tensor t;
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float cx = 0.0f;
+        float cy = 0.0f;
+    };
+
+    std::vector<ViewData> valid_views;
+    valid_views.reserve(views.size());
+
+    for (const auto& view : views)
+    {
+        if (view.keypoints.empty() || view.keypoints.size() != view.keypoint_scores.size())
+        {
+            continue;
+        }
+
+        std::vector<int> smpl_indices;
+        std::vector<float> weights_vec;
+        auto target_xy = BuildTargetTensor(view.keypoints, view.keypoint_scores,
+                                           options.keypoint_threshold,
+                                           options.keypoint_weight_floor,
+                                           options.keypoint_weight_pow,
+                                           &smpl_indices, &weights_vec);
+        if (!target_xy.defined() || smpl_indices.empty())
+        {
+            continue;
+        }
+
+        auto weights = torch::from_blob(weights_vec.data(),
+                                        {static_cast<int64_t>(weights_vec.size())},
+                                        torch::kFloat)
+                           .clone();
+        weights = weights / (weights.mean() + 1e-8f);
+
+        auto idx_tensor = torch::from_blob(smpl_indices.data(),
+                                           {static_cast<int64_t>(smpl_indices.size())},
+                                           torch::kLong)
+                              .clone();
+
+        ViewData vd;
+        vd.target_xy = target_xy.to(device);
+        vd.weights = weights.to(device);
+        vd.idx_tensor = idx_tensor.to(device);
+        vd.R = Matx33fToTensor(view.R, device);
+        vd.t = Vec3fToTensor(view.t, device);
+        vd.fx = view.K(0, 0);
+        vd.fy = view.K(1, 1);
+        vd.cx = view.K(0, 2);
+        vd.cy = view.K(1, 2);
+        valid_views.push_back(std::move(vd));
+    }
+
+    if (valid_views.empty())
+    {
+        std::cout << "[SmplifyLiteMultiView] Skipping: no valid views." << std::endl;
+        return false;
+    }
+
+    auto pose_init = PoseToAxisAngle(*io_res).clone().to(device);
+    auto betas_init = torch::from_blob(io_res->shape.data(),
+                                       {1, static_cast<int64_t>(io_res->shape.size())},
+                                       torch::kFloat)
+                          .clone()
+                          .to(device);
+
+    auto pose = pose_init.clone().detach().set_requires_grad(true);
+    auto betas = betas_init.clone().detach().set_requires_grad(true);
+
+    cv::Vec3f t_init_val(0.0f, 0.0f, 0.0f);
+    if (io_res->camera.size() >= 3)
+    {
+        t_init_val = cv::Vec3f(io_res->camera[0], io_res->camera[1], io_res->camera[2]);
+    }
+    auto t_tensor = torch::tensor({t_init_val[0], t_init_val[1], t_init_val[2]}, torch::kFloat)
+                        .reshape({1, 3})
+                        .to(device)
+                        .detach()
+                        .requires_grad_(options.optimize_translation);
+
+    std::vector<torch::optim::OptimizerParamGroup> param_groups;
+    param_groups.emplace_back(
+        std::vector<torch::Tensor>{pose},
+        std::make_unique<torch::optim::AdamOptions>(options.lr)
+    );
+
+    std::vector<torch::Tensor> robust_params = {betas};
+    robust_params.push_back(t_tensor);
+
+    param_groups.emplace_back(
+        robust_params,
+        std::make_unique<torch::optim::AdamOptions>(options.lr * 100.0)
+    );
+
+    torch::optim::Adam optimizer(param_groups, torch::optim::AdamOptions(options.lr));
+
+    float prev_loss_val = std::numeric_limits<float>::infinity();
+    const float sigma2 = options.reproj_robust_sigma * options.reproj_robust_sigma;
+
+    for (int iter = 0; iter < options.num_iters; ++iter)
+    {
+        optimizer.zero_grad();
+
+        auto smpl_out = smpl_layer.forward(betas, pose, t_tensor);
+        auto joints = smpl_out.joints.squeeze(0);
+
+        torch::Tensor total_data = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat).device(device));
+        int view_count = 0;
+
+        for (const auto& view : valid_views)
+        {
+            auto selected = joints.index_select(0, view.idx_tensor);
+            auto Xc = torch::matmul(selected, view.R.t()) + view.t;
+            auto X = Xc.index({torch::indexing::Slice(), 0});
+            auto Y = Xc.index({torch::indexing::Slice(), 1});
+            auto Z = Xc.index({torch::indexing::Slice(), 2});
+
+            auto u = (view.fx * X / (Z + 1e-9f)) + view.cx;
+            auto v = (view.fy * Y / (Z + 1e-9f)) + view.cy;
+            auto proj = torch::stack({u, v}, 1);
+
+            auto diff = proj - view.target_xy;
+            auto dist2 = (diff * diff).sum(1);
+            if (sigma2 > 0.0f)
+            {
+                dist2 = dist2 / (dist2 + sigma2);
+            }
+            auto data_loss = (dist2 * view.weights).mean();
+            total_data = total_data + data_loss;
+            ++view_count;
+        }
+
+        if (view_count > 0)
+        {
+            total_data = total_data / static_cast<float>(view_count);
+        }
+
+        auto pose_reg = (pose - pose_init).pow(2).mean() * options.pose_reg;
+        auto betas_reg = (betas - betas_init).pow(2).mean() * options.betas_reg;
+
+        auto total = total_data + pose_reg + betas_reg;
+        const float curr_loss_val = total.item<float>();
+        if (iter >= options.min_iters && std::abs(prev_loss_val - curr_loss_val) < options.loss_tol)
+        {
+            break;
+        }
+        prev_loss_val = curr_loss_val;
+        total.backward();
+        optimizer.step();
+    }
+
+    auto pose_cpu = pose.detach().cpu();
+    auto betas_cpu = betas.detach().cpu();
+    auto t_cpu = t_tensor.detach().cpu();
+
+    io_res->pose.assign(pose_cpu.data_ptr<float>(), pose_cpu.data_ptr<float>() + pose_cpu.numel());
+    io_res->shape.assign(betas_cpu.data_ptr<float>(), betas_cpu.data_ptr<float>() + betas_cpu.numel());
+    io_res->camera.assign({t_cpu[0][0].item<float>(), t_cpu[0][1].item<float>(), t_cpu[0][2].item<float>()});
+
+    if (out_y_sign)
+    {
+        *out_y_sign = 1.0f;
+    }
+
+    std::cout << "[SmplifyLiteMultiView] Done." << std::endl;
     return true;
 }
