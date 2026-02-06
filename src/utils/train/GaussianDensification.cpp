@@ -174,7 +174,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
 
         // FIX: Subtract log to shrink, 0.5 opacity for both
         auto new_scale = parent_scales - delta_log;
-        auto new_opacity = parent_opacities * 0.5f;
+        auto new_opacity = parent_opacities;
 
         // Update Parent
         kept_scales.index_put_({parent_local}, new_scale);

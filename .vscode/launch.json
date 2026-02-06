@@ -27,11 +27,11 @@
                 "--densify-max-clones", "100000",
                 "--densify-max", "100000",
                 "--densify-scale", "0.001", 
-                "--densify-min-grad", "0.001",
+                "--densify-min-grad", "0.0001",
                 "--densify-reset-opacity", "0", 
                 "--densify-prune-opacity", "0.0001",
                 "--densify-prune-max", "100000",
-                "--num-gaussians", "80000",
+                "--num-gaussians", "40000",
                 "--viewer",
                 "--sh-degree", "1"
             ],

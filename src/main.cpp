@@ -497,7 +497,7 @@ int main(int argc, char *argv[])
     const int viewer_every = std::max(1, options.viewer_every);
     const bool viewer_stream_poses = options.viewer_stream_poses;
     const int densify_every = std::max(1, options.densify_every);
-    const float pose_lr = 5e-4f;
+    const float pose_lr = 1e-3f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
     const float render_scale_modifier = 1.0f;
