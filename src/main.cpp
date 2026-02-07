@@ -77,6 +77,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->lr = std::stof(value);
             else if (key == "--lr-decay-epoch")
                 options->lr_decay_epoch = std::stoi(value);
+            else if (key == "--lr-decay-multiplier")
+                options->lr_decay_multiplier = std::stof(value);
+            else if (key == "--lr-min-multiplier")
+                options->lr_min_multiplier = std::stof(value);
             else if (key == "--output-dir")
                 options->output_dir = value;
             else if (key == "--train-dir")
@@ -97,6 +101,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->offset_reg_weight = std::stof(value);
             else if (key == "--pose-reg")
                 options->pose_reg_weight = std::stof(value);
+            else if (key == "--pose-lr")
+                options->pose_lr = std::stof(value);
             else if (key == "--alpha-loss")
                 options->alpha_loss_weight = std::stof(value);
             else if (key == "--lambda-dssim")
@@ -488,11 +494,12 @@ int main(int argc, char *argv[])
     {
         std::cout << "Usage: gaussian_train --jsonl <path> [--smpl <path>] [--num-gaussians <int>]"
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
-                     " [--lr-decay-epoch <int>]"
+                     " [--lr-decay-epoch <int>] [--lr-decay-multiplier <float>]"
+                     " [--lr-min-multiplier <float>]"
                      " [--train-dir <path>] [--viewer-export-dir <path>]"
                      " [--scale-reg <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
-                     " [--offset-reg <float>] [--pose-reg <float>] [--alpha-loss <float>]"
+                     " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>]"
                      " [--lambda-dssim <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
@@ -525,6 +532,8 @@ int main(int argc, char *argv[])
     const int epochs = options.epochs;
     const float lr = options.lr;
     const int lr_decay_epoch = options.lr_decay_epoch;
+    const float lr_decay_multiplier = options.lr_decay_multiplier;
+    const float lr_min_multiplier = options.lr_min_multiplier;
     const std::string &output_dir = options.output_dir;
     const std::string &viewer_export_dir = options.viewer_export_dir;
     const float scale_reg_weight = options.scale_reg_weight;
@@ -534,13 +543,13 @@ int main(int argc, char *argv[])
     const float offset_lr = (options.offset_lr < 0.0f) ? lr : options.offset_lr;
     const float offset_reg_weight = options.offset_reg_weight;
     const float pose_reg_weight = options.pose_reg_weight;
+    const float pose_lr = options.pose_lr;
     const float color_lr = options.color_lr;
     const float opacity_lr = (options.opacity_lr < 0.0f) ? lr : options.opacity_lr;
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
     const bool viewer_stream_poses = options.viewer_stream_poses;
     const int densify_every = std::max(1, options.densify_every);
-    const float pose_lr = 5e-4f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
     const float lambda_dssim = options.lambda_dssim;
@@ -729,6 +738,8 @@ int main(int argc, char *argv[])
     std::vector<torch::Tensor> opacity_params = {avatar.g_opacities};
     std::vector<torch::Tensor> pose_params = {pose_offsets, global_rot_offsets, global_trans_offsets};
     float lr_multiplier = 1.0f;
+    float pose_lr_multiplier = 1.0f;
+    bool lr_decay_applied = false;
     torch::optim::Adam optimizer(rot_params, torch::optim::AdamOptions(rot_lr * lr_multiplier));
     optimizer.add_param_group({offset_params});
     auto &offset_group = optimizer.param_groups().back();
@@ -746,15 +757,15 @@ int main(int argc, char *argv[])
     auto &pose_group = optimizer.param_groups().back();
     static_cast<torch::optim::AdamOptions &>(pose_group.options()).lr(pose_lr * lr_multiplier);
 
-    auto apply_lr_multiplier = [&](float multiplier)
+    auto apply_lr_multiplier = [&](float pose_multiplier)
     {
-        lr_multiplier = multiplier;
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(rot_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(offset_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * lr_multiplier);
+        pose_lr_multiplier = pose_multiplier;
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(rot_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(offset_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * pose_lr_multiplier);
     };
 
     auto rebuild_optimizer = [&]()
@@ -780,7 +791,7 @@ int main(int argc, char *argv[])
         static_cast<torch::optim::AdamOptions &>(new_opacity_group.options()).lr(opacity_lr * lr_multiplier);
         optimizer.add_param_group({pose_params});
         auto &new_pose_group = optimizer.param_groups().back();
-        static_cast<torch::optim::AdamOptions &>(new_pose_group.options()).lr(pose_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(new_pose_group.options()).lr(pose_lr * pose_lr_multiplier);
     };
 
     torch::Tensor last_render;
@@ -807,15 +818,34 @@ int main(int argc, char *argv[])
     }
 
     std::mt19937 rng(static_cast<unsigned int>(std::random_device{}()));
-    bool lr_decay_applied = false;
     for (int epoch = 0; epoch < epochs; ++epoch)
     {
-        if (!lr_decay_applied && lr_decay_epoch >= 0 && epoch >= lr_decay_epoch)
+        if (lr_decay_epoch >= 0 && epoch >= lr_decay_epoch)
         {
-            apply_lr_multiplier(lr_multiplier * 0.5f);
-            lr_decay_applied = true;
-            std::cout << "Applied LR decay at epoch " << epoch
-                      << ": multiplier " << lr_multiplier << std::endl;
+            if (!lr_decay_applied)
+            {
+                lr_decay_applied = true;
+            }
+            const float next_pose_multiplier = std::max(pose_lr_multiplier * lr_decay_multiplier, lr_min_multiplier);
+            apply_lr_multiplier(next_pose_multiplier);
+            std::cout << "Applied pose LR decay at epoch " << epoch
+                      << ": pose multiplier " << pose_lr_multiplier << std::endl;
+        }
+        {
+            const auto rot_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr();
+            const auto offset_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr();
+            const auto scale_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr();
+            const auto color_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr();
+            const auto opacity_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr();
+            const auto pose_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr();
+            std::cout << "Epoch " << epoch << " LRs: "
+                      << "rot=" << rot_lr_eff
+                      << " offset=" << offset_lr_eff
+                      << " scale=" << scale_lr_eff
+                      << " color=" << color_lr_eff
+                      << " opacity=" << opacity_lr_eff
+                      << " pose=" << pose_lr_eff
+                      << std::endl;
         }
         std::vector<size_t> indices(samples.size());
         std::iota(indices.begin(), indices.end(), 0);
