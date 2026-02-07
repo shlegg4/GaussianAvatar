@@ -99,6 +99,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->pose_reg_weight = std::stof(value);
             else if (key == "--alpha-loss")
                 options->alpha_loss_weight = std::stof(value);
+            else if (key == "--lambda-dssim")
+                options->lambda_dssim = std::stof(value);
             else if (key == "--color-lr")
                 options->color_lr = std::stof(value);
             else if (key == "--opacity-lr")
@@ -314,6 +316,46 @@ bool BuildSharedGaussianBuffer(const torch::Tensor &positions, const torch::Tens
     return true;
 }
 
+// --- SSIM Implementation Start ---
+torch::Tensor create_window(int window_size, int channel)
+{
+    auto t = torch::arange(window_size, torch::kFloat32) - window_size / 2;
+    auto gauss = torch::exp(-(t * t) / (2 * 1.5 * 1.5));
+    gauss = gauss / gauss.sum();
+
+    auto window_2d = gauss.unsqueeze(1) * gauss.unsqueeze(0);
+    return window_2d.expand({channel, 1, window_size, window_size}).contiguous();
+}
+
+torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, int window_size = 11)
+{
+    auto inp1 = (img1.dim() == 3) ? img1.unsqueeze(0) : img1;
+    auto inp2 = (img2.dim() == 3) ? img2.unsqueeze(0) : img2;
+
+    const int channel = static_cast<int>(inp1.size(1));
+    auto window = create_window(window_size, channel).to(inp1.device());
+
+    auto mu1 = torch::conv2d(inp1, window, {}, 1, window_size / 2, 1, channel);
+    auto mu2 = torch::conv2d(inp2, window, {}, 1, window_size / 2, 1, channel);
+
+    auto mu1_sq = mu1.pow(2);
+    auto mu2_sq = mu2.pow(2);
+    auto mu1_mu2 = mu1 * mu2;
+
+    auto sigma1_sq = torch::conv2d(inp1 * inp1, window, {}, 1, window_size / 2, 1, channel) - mu1_sq;
+    auto sigma2_sq = torch::conv2d(inp2 * inp2, window, {}, 1, window_size / 2, 1, channel) - mu2_sq;
+    auto sigma12 = torch::conv2d(inp1 * inp2, window, {}, 1, window_size / 2, 1, channel) - mu1_mu2;
+
+    const float C1 = 0.01f * 0.01f;
+    const float C2 = 0.03f * 0.03f;
+
+    auto ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) /
+                    ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2));
+
+    return ssim_map.mean();
+}
+// --- SSIM Implementation End ---
+
 struct GaussianAvatar : torch::nn::Module
 {
     std::shared_ptr<SMPLLayer> smpl;
@@ -451,6 +493,7 @@ int main(int argc, char *argv[])
                      " [--scale-reg <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
                      " [--offset-reg <float>] [--pose-reg <float>] [--alpha-loss <float>]"
+                     " [--lambda-dssim <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
                      " [--densify-every <int>] [--densify-max <int>] [--densify-max-clones <int>]"
@@ -500,6 +543,7 @@ int main(int argc, char *argv[])
     const float pose_lr = 5e-4f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
+    const float lambda_dssim = options.lambda_dssim;
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
     const int tile_size = 64;
@@ -543,6 +587,7 @@ int main(int argc, char *argv[])
     }
 
     auto device = torch::kCUDA;
+    auto storage_device = torch::kCPU;
     std::vector<CachedSampleData> cached;
     cached.resize(samples.size());
     for (size_t i = 0; i < samples.size(); ++i)
@@ -563,7 +608,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        auto target = LoadImageTensor(crop, device);
+        auto target = LoadImageTensor(crop, storage_device);
         if (!target.defined() || target.dim() != 3 || target.size(0) != 3)
         {
             cached[i] = std::move(entry);
@@ -577,7 +622,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        auto matte_mask = LoadMatteMaskTensor(matte, W, H, device);
+        auto matte_mask = LoadMatteMaskTensor(matte, W, H, storage_device);
         if (!matte_mask.defined())
         {
             cached[i] = std::move(entry);
@@ -786,6 +831,7 @@ int main(int argc, char *argv[])
             std::vector<torch::Tensor> recon_losses;
             std::vector<torch::Tensor> outside_losses;
             std::vector<torch::Tensor> alpha_losses;
+            std::vector<torch::Tensor> ssim_losses;
             std::vector<float> recon_values;
             std::vector<float> total_values;
             std::vector<TrainSample> batch_samples;
@@ -813,7 +859,7 @@ int main(int argc, char *argv[])
                     skipped_malformed++;
                     continue;
                 }
-                auto target = cached_entry.target;
+                auto target = cached_entry.target.to(device);
                 const int H = static_cast<int>(target.size(1));
                 const int W = static_cast<int>(target.size(2));
                 if (H <= 0 || W <= 0)
@@ -907,7 +953,8 @@ int main(int argc, char *argv[])
                     skipped_malformed++;
                     continue;
                 }
-                if (!IsMaskCoverageValidTensor(image, cached_entry.matte_mask, 0.3f, render_threshold))
+                auto matte_mask = cached_entry.matte_mask.to(device);
+                if (!IsMaskCoverageValidTensor(image, matte_mask, 0.3f, render_threshold))
                 {
                     skipped_mask++;
                     continue;
@@ -924,7 +971,9 @@ int main(int argc, char *argv[])
 
                 auto image_crop = image.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
                 auto target_crop = target.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
-                auto matte_crop = cached_entry.matte_mask.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
+                auto ssim_value = ssim(image_crop, target_crop);
+                auto d_ssim_loss = (1.0f - ssim_value);
+                auto matte_crop = matte_mask.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
                 auto alpha_crop = alpha.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
 
                 auto outside_mask = 1.0f - matte_crop;
@@ -983,6 +1032,7 @@ int main(int argc, char *argv[])
                 recon_losses.push_back(recon_loss);
                 outside_losses.push_back(outside_loss);
                 alpha_losses.push_back(alpha_loss);
+                ssim_losses.push_back(d_ssim_loss);
                 recon_values.push_back(loss_value);
                 total_values.push_back(loss_value + outside_mask_weight * outside_value + alpha_loss_weight * alpha_value);
                 batch_samples.push_back(sample);
@@ -1029,6 +1079,7 @@ int main(int argc, char *argv[])
             }
 
             torch::Tensor recon_sum = torch::zeros({}, torch::TensorOptions().device(device));
+            torch::Tensor ssim_sum = torch::zeros({}, torch::TensorOptions().device(device));
             int inlier_count = 0;
             int skipped_outlier = 0;
             int last_inlier_idx = -1;
@@ -1044,6 +1095,7 @@ int main(int argc, char *argv[])
                 recon_sum = recon_sum + recon_losses[i] +
                             outside_mask_weight * outside_losses[i] +
                             alpha_loss_weight * alpha_losses[i];
+                ssim_sum = ssim_sum + ssim_losses[i];
                 inlier_count++;
                 last_inlier_idx = static_cast<int>(i);
                 if (total_values[i] < best_inlier_loss)
@@ -1065,6 +1117,7 @@ int main(int argc, char *argv[])
             }
 
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
+            auto avg_ssim_loss = ssim_sum / static_cast<float>(inlier_count);
             auto current_scales = torch::exp(avatar.g_scales) * render_scale_modifier;
 
             auto all_scales_sq = current_scales.pow(2).sum(1);
@@ -1074,7 +1127,8 @@ int main(int argc, char *argv[])
             auto pose_reg = torch::mean(pose_offsets.pow(2)) +
                             torch::mean(global_rot_offsets.pow(2)) +
                             torch::mean(global_trans_offsets.pow(2));
-            auto loss = recon_loss +
+            auto loss = (1.0f - lambda_dssim) * recon_loss +
+                        lambda_dssim * avg_ssim_loss +
                         offset_reg_weight * offset_reg +
                         scale_reg_weight * scale_reg +
                         pose_reg_weight * pose_reg;

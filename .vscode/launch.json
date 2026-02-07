@@ -8,22 +8,19 @@
             "preLaunchTask": "CMake: Build (Ninja)",
             "program": "${workspaceFolder}/src/build/smpl_test.exe",
             "args": [
-                "--jsonl", "${workspaceFolder}/outputs/gaussian_train.jsonl",
+                "--jsonl", "${workspaceFolder}/outputs_3/gaussian_train.jsonl",
                 "--smpl", "${workspaceFolder}/src/smpl_data.pt", 
-                "--epochs", "500",
-                "--lr", "0.0001",
-                "--lr-decay-epoch", "100",
-                "--rot-lr", "0.001",
-                "--offset-lr", "0.0001",
-                "--color-lr", "0.005",
-                "--opacity-lr", "0.001",
-                "--scale-lr", "0.005",
-                "--alpha-loss", "0.5",
-                "--output-dir", "C:/Users/Sam/Documents/GaussianAvatar/outputs/gaussian_renders",
-                "--scale-reg", "0.01",
+                "--epochs", "50",
+                "--lr", "0.0005",
+                "--color-lr", "0.01",
+                "--opacity-lr", "0.01",
+                "--scale-lr", "0.01",
+                "--alpha-loss", "1.0",
+                "--output-dir", "D:/Dissertation/Compiled_GaussianAvatar/outputs_3/gaussian_renders",
+                "--scale-reg", "200.0",
                 "--scale-max", "0.01", 
                 "--offset-reg", "0.01",
-                "--densify-every", "50",
+                "--densify-every", "500",
                 "--densify-max-clones", "100000",
                 "--densify-max", "100000",
                 "--densify-scale", "0.001", 
@@ -31,7 +28,7 @@
                 "--densify-reset-opacity", "0", 
                 "--densify-prune-opacity", "0.0001",
                 "--densify-prune-max", "100000",
-                "--num-gaussians", "80000",
+                "--num-gaussians", "40000",
                 "--viewer",
                 "--sh-degree", "1"
             ],
@@ -40,7 +37,7 @@
             "environment": [
                 {
                     "name": "PATH",
-                    "value": "C:/Program Files/NVIDIA/CUDNN/v9.18/bin;C:/opencv/build/x64/vc16/bin;C:/libtorch/lib;${env:PATH}"
+                    "value": "D:/cudnn-windows-x86_64-8.9.7.29_cuda12-archive/bin;D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
 
                 }
             ],
@@ -53,16 +50,13 @@
             "preLaunchTask": "CMake: Build (Ninja)",
             "program": "${workspaceFolder}/src/build/hmr_inference.exe", 
             "args": [
-                "C:/Users/Sam/Documents/GaussianAvatar/cliff_hr48_static.onnx", 
-                "C:/Users/Sam/Videos/2026-02-03 15-07-55.mp4",
-                "--output", "C:/Users/Sam/Documents/GaussianAvatar/outputs/",
-                "--rtmpose", "C:/Users/Sam/Documents/GaussianAvatar/rtmpose26.onnx", 
-                "--rtmpose-cuda",
-                "--yolo", "C:/Users/Sam/Documents/GaussianAvatar/yolov8n.onnx",
-                "--yolo-cuda",
-                "--modnet", "C:/Users/Sam/Documents/GaussianAvatar/modnet.onnx",
-                "--modnet-cuda",
-                "--frame-stride", "10",
+                "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx", 
+                "D:/Users/Samuel/Downloads/IMG_3986.MOV",
+                "--output", "D:/Dissertation/Compiled_GaussianAvatar/outputs_3/",
+                "--rtmpose", "D:/Dissertation/Compiled_GaussianAvatar/rtmpose26.onnx",  
+                "--yolo", "D:/Dissertation/Compiled_GaussianAvatar/yolov8n.onnx", 
+                "--modnet", "D:/Dissertation/Compiled_GaussianAvatar/modnet.onnx", 
+                "--frame-stride", "5",
                 "--smplify-requires-yolo"
             ],
             "stopAtEntry": false,
@@ -70,7 +64,7 @@
             "environment": [
                 {
                     "name": "PATH", 
-                    "value": "C:/Program Files/NVIDIA/CUDNN/v9.18/bin;C:/opencv/build/x64/vc16/bin;C:/libtorch/lib;${env:PATH}"
+                    "value": "D:/cudnn-windows-x86_64-8.9.7.29_cuda12-archive/bin;D:/opencv/build/x64/vc16/bin;D:/libtorch/lib;${env:PATH}"
                 }
             ],
             "console": "integratedTerminal"
