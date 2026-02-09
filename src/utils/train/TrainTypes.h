@@ -31,6 +31,8 @@ struct TrainOptions
     int epochs = 1;
     float lr = 0.01f;
     int lr_decay_epoch = -1;
+    float lr_decay_multiplier = 0.5f;
+    float lr_min_multiplier = 0.1f;
     std::string output_dir = "outputs";
     std::string viewer_export_dir;
     float scale_reg_weight = 200.0f;
@@ -40,7 +42,9 @@ struct TrainOptions
     float offset_lr = -1.0f;
     float offset_reg_weight = 0.01f;
     float pose_reg_weight = 0.01f;
+    float pose_lr = 5e-3f;
     float alpha_loss_weight = 0.1f;
+    float lambda_dssim = 0.2f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;
     int sh_degree = 3;

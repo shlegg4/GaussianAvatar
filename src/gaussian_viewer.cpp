@@ -286,6 +286,11 @@ int main(int argc, char **argv)
 
         int width = 0, height = 0;
         glfwGetFramebufferSize(window, &width, &height);
+        if (width == 0 || height == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
         glViewport(0, 0, width, height);
         glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);

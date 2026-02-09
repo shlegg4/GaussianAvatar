@@ -77,6 +77,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->lr = std::stof(value);
             else if (key == "--lr-decay-epoch")
                 options->lr_decay_epoch = std::stoi(value);
+            else if (key == "--lr-decay-multiplier")
+                options->lr_decay_multiplier = std::stof(value);
+            else if (key == "--lr-min-multiplier")
+                options->lr_min_multiplier = std::stof(value);
             else if (key == "--output-dir")
                 options->output_dir = value;
             else if (key == "--train-dir")
@@ -97,8 +101,12 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->offset_reg_weight = std::stof(value);
             else if (key == "--pose-reg")
                 options->pose_reg_weight = std::stof(value);
+            else if (key == "--pose-lr")
+                options->pose_lr = std::stof(value);
             else if (key == "--alpha-loss")
                 options->alpha_loss_weight = std::stof(value);
+            else if (key == "--lambda-dssim")
+                options->lambda_dssim = std::stof(value);
             else if (key == "--color-lr")
                 options->color_lr = std::stof(value);
             else if (key == "--opacity-lr")
@@ -314,6 +322,46 @@ bool BuildSharedGaussianBuffer(const torch::Tensor &positions, const torch::Tens
     return true;
 }
 
+// --- SSIM Implementation Start ---
+torch::Tensor create_window(int window_size, int channel)
+{
+    auto t = torch::arange(window_size, torch::kFloat32) - window_size / 2;
+    auto gauss = torch::exp(-(t * t) / (2 * 1.5 * 1.5));
+    gauss = gauss / gauss.sum();
+
+    auto window_2d = gauss.unsqueeze(1) * gauss.unsqueeze(0);
+    return window_2d.expand({channel, 1, window_size, window_size}).contiguous();
+}
+
+torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, int window_size = 11)
+{
+    auto inp1 = (img1.dim() == 3) ? img1.unsqueeze(0) : img1;
+    auto inp2 = (img2.dim() == 3) ? img2.unsqueeze(0) : img2;
+
+    const int channel = static_cast<int>(inp1.size(1));
+    auto window = create_window(window_size, channel).to(inp1.device());
+
+    auto mu1 = torch::conv2d(inp1, window, {}, 1, window_size / 2, 1, channel);
+    auto mu2 = torch::conv2d(inp2, window, {}, 1, window_size / 2, 1, channel);
+
+    auto mu1_sq = mu1.pow(2);
+    auto mu2_sq = mu2.pow(2);
+    auto mu1_mu2 = mu1 * mu2;
+
+    auto sigma1_sq = torch::conv2d(inp1 * inp1, window, {}, 1, window_size / 2, 1, channel) - mu1_sq;
+    auto sigma2_sq = torch::conv2d(inp2 * inp2, window, {}, 1, window_size / 2, 1, channel) - mu2_sq;
+    auto sigma12 = torch::conv2d(inp1 * inp2, window, {}, 1, window_size / 2, 1, channel) - mu1_mu2;
+
+    const float C1 = 0.01f * 0.01f;
+    const float C2 = 0.03f * 0.03f;
+
+    auto ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) /
+                    ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2));
+
+    return ssim_map.mean();
+}
+// --- SSIM Implementation End ---
+
 struct GaussianAvatar : torch::nn::Module
 {
     std::shared_ptr<SMPLLayer> smpl;
@@ -446,11 +494,13 @@ int main(int argc, char *argv[])
     {
         std::cout << "Usage: gaussian_train --jsonl <path> [--smpl <path>] [--num-gaussians <int>]"
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
-                     " [--lr-decay-epoch <int>]"
+                     " [--lr-decay-epoch <int>] [--lr-decay-multiplier <float>]"
+                     " [--lr-min-multiplier <float>]"
                      " [--train-dir <path>] [--viewer-export-dir <path>]"
                      " [--scale-reg <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
-                     " [--offset-reg <float>] [--pose-reg <float>] [--alpha-loss <float>]"
+                     " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>]"
+                     " [--lambda-dssim <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
                      " [--densify-every <int>] [--densify-max <int>] [--densify-max-clones <int>]"
@@ -482,6 +532,8 @@ int main(int argc, char *argv[])
     const int epochs = options.epochs;
     const float lr = options.lr;
     const int lr_decay_epoch = options.lr_decay_epoch;
+    const float lr_decay_multiplier = options.lr_decay_multiplier;
+    const float lr_min_multiplier = options.lr_min_multiplier;
     const std::string &output_dir = options.output_dir;
     const std::string &viewer_export_dir = options.viewer_export_dir;
     const float scale_reg_weight = options.scale_reg_weight;
@@ -491,22 +543,23 @@ int main(int argc, char *argv[])
     const float offset_lr = (options.offset_lr < 0.0f) ? lr : options.offset_lr;
     const float offset_reg_weight = options.offset_reg_weight;
     const float pose_reg_weight = options.pose_reg_weight;
+    const float pose_lr = options.pose_lr;
     const float color_lr = options.color_lr;
     const float opacity_lr = (options.opacity_lr < 0.0f) ? lr : options.opacity_lr;
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
     const bool viewer_stream_poses = options.viewer_stream_poses;
     const int densify_every = std::max(1, options.densify_every);
-    const float pose_lr = 1e-3f;
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
+    const float lambda_dssim = options.lambda_dssim;
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
     const int tile_size = 64;
     const float tile_outlier_mult = 3.0f;
     const float tile_mask_min = 0.01f;
     const float tile_median_min = 1e-4f;
-    const int batch_size = 8;
+    const int batch_size = 2;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -543,6 +596,7 @@ int main(int argc, char *argv[])
     }
 
     auto device = torch::kCUDA;
+    auto storage_device = torch::kCPU;
     std::vector<CachedSampleData> cached;
     cached.resize(samples.size());
     for (size_t i = 0; i < samples.size(); ++i)
@@ -563,7 +617,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        auto target = LoadImageTensor(crop, device);
+        auto target = LoadImageTensor(crop, storage_device);
         if (!target.defined() || target.dim() != 3 || target.size(0) != 3)
         {
             cached[i] = std::move(entry);
@@ -577,7 +631,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        auto matte_mask = LoadMatteMaskTensor(matte, W, H, device);
+        auto matte_mask = LoadMatteMaskTensor(matte, W, H, storage_device);
         if (!matte_mask.defined())
         {
             cached[i] = std::move(entry);
@@ -684,6 +738,8 @@ int main(int argc, char *argv[])
     std::vector<torch::Tensor> opacity_params = {avatar.g_opacities};
     std::vector<torch::Tensor> pose_params = {pose_offsets, global_rot_offsets, global_trans_offsets};
     float lr_multiplier = 1.0f;
+    float pose_lr_multiplier = 1.0f;
+    bool lr_decay_applied = false;
     torch::optim::Adam optimizer(rot_params, torch::optim::AdamOptions(rot_lr * lr_multiplier));
     optimizer.add_param_group({offset_params});
     auto &offset_group = optimizer.param_groups().back();
@@ -701,15 +757,15 @@ int main(int argc, char *argv[])
     auto &pose_group = optimizer.param_groups().back();
     static_cast<torch::optim::AdamOptions &>(pose_group.options()).lr(pose_lr * lr_multiplier);
 
-    auto apply_lr_multiplier = [&](float multiplier)
+    auto apply_lr_multiplier = [&](float pose_multiplier)
     {
-        lr_multiplier = multiplier;
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(rot_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(offset_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
-        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * lr_multiplier);
+        pose_lr_multiplier = pose_multiplier;
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(rot_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(offset_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
+        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * pose_lr_multiplier);
     };
 
     auto rebuild_optimizer = [&]()
@@ -735,7 +791,7 @@ int main(int argc, char *argv[])
         static_cast<torch::optim::AdamOptions &>(new_opacity_group.options()).lr(opacity_lr * lr_multiplier);
         optimizer.add_param_group({pose_params});
         auto &new_pose_group = optimizer.param_groups().back();
-        static_cast<torch::optim::AdamOptions &>(new_pose_group.options()).lr(pose_lr * lr_multiplier);
+        static_cast<torch::optim::AdamOptions &>(new_pose_group.options()).lr(pose_lr * pose_lr_multiplier);
     };
 
     torch::Tensor last_render;
@@ -762,15 +818,34 @@ int main(int argc, char *argv[])
     }
 
     std::mt19937 rng(static_cast<unsigned int>(std::random_device{}()));
-    bool lr_decay_applied = false;
     for (int epoch = 0; epoch < epochs; ++epoch)
     {
-        if (!lr_decay_applied && lr_decay_epoch >= 0 && epoch >= lr_decay_epoch)
+        if (lr_decay_epoch >= 0 && epoch >= lr_decay_epoch)
         {
-            apply_lr_multiplier(lr_multiplier * 0.5f);
-            lr_decay_applied = true;
-            std::cout << "Applied LR decay at epoch " << epoch
-                      << ": multiplier " << lr_multiplier << std::endl;
+            if (!lr_decay_applied)
+            {
+                lr_decay_applied = true;
+            }
+            const float next_pose_multiplier = std::max(pose_lr_multiplier * lr_decay_multiplier, lr_min_multiplier);
+            apply_lr_multiplier(next_pose_multiplier);
+            std::cout << "Applied pose LR decay at epoch " << epoch
+                      << ": pose multiplier " << pose_lr_multiplier << std::endl;
+        }
+        {
+            const auto rot_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr();
+            const auto offset_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr();
+            const auto scale_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr();
+            const auto color_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr();
+            const auto opacity_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr();
+            const auto pose_lr_eff = static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr();
+            std::cout << "Epoch " << epoch << " LRs: "
+                      << "rot=" << rot_lr_eff
+                      << " offset=" << offset_lr_eff
+                      << " scale=" << scale_lr_eff
+                      << " color=" << color_lr_eff
+                      << " opacity=" << opacity_lr_eff
+                      << " pose=" << pose_lr_eff
+                      << std::endl;
         }
         std::vector<size_t> indices(samples.size());
         std::iota(indices.begin(), indices.end(), 0);
@@ -786,6 +861,7 @@ int main(int argc, char *argv[])
             std::vector<torch::Tensor> recon_losses;
             std::vector<torch::Tensor> outside_losses;
             std::vector<torch::Tensor> alpha_losses;
+            std::vector<torch::Tensor> ssim_losses;
             std::vector<float> recon_values;
             std::vector<float> total_values;
             std::vector<TrainSample> batch_samples;
@@ -813,7 +889,7 @@ int main(int argc, char *argv[])
                     skipped_malformed++;
                     continue;
                 }
-                auto target = cached_entry.target;
+                auto target = cached_entry.target.to(device);
                 const int H = static_cast<int>(target.size(1));
                 const int W = static_cast<int>(target.size(2));
                 if (H <= 0 || W <= 0)
@@ -880,6 +956,11 @@ int main(int argc, char *argv[])
                     BuildProjection(f_render, render_w, render_h, cx_crop, cy_crop, device);
 
                 auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.g_colors;
+                // Supersample then resolve to preserve high-frequency edges.
+                const float ss_factor = 2.0f;
+                const int ss_h = static_cast<int>(render_h * ss_factor);
+                const int ss_w = static_cast<int>(render_w * ss_factor);
+
                 auto outputs = GaussianRasterizer::apply(
                     means3D,
                     colors,
@@ -891,14 +972,24 @@ int main(int argc, char *argv[])
                     proj_mat,
                     tan_fovx,
                     tan_fovy,
-                    render_h,
-                    render_w,
+                    ss_h,
+                    ss_w,
                     current_sh,
                     use_sh ? sh_degree : 0,
                     cam_pos,
                     false);
-                auto image = outputs[0];
-                auto alpha = outputs[1];
+                auto raw_image = outputs[0];
+                auto raw_alpha = outputs[1];
+
+                namespace F = torch::nn::functional;
+                auto image = F::avg_pool2d(
+                                 raw_image.unsqueeze(0),
+                                 F::AvgPool2dFuncOptions(2).stride(2))
+                                 .squeeze(0);
+                auto alpha = F::avg_pool2d(
+                                 raw_alpha.unsqueeze(0),
+                                 F::AvgPool2dFuncOptions(2).stride(2))
+                                 .squeeze(0);
                 if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
                     image.size(1) != H || image.size(2) != W ||
                     !alpha.defined() || alpha.dim() != 3 || alpha.size(0) != 1 ||
@@ -907,7 +998,8 @@ int main(int argc, char *argv[])
                     skipped_malformed++;
                     continue;
                 }
-                if (!IsMaskCoverageValidTensor(image, cached_entry.matte_mask, 0.3f, render_threshold))
+                auto matte_mask = cached_entry.matte_mask.to(device);
+                if (!IsMaskCoverageValidTensor(image, matte_mask, 0.3f, render_threshold))
                 {
                     skipped_mask++;
                     continue;
@@ -924,15 +1016,23 @@ int main(int argc, char *argv[])
 
                 auto image_crop = image.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
                 auto target_crop = target.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
-                auto matte_crop = cached_entry.matte_mask.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
+                auto matte_crop = matte_mask.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
                 auto alpha_crop = alpha.index({Slice(), Slice(0, tile_h), Slice(0, tile_w)});
+                 
+                auto bg_color = torch::rand({3, 1, 1}, image_crop.options()); 
+                auto image_comp = image_crop + bg_color * (1.0f - alpha_crop); 
+                auto target_comp = target_crop * matte_crop + bg_color * (1.0f - matte_crop);
+ 
+                auto ssim_value = ssim(image_comp, target_comp);
+                auto d_ssim_loss = (1.0f - ssim_value);
 
+                // Use the composited images for the L1 reconstruction loss tiles
+                auto image_tiles = UnfoldTiles(image_comp, tile_size, tile_size);
+                auto target_tiles = UnfoldTiles(target_comp, tile_size, tile_size);
                 auto outside_mask = 1.0f - matte_crop;
                 auto outside_loss = torch::mean(image_crop * outside_mask);
                 auto alpha_loss = torch::l1_loss(alpha_crop, matte_crop);
-
-                auto image_tiles = UnfoldTiles(image_crop, tile_size, tile_size);
-                auto target_tiles = UnfoldTiles(target_crop, tile_size, tile_size);
+ 
                 auto mask_tiles = UnfoldTiles(matte_crop, tile_size, tile_size);
                 if (!image_tiles.defined() || !target_tiles.defined() || !mask_tiles.defined() || image_tiles.numel() == 0)
                 {
@@ -983,6 +1083,7 @@ int main(int argc, char *argv[])
                 recon_losses.push_back(recon_loss);
                 outside_losses.push_back(outside_loss);
                 alpha_losses.push_back(alpha_loss);
+                ssim_losses.push_back(d_ssim_loss);
                 recon_values.push_back(loss_value);
                 total_values.push_back(loss_value + outside_mask_weight * outside_value + alpha_loss_weight * alpha_value);
                 batch_samples.push_back(sample);
@@ -1029,6 +1130,7 @@ int main(int argc, char *argv[])
             }
 
             torch::Tensor recon_sum = torch::zeros({}, torch::TensorOptions().device(device));
+            torch::Tensor ssim_sum = torch::zeros({}, torch::TensorOptions().device(device));
             int inlier_count = 0;
             int skipped_outlier = 0;
             int last_inlier_idx = -1;
@@ -1044,6 +1146,7 @@ int main(int argc, char *argv[])
                 recon_sum = recon_sum + recon_losses[i] +
                             outside_mask_weight * outside_losses[i] +
                             alpha_loss_weight * alpha_losses[i];
+                ssim_sum = ssim_sum + ssim_losses[i];
                 inlier_count++;
                 last_inlier_idx = static_cast<int>(i);
                 if (total_values[i] < best_inlier_loss)
@@ -1065,6 +1168,7 @@ int main(int argc, char *argv[])
             }
 
             auto recon_loss = recon_sum / static_cast<float>(inlier_count);
+            auto avg_ssim_loss = ssim_sum / static_cast<float>(inlier_count);
             auto current_scales = torch::exp(avatar.g_scales) * render_scale_modifier;
 
             auto all_scales_sq = current_scales.pow(2).sum(1);
@@ -1074,7 +1178,8 @@ int main(int argc, char *argv[])
             auto pose_reg = torch::mean(pose_offsets.pow(2)) +
                             torch::mean(global_rot_offsets.pow(2)) +
                             torch::mean(global_trans_offsets.pow(2));
-            auto loss = recon_loss +
+            auto loss = (1.0f - lambda_dssim) * recon_loss +
+                        lambda_dssim * avg_ssim_loss +
                         offset_reg_weight * offset_reg +
                         scale_reg_weight * scale_reg +
                         pose_reg_weight * pose_reg;
@@ -1109,7 +1214,7 @@ int main(int argc, char *argv[])
             global_step++;
 
             // const bool densify_enabled = (densify_stop_epoch <= 0) || (epoch < densify_stop_epoch);
-            if ( 
+            if (
                 densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
                 (global_step % densify_cfg.every) == 0)
             {
@@ -1189,7 +1294,7 @@ int main(int argc, char *argv[])
                                   << " avg_median=" << avg_median << std::endl;
                     }
                 }
- 
+
                 dropped_since_log += skipped_malformed + skipped_mask + skipped_outlier;
                 if ((batch_step + 1) % 10 == 0)
                 {
