@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iostream>
 
+
 void DensificationState::EnsureLike(const torch::Tensor &offsets, const torch::Tensor &scales)
 {
     if (!grad_offsets_accum.defined() || grad_offsets_accum.sizes() != offsets.sizes())
@@ -70,7 +71,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
 
     const float steps = static_cast<float>(std::max<int64_t>(1, state->steps));
     auto grad_offsets = state->grad_offsets_accum / steps;
-    
+
     // FIX: Use only positional gradients for densification to avoid noise from scale optimization
     auto grad_norm = torch::norm(grad_offsets, 2, 1);
 
@@ -121,7 +122,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
     auto kept_grad_norm = grad_norm.index_select(0, keep_indices);
     auto kept_scale_mean = scale_mean.index_select(0, keep_indices);
     auto kept_opacity_flat = opacities.index_select(0, keep_indices);
-    
+
     // Store count before splits/clones for opacity reset logic later
     const int64_t count_after_prune = kept_scales.size(0);
 
@@ -202,7 +203,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
             kept_sh = torch::cat({kept_sh, parent_sh}, 0);
         }
     }
-    
+
     // Store count after splits to distinguish between split-children and clones
     const int64_t count_after_split = kept_scales.size(0);
 
@@ -212,12 +213,13 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
     {
         // Re-calculate gradients for current set (normalized)
         auto current_grad_norm = torch::norm(state->grad_offsets_accum.index_select(0, keep_indices), 2, 1) / steps;
-        
-        auto clone_mask = (current_grad_norm > cfg.grow_grad_threshold) & 
-                          (kept_scale_mean < cfg.scale_threshold) & 
+
+        auto clone_mask = (current_grad_norm > cfg.grow_grad_threshold) &
+                          (kept_scale_mean < cfg.scale_threshold) &
                           (~split_mask);
-                          
-        if (cfg.prune_opacity_threshold > 0.0f) {
+
+        if (cfg.prune_opacity_threshold > 0.0f)
+        {
             clone_mask = clone_mask & (kept_opacity_flat >= cfg.prune_opacity_threshold);
         }
 
@@ -227,16 +229,16 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
             int64_t remaining = std::max<int64_t>(0, cfg.max_splits - k);
             int64_t clone_cap = std::max<int64_t>(0, cfg.max_clones);
             clones = std::min<int64_t>(std::min<int64_t>(remaining, clone_cap), clone_indices.size(0));
-            
+
             if (clones > 0)
             {
                 auto cand_scores = current_grad_norm.index_select(0, clone_indices);
                 auto topk = torch::topk(cand_scores, clones);
                 auto parent_local = clone_indices.index_select(0, std::get<1>(topk));
- 
+
                 auto child_scales = kept_scales.index_select(0, parent_local);
                 auto child_offsets = kept_offsets.index_select(0, parent_local);
- 
+
                 auto child_rots = kept_rots.index_select(0, parent_local);
                 auto child_colors = kept_colors.index_select(0, parent_local);
                 auto child_opacities = kept_opacities.index_select(0, parent_local);
@@ -274,14 +276,11 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
     {
         g_sh = kept_sh.detach().clone().set_requires_grad(true);
     }
- 
 
-    // FIX: Only reset opacity for CLONES (indices appended after splits)
-    if (cfg.reset_opacity > 0.0f && g_opacities.size(0) > count_after_split)
-    {
-        auto new_opacity = torch::full({g_opacities.size(0) - count_after_split, 1}, cfg.reset_opacity,
-                                       g_opacities.options());
-        g_opacities.index_put_({torch::indexing::Slice(count_after_split, g_opacities.size(0))}, new_opacity);
+    if (cfg.reset_opacity > 0.0f)
+    {  
+        torch::NoGradGuard no_grad; 
+        g_opacities.fill_(cfg.reset_opacity);
     }
 
     stats.splits = k;

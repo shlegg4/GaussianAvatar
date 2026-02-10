@@ -267,10 +267,14 @@ bool BuildSharedGaussianBuffer(const torch::Tensor &positions, const torch::Tens
 }
 
 // --- SSIM Implementation Start ---
-torch::Tensor create_window(int window_size, int channel)
+torch::Tensor create_window(int window_size, int channel, float sigma = -1.0f)
 {
+    if (sigma <= 0.0f)
+    {
+        sigma = window_size / 6.0f;
+    }
     auto t = torch::arange(window_size, torch::kFloat32) - window_size / 2;
-    auto gauss = torch::exp(-(t * t) / (2 * 1.5 * 1.5));
+    auto gauss = torch::exp(-(t * t) / (2 * sigma * sigma));
     gauss = gauss / gauss.sum();
 
     auto window_2d = gauss.unsqueeze(1) * gauss.unsqueeze(0);
@@ -281,28 +285,32 @@ struct SsimWindowCache
 {
     int window_size = 0;
     int channel = 0;
+    float sigma = 0.0f;
     c10::Device device = c10::Device(c10::kCPU);
     torch::Tensor window;
 };
 
 static SsimWindowCache g_ssim_window_cache;
 
-torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, int window_size = 5)
+torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, int window_size = 21)
 {
     const bool return_scalar = (img1.dim() == 3 && img2.dim() == 3);
     auto inp1 = (img1.dim() == 3) ? img1.unsqueeze(0) : img1;
     auto inp2 = (img2.dim() == 3) ? img2.unsqueeze(0) : img2;
 
     const int channel = static_cast<int>(inp1.size(1));
+    const float current_sigma = window_size / 6.0f;
     if (!g_ssim_window_cache.window.defined() ||
         g_ssim_window_cache.window_size != window_size ||
         g_ssim_window_cache.channel != channel ||
+        g_ssim_window_cache.sigma != current_sigma ||
         g_ssim_window_cache.device != inp1.device())
     {
         g_ssim_window_cache.window_size = window_size;
         g_ssim_window_cache.channel = channel;
+        g_ssim_window_cache.sigma = current_sigma;
         g_ssim_window_cache.device = inp1.device();
-        g_ssim_window_cache.window = create_window(window_size, channel).to(inp1.device());
+        g_ssim_window_cache.window = create_window(window_size, channel, current_sigma).to(inp1.device());
     }
     auto window = g_ssim_window_cache.window;
 
@@ -528,7 +536,7 @@ int main(int argc, char *argv[])
     const float tile_outlier_mult = 3.0f;
     const float tile_mask_min = 0.01f;
     const float tile_median_min = 1e-4f;
-    const int batch_size = 8;
+    const int batch_size = 1;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -788,6 +796,8 @@ int main(int argc, char *argv[])
     std::mt19937 rng(static_cast<unsigned int>(std::random_device{}()));
     for (int epoch = 0; epoch < epochs; ++epoch)
     {
+        auto epoch_start_time = std::chrono::high_resolution_clock::now();
+
         if (lr_decay_epoch >= 0 && epoch >= lr_decay_epoch)
         {
             if (!lr_decay_applied)
@@ -819,6 +829,7 @@ int main(int argc, char *argv[])
         std::iota(indices.begin(), indices.end(), 0);
         std::shuffle(indices.begin(), indices.end(), rng);
         int dropped_since_log = 0;
+
         for (size_t batch_start = 0; batch_start < indices.size(); batch_start += batch_size)
         {
 
@@ -830,20 +841,12 @@ int main(int argc, char *argv[])
             std::vector<torch::Tensor> outside_losses;
             std::vector<torch::Tensor> alpha_losses;
             std::vector<torch::Tensor> ssim_losses;
-            std::vector<float> recon_values;
-            std::vector<float> total_values;
             std::vector<torch::Tensor> batch_images_comp;
             std::vector<torch::Tensor> batch_targets_comp;
             std::vector<torch::Tensor> batch_masks_comp;
             std::vector<torch::Tensor> batch_alphas_comp;
             int skipped_malformed = 0;
             int skipped_mask = 0;
-            int64_t tiles_total = 0;
-            int64_t tiles_mask_valid = 0;
-            int64_t tiles_outlier_valid = 0;
-            int64_t tiles_final = 0;
-            float tiles_median_sum = 0.0f;
-            int tiles_median_count = 0;
 
             bool has_batched_transfers = false;
             torch::Tensor gpu_targets_block;
@@ -986,7 +989,7 @@ int main(int argc, char *argv[])
 
                 auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.g_colors;
                 // Supersample then resolve to preserve high-frequency edges.
-                const float ss_factor = 2.0f;
+                const float ss_factor = 1.0f;
                 const int ss_h = static_cast<int>(render_h * ss_factor);
                 const int ss_w = static_cast<int>(render_w * ss_factor);
 
@@ -1011,14 +1014,17 @@ int main(int argc, char *argv[])
                 auto raw_alpha = outputs[1];
 
                 namespace F = torch::nn::functional;
-                auto image = F::avg_pool2d(
-                                 raw_image.unsqueeze(0),
-                                 F::AvgPool2dFuncOptions(2).stride(2))
-                                 .squeeze(0);
-                auto alpha = F::avg_pool2d(
-                                 raw_alpha.unsqueeze(0),
-                                 F::AvgPool2dFuncOptions(2).stride(2))
-                                 .squeeze(0);
+                // auto image = F::avg_pool2d(
+                //                  raw_image.unsqueeze(0),
+                //                  F::AvgPool2dFuncOptions(2).stride(2))
+                //                  .squeeze(0);
+                // auto alpha = F::avg_pool2d(
+                //                  raw_alpha.unsqueeze(0),
+                //                  F::AvgPool2dFuncOptions(2).stride(2))
+                //                  .squeeze(0);
+                // Direct assignment (No downsampling needed since ss_factor is 1.0)
+                auto image = raw_image;
+                auto alpha = raw_alpha;
                 if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
                     image.size(1) != H || image.size(2) != W ||
                     !alpha.defined() || alpha.dim() != 3 || alpha.size(0) != 1 ||
@@ -1027,11 +1033,11 @@ int main(int argc, char *argv[])
                     skipped_malformed++;
                     continue;
                 }
-                if (!IsMaskCoverageValidTensor(image, matte_mask, 0.3f, render_threshold))
-                {
-                    skipped_mask++;
-                    continue;
-                }
+                // if (!IsMaskCoverageValidTensor(image, matte_mask, 0.3f, render_threshold))
+                // {
+                //     skipped_mask++;
+                //     continue;
+                // }
 
                 using torch::indexing::Slice;
                 const int tile_h = (H / tile_size) * tile_size;
@@ -1051,55 +1057,38 @@ int main(int argc, char *argv[])
                 auto image_comp = image_crop + bg_color * (1.0f - alpha_crop);
                 auto target_comp = target_crop * matte_crop + bg_color * (1.0f - matte_crop);
 
-                // Use avg_pool2d to compute mean loss per tile without materializing tiles.
                 auto diff_map = torch::abs(image_comp - target_comp);
-                auto diff_map_mean = diff_map.mean(0, true);
-                auto loss_per_tile_2d = F::avg_pool2d(
-                    diff_map_mean,
-                    F::AvgPool2dFuncOptions(tile_size).stride(tile_size));
-                auto loss_per_tile = loss_per_tile_2d.view({-1});
+                auto loss_per_tile = F::avg_pool2d(
+                                         diff_map.mean(0, true),
+                                         F::AvgPool2dFuncOptions(tile_size).stride(tile_size))
+                                         .view({-1});
 
-                auto mask_avg_2d = F::avg_pool2d(
-                    matte_crop,
-                    F::AvgPool2dFuncOptions(tile_size).stride(tile_size));
-                auto mask_sums = mask_avg_2d.view({-1}) * static_cast<float>(tile_size * tile_size);
-                auto valid_tile_mask = mask_sums > tile_mask_min;
-                auto valid_losses = loss_per_tile.index({valid_tile_mask});
-                float median_tile_loss = 0.0f;
-                if (valid_losses.defined() && valid_losses.numel() > 0)
-                {
-                    median_tile_loss = torch::median(valid_losses).item<float>();
-                }
-                auto outlier_tile_mask = torch::ones_like(valid_tile_mask);
-                if (median_tile_loss >= tile_median_min)
-                {
-                    const float outlier_thresh = median_tile_loss * tile_outlier_mult;
-                    outlier_tile_mask = loss_per_tile <= outlier_thresh;
-                }
-                auto final_mask = valid_tile_mask & outlier_tile_mask;
-                const int64_t valid_tiles = final_mask.sum().item<int64_t>();
-                tiles_total += loss_per_tile.size(0);
-                tiles_mask_valid += valid_tile_mask.sum().item<int64_t>();
-                tiles_outlier_valid += outlier_tile_mask.sum().item<int64_t>();
-                tiles_final += valid_tiles;
-                tiles_median_sum += median_tile_loss;
-                tiles_median_count++;
-                if (valid_tiles <= 0)
-                {
-                    skipped_malformed++;
-                    continue;
-                }
+                auto mask_coverage = F::avg_pool2d(
+                                         matte_crop,
+                                         F::AvgPool2dFuncOptions(tile_size).stride(tile_size))
+                                         .view({-1});
+                const float min_coverage = tile_mask_min / static_cast<float>(tile_size * tile_size);
+                auto valid_tile_mask = mask_coverage > min_coverage;
+                auto valid_tile_mask_f = valid_tile_mask.to(torch::kFloat32);
 
-                auto recon_loss = loss_per_tile.index({final_mask}).mean();
-                auto loss_value = recon_loss.item<float>();
-                if (!std::isfinite(loss_value))
-                {
-                    skipped_malformed++;
-                    continue;
-                }
+                auto valid_count = valid_tile_mask_f.sum();
+                auto safe_denom = valid_count.clamp_min(1.0f);
+                auto valid_loss_sum = (loss_per_tile * valid_tile_mask_f).sum();
+                auto loss_mean = valid_loss_sum / safe_denom;
+                auto diff_sq = (loss_per_tile - loss_mean).pow(2) * valid_tile_mask_f;
+                auto loss_std = torch::sqrt(diff_sq.sum() / safe_denom);
+
+                auto threshold_val = loss_mean + (3.0f * loss_std);
+                auto final_threshold = torch::max(threshold_val, torch::full_like(threshold_val, tile_median_min));
+                auto is_inlier = loss_per_tile <= final_threshold;
+
+                auto final_mask = valid_tile_mask & is_inlier;
+                auto final_mask_f = final_mask.to(torch::kFloat32);
+                auto final_sum = (loss_per_tile * final_mask_f).sum();
+                auto final_count_safe = final_mask_f.sum().clamp_min(1.0f);
+                auto recon_loss = final_sum / final_count_safe;
 
                 recon_losses.push_back(recon_loss);
-                recon_values.push_back(loss_value);
                 batch_images_comp.push_back(image_comp);
                 batch_targets_comp.push_back(target_comp);
                 batch_masks_comp.push_back(matte_crop);
@@ -1138,54 +1127,32 @@ int main(int argc, char *argv[])
                     auto msk_batch = torch::stack(batch_masks_comp);
                     auto alp_batch = torch::stack(batch_alphas_comp);
 
-                    auto ssim_vals = ssim(img_batch, tgt_batch);
+                    auto ssim_vals = ssim(img_batch, tgt_batch, 11);
                     auto d_ssim_losses_t = 1.0f - ssim_vals;
-                    auto outside_losses_t = (img_batch * (1.0f - msk_batch)).mean({1, 2, 3});
+                    auto outside_losses_t = (img_batch * (1.0f - msk_batch)).flatten(1).mean(1);
                     auto alpha_losses_t = torch::l1_loss(alp_batch, msk_batch, torch::Reduction::None)
-                                              .mean({1, 2, 3});
+                                              .flatten(1)
+                                              .mean(1);
 
-                    std::vector<torch::Tensor> filtered_recon_losses;
-                    std::vector<torch::Tensor> filtered_outside_losses;
-                    std::vector<torch::Tensor> filtered_alpha_losses;
-                    std::vector<torch::Tensor> filtered_ssim_losses;
-                    std::vector<float> filtered_recon_values;
-                    std::vector<float> filtered_total_values;
-
-                    const size_t batch_count = batch_images_comp.size();
-                    filtered_recon_losses.reserve(batch_count);
-                    filtered_outside_losses.reserve(batch_count);
-                    filtered_alpha_losses.reserve(batch_count);
-                    filtered_ssim_losses.reserve(batch_count);
-                    filtered_recon_values.reserve(batch_count);
-                    filtered_total_values.reserve(batch_count);
-
-                    for (size_t i = 0; i < batch_count; ++i)
+                    auto valid_mask = torch::isfinite(outside_losses_t) &
+                                      torch::isfinite(alpha_losses_t) &
+                                      torch::isfinite(d_ssim_losses_t);
+                    if (valid_mask.sum().item<int>() == 0)
                     {
-                        const float outside_value = outside_losses_t[i].item<float>();
-                        const float alpha_value = alpha_losses_t[i].item<float>();
-                        const float ssim_value = d_ssim_losses_t[i].item<float>();
-                        if (!std::isfinite(outside_value) || !std::isfinite(alpha_value) || !std::isfinite(ssim_value))
-                        {
-                            skipped_malformed++;
-                            continue;
-                        }
-
-                        filtered_recon_losses.push_back(recon_losses[i]);
-                        filtered_outside_losses.push_back(outside_losses_t[i]);
-                        filtered_alpha_losses.push_back(alpha_losses_t[i]);
-                        filtered_ssim_losses.push_back(d_ssim_losses_t[i]);
-                        filtered_recon_values.push_back(recon_values[i]);
-                        filtered_total_values.push_back(recon_values[i] +
-                                                        outside_mask_weight * outside_value +
-                                                        alpha_loss_weight * alpha_value);
+                        skipped_malformed++;
+                        continue;
                     }
 
-                    recon_losses = std::move(filtered_recon_losses);
-                    outside_losses = std::move(filtered_outside_losses);
-                    alpha_losses = std::move(filtered_alpha_losses);
-                    ssim_losses = std::move(filtered_ssim_losses);
-                    recon_values = std::move(filtered_recon_values);
-                    total_values = std::move(filtered_total_values);
+                    auto recon_stack = torch::stack(recon_losses).to(img_batch.device());
+                    auto final_recon = recon_stack.index({valid_mask});
+                    auto final_outside = outside_losses_t.index({valid_mask});
+                    auto final_alpha = alpha_losses_t.index({valid_mask});
+                    auto final_ssim = d_ssim_losses_t.index({valid_mask});
+
+                    recon_losses = final_recon.unbind(0);
+                    outside_losses = final_outside.unbind(0);
+                    alpha_losses = final_alpha.unbind(0);
+                    ssim_losses = final_ssim.unbind(0);
                 }
                 else
                 {
@@ -1193,16 +1160,11 @@ int main(int argc, char *argv[])
                     std::vector<torch::Tensor> filtered_outside_losses;
                     std::vector<torch::Tensor> filtered_alpha_losses;
                     std::vector<torch::Tensor> filtered_ssim_losses;
-                    std::vector<float> filtered_recon_values;
-                    std::vector<float> filtered_total_values;
-
                     const size_t batch_count = batch_images_comp.size();
                     filtered_recon_losses.reserve(batch_count);
                     filtered_outside_losses.reserve(batch_count);
                     filtered_alpha_losses.reserve(batch_count);
                     filtered_ssim_losses.reserve(batch_count);
-                    filtered_recon_values.reserve(batch_count);
-                    filtered_total_values.reserve(batch_count);
 
                     for (size_t i = 0; i < batch_count; ++i)
                     {
@@ -1210,32 +1172,16 @@ int main(int argc, char *argv[])
                         auto d_ssim_loss = 1.0f - ssim_value;
                         auto outside_loss = torch::mean(batch_images_comp[i] * (1.0f - batch_masks_comp[i]));
                         auto alpha_loss = torch::l1_loss(batch_alphas_comp[i], batch_masks_comp[i]);
-
-                        const float outside_value = outside_loss.item<float>();
-                        const float alpha_value = alpha_loss.item<float>();
-                        const float ssim_value_f = d_ssim_loss.item<float>();
-                        if (!std::isfinite(outside_value) || !std::isfinite(alpha_value) || !std::isfinite(ssim_value_f))
-                        {
-                            skipped_malformed++;
-                            continue;
-                        }
-
                         filtered_recon_losses.push_back(recon_losses[i]);
                         filtered_outside_losses.push_back(outside_loss);
                         filtered_alpha_losses.push_back(alpha_loss);
                         filtered_ssim_losses.push_back(d_ssim_loss);
-                        filtered_recon_values.push_back(recon_values[i]);
-                        filtered_total_values.push_back(recon_values[i] +
-                                                        outside_mask_weight * outside_value +
-                                                        alpha_loss_weight * alpha_value);
                     }
 
                     recon_losses = std::move(filtered_recon_losses);
                     outside_losses = std::move(filtered_outside_losses);
                     alpha_losses = std::move(filtered_alpha_losses);
                     ssim_losses = std::move(filtered_ssim_losses);
-                    recon_values = std::move(filtered_recon_values);
-                    total_values = std::move(filtered_total_values);
                 }
             }
 
@@ -1246,76 +1192,26 @@ int main(int argc, char *argv[])
                 {
                     std::cout << "Dropped samples in last 10 batches: "
                               << dropped_since_log << std::endl;
-                    if (tiles_total > 0)
-                    {
-                        const float avg_median = (tiles_median_count > 0)
-                                                     ? (tiles_median_sum / static_cast<float>(tiles_median_count))
-                                                     : 0.0f;
-                        std::cout << "Tile stats: total=" << tiles_total
-                                  << " mask_valid=" << tiles_mask_valid
-                                  << " outlier_valid=" << tiles_outlier_valid
-                                  << " final=" << tiles_final
-                                  << " avg_median=" << avg_median << std::endl;
-                    }
                     dropped_since_log = 0;
                 }
                 continue;
             }
 
-            const float outlier_percentile = 1.0f;
-            float outlier_threshold = std::numeric_limits<float>::infinity();
-            if (!total_values.empty())
-            {
-                std::vector<float> sorted_values = total_values;
-                std::sort(sorted_values.begin(), sorted_values.end());
-                const size_t n = sorted_values.size();
-                const size_t idx = std::min(n - 1, static_cast<size_t>(std::floor(outlier_percentile * (n - 1))));
-                outlier_threshold = sorted_values[idx];
-            }
+            auto recon_stack = torch::stack(recon_losses);
+            auto outside_stack = torch::stack(outside_losses);
+            auto alpha_stack = torch::stack(alpha_losses);
+            auto ssim_stack = torch::stack(ssim_losses);
+            auto total_vals_t = (1.0f - lambda_dssim) * recon_stack +
+                                lambda_dssim * ssim_stack +
+                                outside_mask_weight * outside_stack +
+                                alpha_loss_weight * alpha_stack;
 
-            torch::Tensor recon_sum = torch::zeros({}, torch::TensorOptions().device(device));
-            torch::Tensor ssim_sum = torch::zeros({}, torch::TensorOptions().device(device));
-            int inlier_count = 0;
-            int skipped_outlier = 0;
-            int last_inlier_idx = -1;
-            int best_inlier_idx = -1;
-            float best_inlier_loss = std::numeric_limits<float>::infinity();
-            std::vector<int> inlier_indices;
-            inlier_indices.reserve(recon_losses.size());
-            for (size_t i = 0; i < recon_losses.size(); ++i)
-            {
-                if (total_values[i] > outlier_threshold)
-                {
-                    skipped_outlier++;
-                    continue;
-                }
-                recon_sum = recon_sum + recon_losses[i] +
-                            outside_mask_weight * outside_losses[i] +
-                            alpha_loss_weight * alpha_losses[i];
-                ssim_sum = ssim_sum + ssim_losses[i];
-                inlier_count++;
-                inlier_indices.push_back(static_cast<int>(i));
-                last_inlier_idx = static_cast<int>(i);
-                if (total_values[i] < best_inlier_loss)
-                {
-                    best_inlier_loss = total_values[i];
-                    best_inlier_idx = static_cast<int>(i);
-                }
-            }
-            if (inlier_count == 0)
-            {
-                dropped_since_log += skipped_malformed + skipped_mask + skipped_outlier;
-                if ((batch_step + 1) % 10 == 0)
-                {
-                    std::cout << "Dropped samples in last 10 batches: "
-                              << dropped_since_log << std::endl;
-                    dropped_since_log = 0;
-                }
-                continue;
-            }
-
-            auto recon_loss = recon_sum / static_cast<float>(inlier_count);
-            auto avg_ssim_loss = ssim_sum / static_cast<float>(inlier_count);
+            int best_inlier_idx = torch::argmin(total_vals_t).item<int>();
+            float best_total_value = total_vals_t[best_inlier_idx].item<float>();
+            auto recon_loss = recon_stack.mean();
+            auto avg_ssim_loss = ssim_stack.mean();
+            auto avg_outside_loss = outside_stack.mean();
+            auto avg_alpha_loss = alpha_stack.mean();
 
             auto current_scales = torch::exp(avatar.g_scales) * render_scale_modifier;
             auto all_scales_sq = current_scales.pow(2).sum(1);
@@ -1324,11 +1220,12 @@ int main(int argc, char *argv[])
 
             auto loss = (1.0f - lambda_dssim) * recon_loss +
                         lambda_dssim * avg_ssim_loss +
+                        outside_mask_weight * avg_outside_loss +
+                        alpha_loss_weight * avg_alpha_loss +
                         offset_reg_weight * offset_reg +
                         scale_reg_weight * scale_reg;
-
-            loss.backward();
-
+ 
+            loss.backward(); 
             if (avatar.g_scales.grad().defined())
             {
                 torch::NoGradGuard no_grad;
@@ -1409,7 +1306,7 @@ int main(int argc, char *argv[])
                     float mask_val = outside_losses[best_inlier_idx].item<float>();
 
                     std::cout << "Epoch " << epoch << " Batch " << batch_step
-                              << " Total: " << total_values[best_inlier_idx]
+                              << " Total: " << best_total_value
                               << " | RGB L1: " << l1_val                       // <--- The true "visual" loss
                               << " | Alpha: " << alpha_val * alpha_loss_weight // <--- Likely the culprit
                               << " | Mask: " << mask_val * outside_mask_weight
@@ -1421,20 +1318,9 @@ int main(int argc, char *argv[])
                     std::cout << "Scale stats (min/mean/max): "
                               << scale_min << " / " << scale_mean << " / " << scale_max << std::endl;
                     std::cout << "Global step: " << global_step << std::endl;
-                    if (tiles_total > 0)
-                    {
-                        const float avg_median = (tiles_median_count > 0)
-                                                     ? (tiles_median_sum / static_cast<float>(tiles_median_count))
-                                                     : 0.0f;
-                        std::cout << "Tile stats: total=" << tiles_total
-                                  << " mask_valid=" << tiles_mask_valid
-                                  << " outlier_valid=" << tiles_outlier_valid
-                                  << " final=" << tiles_final
-                                  << " avg_median=" << avg_median << std::endl;
-                    }
                 }
 
-                dropped_since_log += skipped_malformed + skipped_mask + skipped_outlier;
+                dropped_since_log += skipped_malformed + skipped_mask;
                 if ((batch_step + 1) % 10 == 0)
                 {
                     std::cout << "Dropped samples in last 10 batches: "
@@ -1444,230 +1330,233 @@ int main(int argc, char *argv[])
             }
         }
 
-        // --- MODIFIED SECTION START ---
-
-        // 1. Always calculate canonical geometry for saving/viewing
-        torch::Tensor positions, rotations;
-        std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
- 
-
-        torch::Tensor colors;
-        if (use_sh)
         {
+            torch::NoGradGuard no_grad;
+            torch::Tensor positions, rotations;
+            std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
+
+            torch::Tensor colors;
+            if (use_sh)
+            {
+                using torch::indexing::Slice;
+                colors = avatar.g_sh.index({Slice(), 0, Slice()});
+            }
+            else
+            {
+                colors = avatar.g_colors;
+            }
+            auto opacities = avatar.g_opacities;
+            auto scales = capped_scales(avatar.g_scales);
+
             using torch::indexing::Slice;
-            colors = avatar.g_sh.index({Slice(), 0, Slice()});
-        }
-        else
-        {
-            colors = avatar.g_colors;
-        }
-        auto opacities = avatar.g_opacities;
-        auto scales = capped_scales(avatar.g_scales);
 
-        using torch::indexing::Slice;
-
-        torch::Tensor sh_to_send = sh;
-        if (use_sh && sh_degree > 0)
-        {
-            sh_to_send = RotateSH(avatar.g_sh, rotations);  
-        }
-
-        // 2. Handle Shared Memory Viewer (Only if enabled)
-        if (publish_viewer)
-        {
-            const int64_t bind_count = avatar.g_offsets.size(0);
-            if (bind_count > 0)
-            {
-                auto bary_cpu = avatar.g_bary_coords.to(torch::kCPU).contiguous();
-                auto offsets_cpu = avatar.g_offsets.to(torch::kCPU).contiguous();
-                auto rots_cpu = avatar.g_rots.to(torch::kCPU).contiguous();
-                auto faces_cpu = avatar.g_face_indices.to(torch::kCPU).contiguous();
-
-                const float *bary_ptr = bary_cpu.data_ptr<float>();
-                const float *off_ptr = offsets_cpu.data_ptr<float>();
-                const float *rot_ptr = rots_cpu.data_ptr<float>();
-                const int64_t *face_ptr = faces_cpu.data_ptr<int64_t>();
-
-                const uint32_t stride = shared_gaussian::kSharedBindStrideFloats;
-                bind_buffer.resize(static_cast<size_t>(bind_count) * stride);
-                for (int64_t i = 0; i < bind_count; ++i)
-                {
-                    const size_t base = static_cast<size_t>(i) * stride;
-                    const size_t base3 = static_cast<size_t>(i) * 3u;
-                    const size_t base4 = static_cast<size_t>(i) * 4u;
-                    bind_buffer[base + 0] = bary_ptr[base3 + 0];
-                    bind_buffer[base + 1] = bary_ptr[base3 + 1];
-                    bind_buffer[base + 2] = bary_ptr[base3 + 2];
-                    bind_buffer[base + 3] = off_ptr[base3 + 0];
-                    bind_buffer[base + 4] = off_ptr[base3 + 1];
-                    bind_buffer[base + 5] = off_ptr[base3 + 2];
-                    bind_buffer[base + 6] = rot_ptr[base4 + 0];
-                    bind_buffer[base + 7] = rot_ptr[base4 + 1];
-                    bind_buffer[base + 8] = rot_ptr[base4 + 2];
-                    bind_buffer[base + 9] = rot_ptr[base4 + 3];
-                    bind_buffer[base + 10] = static_cast<float>(face_ptr[i]);
-                }
-
-                auto betas_cpu = canonical_betas.to(torch::kCPU).contiguous();
-                const int64_t betas_count = betas_cpu.numel();
-                bind_betas_buffer.resize(static_cast<size_t>(betas_count));
-                std::memcpy(bind_betas_buffer.data(), betas_cpu.data_ptr<float>(),
-                            static_cast<size_t>(betas_count) * sizeof(float));
-
-                bind_writer.Write(bind_betas_buffer.data(), static_cast<uint32_t>(betas_count),
-                                  bind_buffer.data(), static_cast<uint32_t>(bind_count));
-            }
-            if (BuildSharedGaussianBuffer(positions, colors, opacities, scales, rotations, sh_to_send, sh_degree,
-                                          &shared_buffer))
-            {
-                shared_writer.Write(shared_buffer.data(), static_cast<uint32_t>(positions.size(0)),
-                                    shared_frame++);
-            }
-        }
-
-        // 3. Save to Disk (Every epoch, Overwrite)
-        {
-            std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path;
-
-            SaveViewerDataOverwrite(save_dir, positions, colors, opacities, scales, rotations,
-                                    sh_to_send, sh_degree);
-        }
-
-        auto render_view = [&](size_t sample_index,
-                               const TrainSample &sample,
-                               const CachedSampleData &cached_entry) -> torch::Tensor
-        {
-            if (!cached_entry.valid)
-            {
-                return torch::Tensor();
-            }
-            auto target = cached_entry.target;
-            const int H = static_cast<int>(target.size(1));
-            const int W = static_cast<int>(target.size(2));
-            if (H <= 0 || W <= 0)
-            {
-                return torch::Tensor();
-            }
-
-            SmplResult res;
-            res.pose = sample.pose;
-            res.shape = sample.betas;
-            res.camera = sample.cam;
-
-            auto pose = PoseToAxisAngle(res).to(device);
-            auto pose_offset = pose_offsets.index({static_cast<int64_t>(sample_index)}).unsqueeze(0);
-            pose = pose + pose_offset;
-            auto global_rot = global_rot_offsets.index({static_cast<int64_t>(sample_index)}).unsqueeze(0);
-            pose.index_put_({0, 0, torch::indexing::Slice()},
-                            pose.index({0, 0, torch::indexing::Slice()}) + global_rot.squeeze(0));
-            cv::Vec3f trans_cv = EstimateTranslation(res.camera, sample.crop_cx, sample.crop_cy,
-                                                     sample.crop_size, sample.focal_length,
-                                                     static_cast<float>(sample.img_w),
-                                                     static_cast<float>(sample.img_h));
-            auto trans = torch::tensor({trans_cv[0], trans_cv[1], trans_cv[2]},
-                                       torch::TensorOptions().device(device).dtype(torch::kFloat));
-            auto trans_offset = global_trans_offsets.index({static_cast<int64_t>(sample_index)});
-            trans = trans + trans_offset;
-
-            if (viewer_stream_poses)
-            {
-                auto pose_cpu = pose.detach().to(torch::kCPU).contiguous();
-                const float *pose_ptr = pose_cpu.data_ptr<float>();
-                std::ostringstream pose_line;
-                pose_line.setf(std::ios::fixed);
-                pose_line << std::setprecision(6);
-                pose_line << "smpl_pose: [";
-                for (int i = 0; i < 72; ++i)
-                {
-                    if (i > 0)
-                        pose_line << ", ";
-                    pose_line << pose_ptr[i];
-                }
-                pose_line << "]";
-                std::cout << pose_line.str() << "\n";
-
-                auto trans_cpu = trans.detach().to(torch::kCPU).contiguous();
-                const float tx = trans_cpu[0].item<float>();
-                const float ty = trans_cpu[1].item<float>();
-                const float tz = trans_cpu[2].item<float>();
-                std::ostringstream trans_line;
-                trans_line.setf(std::ios::fixed);
-                trans_line << std::setprecision(6);
-                trans_line << "smpl_trans: [" << tx << ", " << ty << ", " << tz << "]";
-                std::cout << trans_line.str() << "\n";
-                std::cout.flush();
-            }
-
-            torch::Tensor means3D;
-            torch::Tensor current_rots;
-            std::tie(means3D, current_rots) =
-                avatar.forward(canonical_betas, pose, torch::zeros({1, 3}, canonical_betas.options()));
-            torch::Tensor current_sh = use_sh ? avatar.g_sh : torch::zeros({0}, avatar.g_colors.options());
+            torch::Tensor sh_to_send = sh;
             if (use_sh && sh_degree > 0)
             {
-                current_sh = RotateSH(current_sh, current_rots);
+                sh_to_send = RotateSH(avatar.g_sh, rotations);
             }
-            auto y_scale = torch::tensor({1.0f, sample.y_sign, 1.0f},
-                                         torch::TensorOptions().device(device).dtype(torch::kFloat));
-            means3D = means3D * y_scale;
-            means3D = means3D + trans;
 
-            const int full_w = sample.img_w;
-            const int full_h = sample.img_h;
-            float f_render = sample.focal_length;
-            torch::Tensor view_mat;
-            torch::Tensor proj_mat;
-            float tan_fovx = 0.0f;
-            float tan_fovy = 0.0f;
-            const int render_w = W;
-            const int render_h = H;
-            const float full_cx = static_cast<float>(full_w) * 0.5f;
-            const float full_cy = static_cast<float>(full_h) * 0.5f;
-            float x0 = sample.crop_x0;
-            float y0 = sample.crop_y0;
-            if (sample.crop_w <= 0.0f || sample.crop_h <= 0.0f)
+            // 2. Handle Shared Memory Viewer (Only if enabled)
+            if (publish_viewer && (global_step % viewer_every == 0))
             {
-                x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
-                y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
-            }
-            const float cx_crop = full_cx - x0;
-            const float cy_crop = full_cy - y0;
-            std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) =
-                BuildProjection(f_render, render_w, render_h, cx_crop, cy_crop, device);
+                const int64_t bind_count = avatar.g_offsets.size(0);
+                if (bind_count > 0)
+                {
+                    auto bary_cpu = avatar.g_bary_coords.to(torch::kCPU).contiguous();
+                    auto offsets_cpu = avatar.g_offsets.to(torch::kCPU).contiguous();
+                    auto rots_cpu = avatar.g_rots.to(torch::kCPU).contiguous();
+                    auto faces_cpu = avatar.g_face_indices.to(torch::kCPU).contiguous();
 
-            auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.g_colors;
-            auto outputs = GaussianRasterizer::apply(
-                means3D,
-                colors,
-                avatar.g_opacities,
-                capped_scales(avatar.g_scales),
-                current_rots,
-                render_scale_modifier,
-                view_mat,
-                proj_mat,
-                tan_fovx,
-                tan_fovy,
-                render_h,
-                render_w,
-                current_sh,
-                use_sh ? sh_degree : 0,
-                cam_pos,
-                false);
-            auto image = outputs[0];
-            if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
-                image.size(1) != H || image.size(2) != W)
+                    const float *bary_ptr = bary_cpu.data_ptr<float>();
+                    const float *off_ptr = offsets_cpu.data_ptr<float>();
+                    const float *rot_ptr = rots_cpu.data_ptr<float>();
+                    const int64_t *face_ptr = faces_cpu.data_ptr<int64_t>();
+
+                    const uint32_t stride = shared_gaussian::kSharedBindStrideFloats;
+                    bind_buffer.resize(static_cast<size_t>(bind_count) * stride);
+                    for (int64_t i = 0; i < bind_count; ++i)
+                    {
+                        const size_t base = static_cast<size_t>(i) * stride;
+                        const size_t base3 = static_cast<size_t>(i) * 3u;
+                        const size_t base4 = static_cast<size_t>(i) * 4u;
+                        bind_buffer[base + 0] = bary_ptr[base3 + 0];
+                        bind_buffer[base + 1] = bary_ptr[base3 + 1];
+                        bind_buffer[base + 2] = bary_ptr[base3 + 2];
+                        bind_buffer[base + 3] = off_ptr[base3 + 0];
+                        bind_buffer[base + 4] = off_ptr[base3 + 1];
+                        bind_buffer[base + 5] = off_ptr[base3 + 2];
+                        bind_buffer[base + 6] = rot_ptr[base4 + 0];
+                        bind_buffer[base + 7] = rot_ptr[base4 + 1];
+                        bind_buffer[base + 8] = rot_ptr[base4 + 2];
+                        bind_buffer[base + 9] = rot_ptr[base4 + 3];
+                        bind_buffer[base + 10] = static_cast<float>(face_ptr[i]);
+                    }
+
+                    auto betas_cpu = canonical_betas.to(torch::kCPU).contiguous();
+                    const int64_t betas_count = betas_cpu.numel();
+                    bind_betas_buffer.resize(static_cast<size_t>(betas_count));
+                    std::memcpy(bind_betas_buffer.data(), betas_cpu.data_ptr<float>(),
+                                static_cast<size_t>(betas_count) * sizeof(float));
+
+                    bind_writer.Write(bind_betas_buffer.data(), static_cast<uint32_t>(betas_count),
+                                      bind_buffer.data(), static_cast<uint32_t>(bind_count));
+                }
+                if (BuildSharedGaussianBuffer(positions, colors, opacities, scales, rotations, sh_to_send, sh_degree,
+                                              &shared_buffer))
+                {
+                    shared_writer.Write(shared_buffer.data(), static_cast<uint32_t>(positions.size(0)),
+                                        shared_frame++);
+                }
+            }
+
+            // 3. Save to Disk (Every epoch, Overwrite)
             {
-                return torch::Tensor();
+                std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path;
+
+                SaveViewerDataOverwrite(save_dir, positions, colors, opacities, scales, rotations,
+                                        sh_to_send, sh_degree);
             }
 
-            return image.detach();
-        };
+            auto render_view = [&](size_t sample_index,
+                                   const TrainSample &sample,
+                                   const CachedSampleData &cached_entry) -> torch::Tensor
+            {
+                if (!cached_entry.valid)
+                {
+                    return torch::Tensor();
+                }
+                auto target = cached_entry.target;
+                const int H = static_cast<int>(target.size(1));
+                const int W = static_cast<int>(target.size(2));
+                if (H <= 0 || W <= 0)
+                {
+                    return torch::Tensor();
+                }
 
-        if ((epoch + 1) % 5 == 0 || epoch == (epochs - 1))
-        {
-            const int saved_pairs = SaveEpochViewPairs(samples, cached, out_dir_path, epoch, render_view);
-            std::cout << "Epoch " << epoch << " saved " << saved_pairs << " view pairs." << std::endl;
+                SmplResult res;
+                res.pose = sample.pose;
+                res.shape = sample.betas;
+                res.camera = sample.cam;
+
+                auto pose = PoseToAxisAngle(res).to(device);
+                auto pose_offset = pose_offsets.index({static_cast<int64_t>(sample_index)}).unsqueeze(0);
+                pose = pose + pose_offset;
+                auto global_rot = global_rot_offsets.index({static_cast<int64_t>(sample_index)}).unsqueeze(0);
+                pose.index_put_({0, 0, torch::indexing::Slice()},
+                                pose.index({0, 0, torch::indexing::Slice()}) + global_rot.squeeze(0));
+                cv::Vec3f trans_cv = EstimateTranslation(res.camera, sample.crop_cx, sample.crop_cy,
+                                                         sample.crop_size, sample.focal_length,
+                                                         static_cast<float>(sample.img_w),
+                                                         static_cast<float>(sample.img_h));
+                auto trans = torch::tensor({trans_cv[0], trans_cv[1], trans_cv[2]},
+                                           torch::TensorOptions().device(device).dtype(torch::kFloat));
+                auto trans_offset = global_trans_offsets.index({static_cast<int64_t>(sample_index)});
+                trans = trans + trans_offset;
+
+                if (viewer_stream_poses)
+                {
+                    auto pose_cpu = pose.detach().to(torch::kCPU).contiguous();
+                    const float *pose_ptr = pose_cpu.data_ptr<float>();
+                    std::ostringstream pose_line;
+                    pose_line.setf(std::ios::fixed);
+                    pose_line << std::setprecision(6);
+                    pose_line << "smpl_pose: [";
+                    for (int i = 0; i < 72; ++i)
+                    {
+                        if (i > 0)
+                            pose_line << ", ";
+                        pose_line << pose_ptr[i];
+                    }
+                    pose_line << "]";
+                    std::cout << pose_line.str() << "\n";
+
+                    auto trans_cpu = trans.detach().to(torch::kCPU).contiguous();
+                    const float tx = trans_cpu[0].item<float>();
+                    const float ty = trans_cpu[1].item<float>();
+                    const float tz = trans_cpu[2].item<float>();
+                    std::ostringstream trans_line;
+                    trans_line.setf(std::ios::fixed);
+                    trans_line << std::setprecision(6);
+                    trans_line << "smpl_trans: [" << tx << ", " << ty << ", " << tz << "]";
+                    std::cout << trans_line.str() << "\n";
+                    std::cout.flush();
+                }
+
+                torch::Tensor means3D;
+                torch::Tensor current_rots;
+                std::tie(means3D, current_rots) =
+                    avatar.forward(canonical_betas, pose, torch::zeros({1, 3}, canonical_betas.options()));
+                torch::Tensor current_sh = use_sh ? avatar.g_sh : torch::zeros({0}, avatar.g_colors.options());
+                if (use_sh && sh_degree > 0)
+                {
+                    current_sh = RotateSH(current_sh, current_rots);
+                }
+                auto y_scale = torch::tensor({1.0f, sample.y_sign, 1.0f},
+                                             torch::TensorOptions().device(device).dtype(torch::kFloat));
+                means3D = means3D * y_scale;
+                means3D = means3D + trans;
+
+                const int full_w = sample.img_w;
+                const int full_h = sample.img_h;
+                float f_render = sample.focal_length;
+                torch::Tensor view_mat;
+                torch::Tensor proj_mat;
+                float tan_fovx = 0.0f;
+                float tan_fovy = 0.0f;
+                const int render_w = W;
+                const int render_h = H;
+                const float full_cx = static_cast<float>(full_w) * 0.5f;
+                const float full_cy = static_cast<float>(full_h) * 0.5f;
+                float x0 = sample.crop_x0;
+                float y0 = sample.crop_y0;
+                if (sample.crop_w <= 0.0f || sample.crop_h <= 0.0f)
+                {
+                    x0 = sample.crop_cx - static_cast<float>(render_w) * 0.5f;
+                    y0 = sample.crop_cy - static_cast<float>(render_h) * 0.5f;
+                }
+                const float cx_crop = full_cx - x0;
+                const float cy_crop = full_cy - y0;
+                std::tie(view_mat, proj_mat, tan_fovx, tan_fovy) =
+                    BuildProjection(f_render, render_w, render_h, cx_crop, cy_crop, device);
+
+                auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.g_colors;
+                auto outputs = GaussianRasterizer::apply(
+                    means3D,
+                    colors,
+                    avatar.g_opacities,
+                    capped_scales(avatar.g_scales),
+                    current_rots,
+                    render_scale_modifier,
+                    view_mat,
+                    proj_mat,
+                    tan_fovx,
+                    tan_fovy,
+                    render_h,
+                    render_w,
+                    current_sh,
+                    use_sh ? sh_degree : 0,
+                    cam_pos,
+                    false);
+                auto image = outputs[0];
+                if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
+                    image.size(1) != H || image.size(2) != W)
+                {
+                    return torch::Tensor();
+                }
+
+                return image.detach();
+            };
+
+            if ((epoch + 1) % 20 == 0 || epoch == (epochs - 1))
+            {
+                const int saved_pairs = SaveEpochViewPairs(samples, cached, out_dir_path, epoch, render_view);
+                std::cout << "Epoch " << epoch << " saved " << saved_pairs << " view pairs." << std::endl;
+            }
         }
+
+        auto epoch_end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> epoch_duration = epoch_end_time - epoch_start_time;
+        std::cout << "Epoch " << epoch << " duration: " << epoch_duration.count() << " seconds." << std::endl;
     }
 
     return 0;
