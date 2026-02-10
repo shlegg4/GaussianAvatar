@@ -45,6 +45,7 @@ struct TrainOptions
     float pose_lr = 5e-3f;
     float alpha_loss_weight = 0.1f;
     float lambda_dssim = 0.2f;
+    float gan_weight = 0.1f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;
     int sh_degree = 3;

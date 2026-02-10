@@ -107,6 +107,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->alpha_loss_weight = std::stof(value);
             else if (key == "--lambda-dssim")
                 options->lambda_dssim = std::stof(value);
+            else if (key == "--gan-weight")
+                options->gan_weight = std::stof(value);
             else if (key == "--color-lr")
                 options->color_lr = std::stof(value);
             else if (key == "--opacity-lr")
@@ -362,6 +364,50 @@ torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, int win
 }
 // --- SSIM Implementation End ---
 
+struct PatchGANDiscriminator : torch::nn::Module
+{
+    torch::nn::Sequential model;
+
+    PatchGANDiscriminator(int input_nc = 3, int ndf = 64, int n_layers = 3)
+        : model(torch::nn::Sequential())
+    {
+        model->push_back(torch::nn::Conv2d(torch::nn::Conv2dOptions(input_nc, ndf, 4).stride(2).padding(1)));
+        model->push_back(torch::nn::LeakyReLU(torch::nn::LeakyReLUOptions().negative_slope(0.2).inplace(true)));
+
+        int nf_mult = 1;
+        int nf_mult_prev = 1;
+        for (int n = 1; n < n_layers; n++)
+        {
+            nf_mult_prev = nf_mult;
+            nf_mult = std::min(8, 1 << n);
+            model->push_back(torch::nn::Conv2d(torch::nn::Conv2dOptions(ndf * nf_mult_prev, ndf * nf_mult, 4)
+                                                   .stride(2)
+                                                   .padding(1)
+                                                   .bias(false)));
+            model->push_back(torch::nn::BatchNorm2d(ndf * nf_mult));
+            model->push_back(torch::nn::LeakyReLU(torch::nn::LeakyReLUOptions().negative_slope(0.2).inplace(true)));
+        }
+
+        nf_mult_prev = nf_mult;
+        nf_mult = std::min(8, 1 << n_layers);
+        model->push_back(torch::nn::Conv2d(torch::nn::Conv2dOptions(ndf * nf_mult_prev, ndf * nf_mult, 4)
+                                               .stride(1)
+                                               .padding(1)
+                                               .bias(false)));
+        model->push_back(torch::nn::BatchNorm2d(ndf * nf_mult));
+        model->push_back(torch::nn::LeakyReLU(torch::nn::LeakyReLUOptions().negative_slope(0.2).inplace(true)));
+
+        model->push_back(torch::nn::Conv2d(torch::nn::Conv2dOptions(ndf * nf_mult, 1, 4).stride(1).padding(1)));
+
+        register_module("model", model);
+    }
+
+    torch::Tensor forward(torch::Tensor input)
+    {
+        return model->forward(input);
+    }
+};
+
 struct GaussianAvatar : torch::nn::Module
 {
     std::shared_ptr<SMPLLayer> smpl;
@@ -500,7 +546,7 @@ int main(int argc, char *argv[])
                      " [--scale-reg <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
                      " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>]"
-                     " [--lambda-dssim <float>]"
+                     " [--lambda-dssim <float>] [--gan-weight <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
                      " [--densify-every <int>] [--densify-max <int>] [--densify-max-clones <int>]"
@@ -534,6 +580,7 @@ int main(int argc, char *argv[])
     const int lr_decay_epoch = options.lr_decay_epoch;
     const float lr_decay_multiplier = options.lr_decay_multiplier;
     const float lr_min_multiplier = options.lr_min_multiplier;
+    const float gan_weight = options.gan_weight;
     const std::string &output_dir = options.output_dir;
     const std::string &viewer_export_dir = options.viewer_export_dir;
     const float scale_reg_weight = options.scale_reg_weight;
@@ -559,7 +606,7 @@ int main(int argc, char *argv[])
     const float tile_outlier_mult = 3.0f;
     const float tile_mask_min = 0.01f;
     const float tile_median_min = 1e-4f;
-    const int batch_size = 2;
+    const int batch_size = 8;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -647,6 +694,15 @@ int main(int argc, char *argv[])
 
     GaussianAvatar avatar(smpl_model_path);
     avatar.to(device);
+
+    PatchGANDiscriminator discriminator(3, 64, 3);
+    discriminator.to(device);
+    discriminator.train();
+    const float d_lr = 0.0002f;
+    torch::optim::Adam d_optimizer(discriminator.parameters(),
+                                   torch::optim::AdamOptions(d_lr).betas({0.5, 0.999}));
+    const float lambda_gan = gan_weight;
+    const int gan_warmup_epochs = 5;
 
     std::ifstream smpl_in(smpl_model_path, std::ios::binary);
     std::vector<char> f_bytes((std::istreambuf_iterator<char>(smpl_in)), (std::istreambuf_iterator<char>()));
@@ -856,6 +912,7 @@ int main(int argc, char *argv[])
 
             const size_t batch_end = std::min(indices.size(), batch_start + batch_size);
             int batch_step = static_cast<int>(batch_start / batch_size);
+            const bool use_gan = (epoch >= gan_warmup_epochs);
             optimizer.zero_grad();
 
             std::vector<torch::Tensor> recon_losses;
@@ -871,6 +928,9 @@ int main(int argc, char *argv[])
             std::vector<torch::Tensor> batch_betas;
             std::vector<torch::Tensor> batch_pose;
             std::vector<torch::Tensor> batch_trans;
+            std::vector<torch::Tensor> batch_gan_real;
+            std::vector<torch::Tensor> batch_gan_fake;
+            std::vector<torch::Tensor> batch_gan_alpha;
             int skipped_malformed = 0;
             int skipped_mask = 0;
             int64_t tiles_total = 0;
@@ -1093,6 +1153,9 @@ int main(int argc, char *argv[])
                 batch_betas.push_back(canonical_betas.detach());
                 batch_pose.push_back(pose.detach());
                 batch_trans.push_back(trans.detach());
+                batch_gan_real.push_back(target_comp);
+                batch_gan_fake.push_back(image_comp);
+                batch_gan_alpha.push_back(alpha_crop);
             }
 
             if (recon_losses.empty())
@@ -1136,6 +1199,8 @@ int main(int argc, char *argv[])
             int last_inlier_idx = -1;
             int best_inlier_idx = -1;
             float best_inlier_loss = std::numeric_limits<float>::infinity();
+            std::vector<int> inlier_indices;
+            inlier_indices.reserve(recon_losses.size());
             for (size_t i = 0; i < recon_losses.size(); ++i)
             {
                 if (total_values[i] > outlier_threshold)
@@ -1148,6 +1213,7 @@ int main(int argc, char *argv[])
                             alpha_loss_weight * alpha_losses[i];
                 ssim_sum = ssim_sum + ssim_losses[i];
                 inlier_count++;
+                inlier_indices.push_back(static_cast<int>(i));
                 last_inlier_idx = static_cast<int>(i);
                 if (total_values[i] < best_inlier_loss)
                 {
@@ -1183,6 +1249,124 @@ int main(int argc, char *argv[])
                         offset_reg_weight * offset_reg +
                         scale_reg_weight * scale_reg +
                         pose_reg_weight * pose_reg;
+
+            float d_acc_real = -1.0f;
+            float d_acc_fake = -1.0f;
+            float d_acc_total = -1.0f;
+            float d_loss_value = -1.0f;
+
+            if (use_gan && !inlier_indices.empty())
+            {
+                // 1. CONSTANTS: Define a fixed patch size for the GAN
+                const int patch_size = 64; // Must match your Discriminator input (or be larger)
+                const float alpha_min_mean = 0.1f;
+                const int max_alpha_tries = 10;
+                
+                std::vector<torch::Tensor> real_patches;
+                std::vector<torch::Tensor> fake_patches;
+                real_patches.reserve(inlier_indices.size());
+                fake_patches.reserve(inlier_indices.size());
+
+                for (int idx : inlier_indices)
+                {
+                    torch::Tensor real_img = batch_gan_real[static_cast<size_t>(idx)];
+                    torch::Tensor fake_img = batch_gan_fake[static_cast<size_t>(idx)];
+                    torch::Tensor alpha_img = batch_gan_alpha[static_cast<size_t>(idx)];
+
+                    // 2. CHECK: Ensure images are large enough to crop
+                    int h = static_cast<int>(real_img.size(1));
+                    int w = static_cast<int>(real_img.size(2));
+
+                    if (h < patch_size || w < patch_size)
+                    {
+                        // If too small, resize up to patch_size exactly
+                        namespace F = torch::nn::functional;
+                        auto options = F::InterpolateFuncOptions()
+                                           .size(std::vector<int64_t>({patch_size, patch_size}))
+                                           .mode(torch::kBilinear)
+                                           .align_corners(false);
+                        real_img = F::interpolate(real_img.unsqueeze(0), options).squeeze(0);
+                        fake_img = F::interpolate(fake_img.unsqueeze(0), options).squeeze(0);
+                        alpha_img = F::interpolate(alpha_img.unsqueeze(0), options).squeeze(0);
+                    }
+                    else
+                    {
+                        int y = 0;
+                        int x = 0;
+                        bool found_alpha = false;
+                        using torch::indexing::Slice;
+                        for (int attempt = 0; attempt < max_alpha_tries; ++attempt)
+                        {
+                            y = rand() % (h - patch_size + 1);
+                            x = rand() % (w - patch_size + 1);
+                            auto alpha_patch = alpha_img.index({Slice(), Slice(y, y + patch_size), Slice(x, x + patch_size)});
+                            float alpha_mean = alpha_patch.mean().item<float>();
+                            if (alpha_mean > alpha_min_mean)
+                            {
+                                found_alpha = true;
+                                break;
+                            }
+                        }
+
+                        if (!found_alpha)
+                        {
+                            auto alpha_flat = alpha_img.squeeze(0).flatten();
+                            int64_t max_idx = alpha_flat.argmax().item<int64_t>();
+                            int max_y = static_cast<int>(max_idx / w);
+                            int max_x = static_cast<int>(max_idx % w);
+                            y = std::min(std::max(max_y - patch_size / 2, 0), h - patch_size);
+                            x = std::min(std::max(max_x - patch_size / 2, 0), w - patch_size);
+                        }
+
+                        real_img = real_img.index({Slice(), Slice(y, y + patch_size), Slice(x, x + patch_size)});
+                        fake_img = fake_img.index({Slice(), Slice(y, y + patch_size), Slice(x, x + patch_size)});
+                    }
+
+                    real_patches.push_back(real_img);
+                    fake_patches.push_back(fake_img);
+                }
+
+                // 3. STACK: Now safe because all tensors are guaranteed to be [3, patch_size, patch_size]
+                auto gan_real_batch = torch::stack(real_patches);
+                auto gan_fake_batch = torch::stack(fake_patches);
+
+                // --- Discriminator Optimization Step ---
+                d_optimizer.zero_grad();
+
+                // Real Loss
+                auto pred_real = discriminator.forward(gan_real_batch);
+                auto target_real = torch::ones_like(pred_real);
+                auto loss_d_real = torch::mse_loss(pred_real, target_real);
+
+                // Fake Loss (Detach to stop gradients to Generator)
+                auto pred_fake = discriminator.forward(gan_fake_batch.detach());
+                auto target_fake = torch::zeros_like(pred_fake);
+                auto loss_d_fake = torch::mse_loss(pred_fake, target_fake);
+
+                auto loss_d = (loss_d_real + loss_d_fake) * 0.5f;
+                loss_d.backward();
+                d_optimizer.step();
+
+                {
+                    torch::NoGradGuard no_grad;
+                    auto real_correct = (pred_real.detach() > 0.5f).to(torch::kFloat).mean();
+                    auto fake_correct = (pred_fake.detach() < 0.5f).to(torch::kFloat).mean();
+                    d_acc_real = real_correct.item<float>();
+                    d_acc_fake = fake_correct.item<float>();
+                    d_acc_total = 0.5f * (d_acc_real + d_acc_fake);
+                    d_loss_value = loss_d.item<float>();
+                }
+
+                // --- Generator (Avatar) Optimization Step ---
+                // Fake Loss (Keep attached to flow gradients to Generator)
+                auto pred_fake_g = discriminator.forward(gan_fake_batch);
+                auto target_real_g = torch::ones_like(pred_fake_g);
+                auto loss_g_gan = torch::mse_loss(pred_fake_g, target_real_g);
+
+                // Add to total loss
+                loss = loss + (lambda_gan * loss_g_gan);
+            }
+                        
             // 1. BACKWARD PASS
             loss.backward();
 
@@ -1264,6 +1448,14 @@ int main(int argc, char *argv[])
                               << scale_reg.item<float>() * scale_reg_weight << " Pose Reg: "
                               << pose_reg.item<float>() * pose_reg_weight << " Recon loss: "
                               << recon_loss.item<float>() << std::endl;
+                    if (use_gan && d_acc_total >= 0.0f)
+                    {
+                        std::cout << "Epoch " << epoch << " Batch " << batch_step
+                                  << " D loss: " << d_loss_value
+                                  << " D acc (real/fake/avg): " << d_acc_real
+                                  << " / " << d_acc_fake
+                                  << " / " << d_acc_total << std::endl;
+                    }
                     // Calculate components for the BEST inlier sample (or average them if you prefer)
                     float l1_val = recon_losses[best_inlier_idx].item<float>();
                     float alpha_val = alpha_losses[best_inlier_idx].item<float>();
