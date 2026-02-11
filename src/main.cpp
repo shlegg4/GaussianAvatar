@@ -333,7 +333,7 @@ torch::Tensor create_window(int window_size, int channel)
     return window_2d.expand({channel, 1, window_size, window_size}).contiguous();
 }
 
-torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, int window_size = 11)
+torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, int window_size = 21)
 {
     auto inp1 = (img1.dim() == 3) ? img1.unsqueeze(0) : img1;
     auto inp2 = (img2.dim() == 3) ? img2.unsqueeze(0) : img2;
@@ -559,7 +559,7 @@ int main(int argc, char *argv[])
     const float tile_outlier_mult = 3.0f;
     const float tile_mask_min = 0.01f;
     const float tile_median_min = 1e-4f;
-    const int batch_size = 8;
+    const int batch_size = 4;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -730,6 +730,7 @@ int main(int argc, char *argv[])
     const int densify_stop_epoch = options.densify_stop_epoch;
     DensificationState densify_state;
     int64_t global_step = 0;
+    const int warmup_epochs = 5;
 
     std::vector<torch::Tensor> rot_params = {avatar.g_rots};
     std::vector<torch::Tensor> offset_params = {avatar.g_offsets};
@@ -820,6 +821,25 @@ int main(int argc, char *argv[])
     std::mt19937 rng(static_cast<unsigned int>(std::random_device{}()));
     for (int epoch = 0; epoch < epochs; ++epoch)
     {
+        const int sh_degree_eff = (epoch < warmup_epochs) ? 0 : sh_degree;
+        if (epoch < warmup_epochs)
+        {
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(0.0f);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(0.0f);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(0.0f);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * pose_lr_multiplier);
+        }
+        else if (epoch == warmup_epochs)
+        {
+            std::cout << "Warmup complete. Unfreezing Gaussian geometry..." << std::endl;
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(rot_lr * lr_multiplier);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(offset_lr * lr_multiplier);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
+        }
         if (lr_decay_epoch >= 0 && epoch >= lr_decay_epoch)
         {
             if (!lr_decay_applied)
@@ -923,7 +943,7 @@ int main(int argc, char *argv[])
                 std::tie(means3D, current_rots) =
                     avatar.forward(canonical_betas, pose, torch::zeros({1, 3}, canonical_betas.options()));
                 torch::Tensor current_sh = use_sh ? avatar.g_sh : torch::zeros({0}, avatar.g_colors.options());
-                if (use_sh && sh_degree > 0)
+                if (use_sh && sh_degree_eff > 0)
                 {
                     current_sh = RotateSH(current_sh, current_rots);
                 }
@@ -970,7 +990,7 @@ int main(int argc, char *argv[])
                     render_h,
                     render_w,
                     current_sh,
-                    use_sh ? sh_degree : 0,
+                    use_sh ? sh_degree_eff : 0,
                     cam_pos,
                     false);
                 auto image = outputs[0];
@@ -1193,7 +1213,8 @@ int main(int argc, char *argv[])
             global_step++;
 
             // const bool densify_enabled = (densify_stop_epoch <= 0) || (epoch < densify_stop_epoch);
-            if ( 
+            if (
+                epoch >= warmup_epochs &&
                 densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
                 (global_step % densify_cfg.every) == 0)
             {
@@ -1273,7 +1294,7 @@ int main(int argc, char *argv[])
                                   << " avg_median=" << avg_median << std::endl;
                     }
                 }
- 
+
                 dropped_since_log += skipped_malformed + skipped_mask + skipped_outlier;
                 if ((batch_step + 1) % 10 == 0)
                 {
@@ -1304,7 +1325,7 @@ int main(int argc, char *argv[])
         auto scales = capped_scales(avatar.g_scales);
 
         torch::Tensor sh_to_send = sh;
-        if (use_sh && sh_degree > 0)
+        if (use_sh && sh_degree_eff > 0)
         {
             sh_to_send = RotateSH(avatar.g_sh, rotations);
         }
