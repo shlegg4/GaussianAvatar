@@ -7,6 +7,9 @@ struct CachedSampleData
 {
     torch::Tensor target;
     torch::Tensor matte_mask;
+    torch::Tensor pose_axis_angle;
+    torch::Tensor base_trans;
+    torch::Tensor y_scale;
     cv::Mat crop_bgr;
     bool valid = false;
 };

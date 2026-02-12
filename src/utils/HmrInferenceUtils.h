@@ -34,6 +34,11 @@ struct HmrOutputOptions {
     std::string modnet_model_path = "modnet.onnx";
     bool modnet_use_cuda = false;
     int modnet_input_size = 512;
+
+    // Texture Optimization Options
+    bool optimize_texture = false;
+    int texture_iters = 30;
+    int texture_batch = 30;
 };
 
 bool RunHmrInferenceOnVideo(const std::string& model_path,

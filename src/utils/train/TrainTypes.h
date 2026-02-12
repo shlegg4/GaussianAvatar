@@ -66,4 +66,5 @@ struct TrainOptions
     std::string viewer_pose_shm_name;
     std::string viewer_bind_shm_name;
     bool viewer_stream_poses = false;
+    bool enable_timings = false;
 };

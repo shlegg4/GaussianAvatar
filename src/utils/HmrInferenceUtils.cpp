@@ -18,6 +18,7 @@
 #include "ModNetMatte.h"
 #include "SmplifyLite.h"
 #include "SmplLBS.h"
+#include "TextureOptimizer.h"
 #include "TrtBuilder.h"
 #include "RtmPoseDetector.h"
 #include "YoloPersonDetector.h"
@@ -263,6 +264,28 @@ std::string MakeObjName(int frame_idx) {
     return oss.str();
 }
 
+struct BufferedFrameData {
+    int frame_idx = 0;
+    cv::Mat base_frame;
+    SmplResult res;
+    float crop_cx = 0.0f;
+    float crop_cy = 0.0f;
+    float crop_size = 0.0f;
+    float crop_x0 = 0.0f;
+    float crop_y0 = 0.0f;
+    float crop_w = 0.0f;
+    float crop_h = 0.0f;
+    float f_geo = 0.0f;
+    float smplify_y_sign = 1.0f;
+    bool yolo_found = false;
+    std::vector<float> bbox_data;
+    std::optional<cv::Rect2f> pose_bbox;
+    std::optional<cv::Rect2f> yolo_bbox;
+    std::optional<cv::Rect> pose_crop;
+    std::vector<cv::Point2f> pose_keypoints;
+    std::vector<float> pose_keypoint_scores;
+};
+
 void WriteResult(std::ofstream& out, int frame_idx, const SmplResult& res) {
     out << "Frame: " << frame_idx << "\n";
     out << "Pose: ";
@@ -416,7 +439,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
 
     bool use_rtmpose = options.use_rtmpose && !options.rtmpose_model_path.empty();
     std::unique_ptr<SMPLLayer> smpl_layer;
-    if (save_outputs || use_rtmpose) {
+    if (save_outputs || use_rtmpose || options.optimize_texture) {
         smpl_layer = std::make_unique<SMPLLayer>(options.smpl_model_path);
     }
 
@@ -465,6 +488,86 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
             use_modnet = false;
         }
     }
+
+    std::vector<BufferedFrameData> buffered_frames;
+
+    auto save_outputs_for_frame = [&](const BufferedFrameData& data, const SmplResult& res) {
+        if (!save_outputs || !data.yolo_found || !smpl_layer) return;
+
+        WriteResult(outfile, data.frame_idx, res);
+
+        torch::NoGradGuard no_grad;
+        auto betas = torch::from_blob(const_cast<float*>(res.shape.data()), {1, 10}, torch::kFloat).clone();
+        auto pose_axis = PoseToAxisAngle(res);
+        auto trans = torch::zeros({1, 3}, torch::kFloat);
+
+        auto smpl_out = smpl_layer->forward(betas, pose_axis, trans);
+        cv::Mat overlay = data.base_frame.clone();
+        const float render_y_sign = data.smplify_y_sign;
+        DrawVerticesOverlayPinhole(overlay, smpl_out.vertices, res.camera,
+                                   data.crop_cx, data.crop_cy, data.crop_size,
+                                   data.f_geo, data.f_geo, render_y_sign);
+        if (data.pose_bbox) {
+            const cv::Scalar color_bbox(255, 0, 0);
+            cv::rectangle(overlay, data.pose_bbox.value(), color_bbox, 2, cv::LINE_AA);
+        }
+        if (data.yolo_bbox) {
+            const cv::Scalar color_yolo(0, 255, 255);
+            cv::rectangle(overlay, data.yolo_bbox.value(), color_yolo, 2, cv::LINE_AA);
+        }
+        if (data.pose_crop) {
+            const cv::Scalar color_crop(0, 165, 255);
+            cv::rectangle(overlay, data.pose_crop.value(), color_crop, 2, cv::LINE_AA);
+        }
+        DrawOverlayDebug(overlay, res.camera, data.bbox_data);
+        if (!data.pose_keypoints.empty()) {
+            DrawPoseKeypoints(overlay, data.pose_keypoints, data.pose_keypoint_scores, 0.2f);
+        }
+
+        const auto out_path = std::filesystem::path(options.output_dir) / MakeFrameName(data.frame_idx);
+        cv::imwrite(out_path.string(), overlay);
+
+        std::string crop_path_str;
+        if (data.pose_crop && data.pose_crop->width > 0 && data.pose_crop->height > 0) {
+            const auto crop_path = std::filesystem::path(options.output_dir) / MakeCropName(data.frame_idx);
+            cv::Mat crop_img = data.base_frame(*data.pose_crop);
+            cv::Mat matte;
+            cv::Mat matted_frame;
+            bool has_matte = false;
+            if (use_modnet) {
+                if (modnet.ComputeMatte(crop_img, &matte)) {
+                    matted_frame = modnet.ApplyMatte(crop_img, matte);
+                    has_matte = true;
+                }
+            }
+            if (has_matte) {
+                cv::Mat matte_u8;
+                matte.convertTo(matte_u8, CV_8U, 255.0);
+                const auto matte_path = std::filesystem::path(options.output_dir) / MakeMatteName(data.frame_idx);
+                cv::imwrite(matte_path.string(), matte_u8);
+                const auto matte_crop_path = std::filesystem::path(options.output_dir) / MakeMatteCropName(data.frame_idx);
+                cv::imwrite(matte_crop_path.string(), matte_u8);
+                crop_img = matted_frame;
+            }
+            cv::imwrite(crop_path.string(), crop_img);
+            crop_path_str = crop_path.generic_string();
+        }
+
+        WriteTrainRecord(trainfile, data.frame_idx, res,
+                         std::string(),
+                         crop_path_str,
+                         std::string(),
+                         out_path.generic_string(),
+                         data.crop_cx, data.crop_cy, data.crop_size,
+                         data.crop_x0, data.crop_y0, data.crop_w, data.crop_h,
+                         data.f_geo, data.smplify_y_sign,
+                         data.base_frame.cols, data.base_frame.rows);
+
+        if (data.frame_idx == 150) {
+            const auto obj_path = std::filesystem::path(options.output_dir) / MakeObjName(data.frame_idx);
+            WriteObjVertices(smpl_out.vertices, obj_path.string());
+        }
+    };
 
     const nvinfer1::Dims4 img_dims(1, 3, kInputH, kInputW);
     const nvinfer1::Dims2 bbox_dims(1, 3);
@@ -683,83 +786,35 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                             frame_idx);
             }
 
-            if (out_results) {
-                (*out_results)[frame_idx] = res;
-            }
-
-            if (save_outputs && yolo_found) {
-                WriteResult(outfile, frame_idx, res);
-
-                torch::NoGradGuard no_grad;
-                auto betas = torch::from_blob(res.shape.data(), {1, 10}, torch::kFloat).clone();
-                auto pose_axis = PoseToAxisAngle(res);
-                auto trans = torch::zeros({1, 3}, torch::kFloat);
-
-                auto smpl_out = smpl_layer->forward(betas, pose_axis, trans);
-                cv::Mat overlay = base_frame.clone();
-                float render_y_sign = smplify_y_sign;
-                DrawVerticesOverlayPinhole(overlay, smpl_out.vertices, res.camera,
-                                           crop_cx, crop_cy, crop_size, f_geo, f_render, render_y_sign);
-                if (pose_bbox) {
-                    const cv::Scalar color_bbox(255, 0, 0);
-                    cv::rectangle(overlay, pose_bbox.value(), color_bbox, 2, cv::LINE_AA);
+            if (options.optimize_texture) {
+                BufferedFrameData data;
+                data.frame_idx = frame_idx;
+                data.base_frame = base_frame.clone();
+                data.res = res;
+                data.crop_cx = crop_cx;
+                data.crop_cy = crop_cy;
+                data.crop_size = crop_size;
+                data.crop_x0 = crop_x0;
+                data.crop_y0 = crop_y0;
+                data.crop_w = crop_w;
+                data.crop_h = crop_h;
+                data.f_geo = f_geo;
+                data.smplify_y_sign = smplify_y_sign;
+                data.yolo_found = yolo_found;
+                data.bbox_data = bbox_data;
+                data.pose_bbox = pose_bbox;
+                data.yolo_bbox = yolo_bbox;
+                data.pose_crop = pose_crop;
+                data.pose_keypoints = pose_keypoints;
+                data.pose_keypoint_scores = pose_keypoint_scores;
+                buffered_frames.push_back(std::move(data));
+            } else {
+                if (out_results) {
+                    (*out_results)[frame_idx] = res;
                 }
-                if (yolo_bbox) {
-                    const cv::Scalar color_yolo(0, 255, 255);
-                    cv::rectangle(overlay, yolo_bbox.value(), color_yolo, 2, cv::LINE_AA);
-                }
-                if (pose_crop) {
-                    const cv::Scalar color_crop(0, 165, 255);
-                    cv::rectangle(overlay, pose_crop.value(), color_crop, 2, cv::LINE_AA);
-                }
-                DrawOverlayDebug(overlay, res.camera, bbox_data);
-                if (!pose_keypoints.empty()) {
-                    DrawPoseKeypoints(overlay, pose_keypoints, pose_keypoint_scores, 0.2f);
-                }
-
-                const auto out_path = std::filesystem::path(options.output_dir) / MakeFrameName(frame_idx);
-                cv::imwrite(out_path.string(), overlay);
-
-                std::string crop_path_str;
-                if (pose_crop && pose_crop->width > 0 && pose_crop->height > 0) {
-                    const auto crop_path = std::filesystem::path(options.output_dir) / MakeCropName(frame_idx);
-                    cv::Mat crop_img = base_frame(*pose_crop);
-                    cv::Mat matte;
-                    cv::Mat matted_frame;
-                    bool has_matte = false;
-                    if (use_modnet) {
-                        if (modnet.ComputeMatte(crop_img, &matte)) {
-                            matted_frame = modnet.ApplyMatte(crop_img, matte);
-                            has_matte = true;
-                        }
-                    }
-                    if (has_matte) {
-                        cv::Mat matte_u8;
-                        matte.convertTo(matte_u8, CV_8U, 255.0);
-                        const auto matte_path = std::filesystem::path(options.output_dir) / MakeMatteName(frame_idx);
-                        cv::imwrite(matte_path.string(), matte_u8);
-                        const auto matte_crop_path = std::filesystem::path(options.output_dir) / MakeMatteCropName(frame_idx);
-                        cv::imwrite(matte_crop_path.string(), matte_u8);
-                        crop_img = matted_frame;
-                    }
-                    cv::imwrite(crop_path.string(), crop_img);
-                    crop_path_str = crop_path.generic_string();
-                }
-
-                WriteTrainRecord(trainfile, frame_idx, res,
-                                 std::string(),
-                                 crop_path_str,
-                                 std::string(),
-                                 out_path.generic_string(),
-                                 crop_cx, crop_cy, crop_size,
-                                 crop_x0, crop_y0, crop_w, crop_h,
-                                 f_geo, smplify_y_sign,
-                                 base_frame.cols, base_frame.rows);
-
-                if (frame_idx == 150) {
-                    const auto obj_path = std::filesystem::path(options.output_dir) / MakeObjName(frame_idx);
-                    WriteObjVertices(smpl_out.vertices, obj_path.string());
-                }
+                save_outputs_for_frame(BufferedFrameData{frame_idx, base_frame, res, crop_cx, crop_cy, crop_size,
+                    crop_x0, crop_y0, crop_w, crop_h, f_geo, smplify_y_sign, yolo_found, bbox_data, pose_bbox, yolo_bbox,
+                    pose_crop, pose_keypoints, pose_keypoint_scores}, res);
             }
 
         } catch (const std::exception& e) {
@@ -778,6 +833,34 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
             }
             if (frame_idx % 30 == 0) std::cout << "Frame: " << frame_idx << std::endl;
             frame_idx++;
+        }
+    }
+
+    if (options.optimize_texture && !buffered_frames.empty() && smpl_layer) {
+        std::vector<cv::Mat> frames;
+        std::vector<SmplResult> results;
+        std::vector<float> crop_info;
+        frames.reserve(buffered_frames.size());
+        results.reserve(buffered_frames.size());
+        crop_info.reserve(buffered_frames.size() * 3);
+
+        for (const auto& data : buffered_frames) {
+            frames.push_back(data.base_frame);
+            results.push_back(data.res);
+            crop_info.push_back(data.crop_cx);
+            crop_info.push_back(data.crop_cy);
+            crop_info.push_back(data.crop_size);
+        }
+
+        const float f_geo = buffered_frames.front().f_geo;
+        OptimizeTextureConsistency(*smpl_layer, frames, &results, crop_info, f_geo, options);
+
+        for (size_t i = 0; i < buffered_frames.size(); ++i) {
+            buffered_frames[i].res = results[i];
+            if (out_results) {
+                (*out_results)[buffered_frames[i].frame_idx] = buffered_frames[i].res;
+            }
+            save_outputs_for_frame(buffered_frames[i], buffered_frames[i].res);
         }
     }
 

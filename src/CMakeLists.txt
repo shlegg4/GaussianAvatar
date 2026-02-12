@@ -138,6 +138,7 @@ add_executable(hmr_inference
     utils/HmrMathHelpers.cpp
     utils/HmrOverlayHelpers.cpp
     utils/SmplifyLite.cpp
+    utils/TextureOptimizer.cpp
     utils/TrtBuilder.cpp
     utils/RtmPoseDetector.cpp
     utils/YoloPersonDetector.cpp
@@ -206,6 +207,93 @@ if(MSVC)
     endif()
 else()
     target_link_libraries(hmr_inference 
+        PRIVATE 
+        ${OpenCV_LIBS}
+        nvinfer
+        nvonnxparser
+        cudart
+        onnxruntime
+        ${TORCH_LIBRARIES}
+    )
+endif()
+
+# ==========================================
+# EXECUTABLE 3: hmr_inference_opt (ONNX/OpenCV + Texture Optimization)
+# ==========================================
+add_executable(hmr_inference_opt
+    hmr_inference_opt.cpp
+    utils/HmrInferenceUtils.cpp
+    utils/HmrMathHelpers.cpp
+    utils/HmrOverlayHelpers.cpp
+    utils/SmplifyLite.cpp
+    utils/TextureOptimizer.cpp
+    utils/TrtBuilder.cpp
+    utils/RtmPoseDetector.cpp
+    utils/YoloPersonDetector.cpp
+    utils/ModNetMatte.cpp
+)
+target_include_directories(hmr_inference_opt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+if(MSVC)
+    target_link_libraries(hmr_inference_opt 
+        PRIVATE 
+        ${OpenCV_LIBS}
+        nvinfer.lib
+        nvonnxparser.lib
+        cudart.lib
+        onnxruntime.lib
+        ${TORCH_LIBRARIES}
+    )
+    target_compile_definitions(hmr_inference_opt PRIVATE NOMINMAX)
+
+    add_custom_command(TARGET hmr_inference_opt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${TENSORRT_ROOT}/lib/nvinfer.dll"
+        $<TARGET_FILE_DIR:hmr_inference_opt>
+    )
+    add_custom_command(TARGET hmr_inference_opt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${TENSORRT_ROOT}/lib/nvonnxparser.dll"
+        $<TARGET_FILE_DIR:hmr_inference_opt>
+    )
+    add_custom_command(TARGET hmr_inference_opt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${TENSORRT_ROOT}/lib/nvinfer_builder_resource.dll"
+        $<TARGET_FILE_DIR:hmr_inference_opt>
+    )
+    add_custom_command(TARGET hmr_inference_opt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${TENSORRT_ROOT}/lib/nvinfer_plugin.dll"
+        $<TARGET_FILE_DIR:hmr_inference_opt>
+    )
+    add_custom_command(TARGET hmr_inference_opt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CUDA_ROOT}/bin/cudart64_12.dll"
+        $<TARGET_FILE_DIR:hmr_inference_opt>
+    )
+    if(EXISTS "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll")
+        add_custom_command(TARGET hmr_inference_opt POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
+            $<TARGET_FILE_DIR:hmr_inference_opt>
+        )
+    endif()
+    if(EXISTS "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_cuda.dll")
+        add_custom_command(TARGET hmr_inference_opt POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_cuda.dll"
+            $<TARGET_FILE_DIR:hmr_inference_opt>
+        )
+    endif()
+    if(EXISTS "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_shared.dll")
+        add_custom_command(TARGET hmr_inference_opt POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_ROOT}/lib/onnxruntime_providers_shared.dll"
+            $<TARGET_FILE_DIR:hmr_inference_opt>
+        )
+    endif()
+else()
+    target_link_libraries(hmr_inference_opt 
         PRIVATE 
         ${OpenCV_LIBS}
         nvinfer
