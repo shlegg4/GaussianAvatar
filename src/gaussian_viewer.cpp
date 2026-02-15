@@ -20,130 +20,130 @@
 
 namespace
 {
-struct ViewerOptions
-{
-    std::string shm_name = "GaussianAvatarShared";
-    int width = 1280;
-    int height = 720;
-    float point_size = 1.0f;
-    int retry_ms = 500;
-};
-
-struct CameraState
-{
-    float yaw = 0.0f;
-    float pitch = 0.0f;
-    Vec3 position{0.0f, 0.0f, 2.5f};
-    Vec3 target{0.0f, 0.0f, 0.0f};
-    Quat model_rot{1.0f, 0.0f, 0.0f, 0.0f};
-    Vec3 model_offset{0.0f, 0.0f, 0.0f};
-    bool rotating = false;
-    bool panning = false;
-    double last_x = 0.0;
-    double last_y = 0.0;
-};
-
-CameraState g_camera{};
-
-struct BoundsState
-{
-    bool valid = false;
-    Vec3 min;
-    Vec3 max;
-};
-
-BoundsState g_bounds{};
-
-void MouseButtonCallback(GLFWwindow *window, int button, int action, int /*mods*/)
-{
-    if (button == GLFW_MOUSE_BUTTON_LEFT)
-        g_camera.rotating = (action == GLFW_PRESS);
-    if (button == GLFW_MOUSE_BUTTON_RIGHT)
-        g_camera.panning = (action == GLFW_PRESS);
-    glfwGetCursorPos(window, &g_camera.last_x, &g_camera.last_y);
-}
-
-void CursorPosCallback(GLFWwindow * /*window*/, double xpos, double ypos)
-{
-    const double dx = xpos - g_camera.last_x;
-    const double dy = ypos - g_camera.last_y;
-    g_camera.last_x = xpos;
-    g_camera.last_y = ypos;
-    if (g_camera.rotating)
+    struct ViewerOptions
     {
-        const float yaw_delta = static_cast<float>(dx) * 0.005f;
-        const Quat qy = AxisAngleQuat({0.0f, 1.0f, 0.0f}, yaw_delta);
-        g_camera.model_rot = NormalizeQuat(MulQuat(qy, g_camera.model_rot));
+        std::string shm_name = "GaussianAvatarShared";
+        int width = 1280;
+        int height = 720;
+        float point_size = 1.0f;
+        int retry_ms = 500;
+    };
+
+    struct CameraState
+    {
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+        Vec3 position{0.0f, 0.0f, 2.5f};
+        Vec3 target{0.0f, 0.0f, 0.0f};
+        Quat model_rot{1.0f, 0.0f, 0.0f, 0.0f};
+        Vec3 model_offset{0.0f, 0.0f, 0.0f};
+        bool rotating = false;
+        bool panning = false;
+        double last_x = 0.0;
+        double last_y = 0.0;
+    };
+
+    CameraState g_camera{};
+
+    struct BoundsState
+    {
+        bool valid = false;
+        Vec3 min;
+        Vec3 max;
+    };
+
+    BoundsState g_bounds{};
+
+    void MouseButtonCallback(GLFWwindow *window, int button, int action, int /*mods*/)
+    {
+        if (button == GLFW_MOUSE_BUTTON_LEFT)
+            g_camera.rotating = (action == GLFW_PRESS);
+        if (button == GLFW_MOUSE_BUTTON_RIGHT)
+            g_camera.panning = (action == GLFW_PRESS);
+        glfwGetCursorPos(window, &g_camera.last_x, &g_camera.last_y);
     }
-    if (g_camera.panning)
+
+    void CursorPosCallback(GLFWwindow * /*window*/, double xpos, double ypos)
     {
-        const float pan_scale = 0.005f;
-        g_camera.model_offset.x += -static_cast<float>(dx) * pan_scale;
-        g_camera.model_offset.y += static_cast<float>(dy) * pan_scale;
-    }
-}
-
-void ScrollCallback(GLFWwindow * /*window*/, double /*xoffset*/, double yoffset)
-{
-    const float zoom = static_cast<float>(yoffset) * 0.2f;
-    g_camera.model_offset.z += zoom;
-}
-
-void FrameCameraToBounds()
-{
-    if (!g_bounds.valid)
-        return;
-    Vec3 center{
-        0.5f * (g_bounds.min.x + g_bounds.max.x),
-        0.5f * (g_bounds.min.y + g_bounds.max.y),
-        0.5f * (g_bounds.min.z + g_bounds.max.z)};
-    Vec3 extents{
-        0.5f * (g_bounds.max.x - g_bounds.min.x),
-        0.5f * (g_bounds.max.y - g_bounds.min.y),
-        0.5f * (g_bounds.max.z - g_bounds.min.z)};
-    const float radius = std::max({extents.x, extents.y, extents.z, 0.1f});
-    const float dist = radius * 3.0f;
-    g_camera.target = center;
-    g_camera.position = {center.x, center.y, center.z + dist};
-}
-
-bool ParseArgs(int argc, char **argv, ViewerOptions *options)
-{
-    for (int i = 1; i < argc; ++i)
-    {
-        std::string arg = argv[i];
-        if (arg == "--shm" && i + 1 < argc)
+        const double dx = xpos - g_camera.last_x;
+        const double dy = ypos - g_camera.last_y;
+        g_camera.last_x = xpos;
+        g_camera.last_y = ypos;
+        if (g_camera.rotating)
         {
-            options->shm_name = argv[++i];
+            const float yaw_delta = static_cast<float>(dx) * 0.005f;
+            const Quat qy = AxisAngleQuat({0.0f, 1.0f, 0.0f}, yaw_delta);
+            g_camera.model_rot = NormalizeQuat(MulQuat(qy, g_camera.model_rot));
         }
-        else if (arg == "--width" && i + 1 < argc)
+        if (g_camera.panning)
         {
-            options->width = std::stoi(argv[++i]);
-        }
-        else if (arg == "--height" && i + 1 < argc)
-        {
-            options->height = std::stoi(argv[++i]);
-        }
-        else if (arg == "--point-size" && i + 1 < argc)
-        {
-            options->point_size = std::stof(argv[++i]);
-        }
-        else if (arg == "--retry-ms" && i + 1 < argc)
-        {
-            options->retry_ms = std::stoi(argv[++i]);
-        }
-        else if (arg == "--help" || arg == "-h")
-        {
-            return false;
-        }
-        else
-        {
-            std::cerr << "Unknown arg: " << arg << std::endl;
-            return false;
+            const float pan_scale = 0.005f;
+            g_camera.model_offset.x += -static_cast<float>(dx) * pan_scale;
+            g_camera.model_offset.y += static_cast<float>(dy) * pan_scale;
         }
     }
-    return true;
-}
+
+    void ScrollCallback(GLFWwindow * /*window*/, double /*xoffset*/, double yoffset)
+    {
+        const float zoom = static_cast<float>(yoffset) * 0.2f;
+        g_camera.model_offset.z += zoom;
+    }
+
+    void FrameCameraToBounds()
+    {
+        if (!g_bounds.valid)
+            return;
+        Vec3 center{
+            0.5f * (g_bounds.min.x + g_bounds.max.x),
+            0.5f * (g_bounds.min.y + g_bounds.max.y),
+            0.5f * (g_bounds.min.z + g_bounds.max.z)};
+        Vec3 extents{
+            0.5f * (g_bounds.max.x - g_bounds.min.x),
+            0.5f * (g_bounds.max.y - g_bounds.min.y),
+            0.5f * (g_bounds.max.z - g_bounds.min.z)};
+        const float radius = std::max({extents.x, extents.y, extents.z, 0.1f});
+        const float dist = radius * 3.0f;
+        g_camera.target = center;
+        g_camera.position = {center.x, center.y, center.z + dist};
+    }
+
+    bool ParseArgs(int argc, char **argv, ViewerOptions *options)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            std::string arg = argv[i];
+            if (arg == "--shm" && i + 1 < argc)
+            {
+                options->shm_name = argv[++i];
+            }
+            else if (arg == "--width" && i + 1 < argc)
+            {
+                options->width = std::stoi(argv[++i]);
+            }
+            else if (arg == "--height" && i + 1 < argc)
+            {
+                options->height = std::stoi(argv[++i]);
+            }
+            else if (arg == "--point-size" && i + 1 < argc)
+            {
+                options->point_size = std::stof(argv[++i]);
+            }
+            else if (arg == "--retry-ms" && i + 1 < argc)
+            {
+                options->retry_ms = std::stoi(argv[++i]);
+            }
+            else if (arg == "--help" || arg == "-h")
+            {
+                return false;
+            }
+            else
+            {
+                std::cerr << "Unknown arg: " << arg << std::endl;
+                return false;
+            }
+        }
+        return true;
+    }
 } // namespace
 
 int main(int argc, char **argv)
@@ -200,7 +200,7 @@ int main(int argc, char **argv)
     bool prev_z = false;
     bool prev_r = false;
     bool randomize_colors = false;
-    
+
     float render_scale_modifier = 1.0f;
     uint64_t last_version = 0;
 
@@ -222,17 +222,17 @@ int main(int argc, char **argv)
         if (key_x && !prev_x)
         {
             g_camera.model_rot = NormalizeQuat(MulQuat(AxisAngleQuat({1.0f, 0.0f, 0.0f}, 1.57079633f),
-                                                      g_camera.model_rot));
+                                                       g_camera.model_rot));
         }
         if (key_y && !prev_y)
         {
             g_camera.model_rot = NormalizeQuat(MulQuat(AxisAngleQuat({0.0f, 1.0f, 0.0f}, 1.57079633f),
-                                                      g_camera.model_rot));
+                                                       g_camera.model_rot));
         }
         if (key_z && !prev_z)
         {
             g_camera.model_rot = NormalizeQuat(MulQuat(AxisAngleQuat({0.0f, 0.0f, 1.0f}, 1.57079633f),
-                                                      g_camera.model_rot));
+                                                       g_camera.model_rot));
         }
         prev_x = key_x;
         prev_y = key_y;
@@ -260,7 +260,7 @@ int main(int argc, char **argv)
                 reader.Open(options.shm_name);
             }
         }
-        
+
         uint32_t sh_degree = 0;
         if (reader.IsOpen())
         {
@@ -300,7 +300,7 @@ int main(int argc, char **argv)
             const uint32_t sh_coeffs = (sh_degree > 0) ? (sh_degree + 1) * (sh_degree + 1) : 0;
             const uint32_t sh_stride = base_stride + sh_coeffs * 3u;
             const bool use_sh = (sh_degree > 0) && (stride >= sh_stride) && !randomize_colors;
-            
+
             // --- OPTIMIZATION 1: Conditional Upload & GPU Slicing ---
             // We only run this block if new data arrived from Shared Memory.
             // Otherwise, we reuse 'means3D', 'colors', etc., which stay on VRAM.
@@ -308,36 +308,38 @@ int main(int argc, char **argv)
             {
                 // Upload ONE large contiguous blob. No CPU loop!
                 auto opts_cpu = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-                
+
                 // Copy points -> GPU raw tensor
-                raw_gpu = torch::from_blob(points.data(), 
-                    {static_cast<int64_t>(point_count), static_cast<int64_t>(stride)}, 
-                    opts_cpu).to(device, /*non_blocking=*/false, /*copy=*/true);
+                raw_gpu = torch::from_blob(points.data(),
+                                           {static_cast<int64_t>(point_count), static_cast<int64_t>(stride)},
+                                           opts_cpu)
+                              .to(device, /*non_blocking=*/false, /*copy=*/true);
 
                 using namespace torch::indexing;
-                
+
                 // Create views/slices on GPU (Instant)
-                means3D   = raw_gpu.index({Slice(), Slice(0, 3)}).contiguous();
+                means3D = raw_gpu.index({Slice(), Slice(0, 3)}).contiguous();
                 // Colors are temporarily extracted even if SH is used, just to be safe
-                colors    = raw_gpu.index({Slice(), Slice(3, 6)}).contiguous();
+                colors = raw_gpu.index({Slice(), Slice(3, 6)}).contiguous();
                 opacities = raw_gpu.index({Slice(), Slice(6, 7)}).contiguous();
-                scales    = raw_gpu.index({Slice(), Slice(8, 11)}).contiguous();
+                scales = raw_gpu.index({Slice(), Slice(8, 11)}).contiguous();
                 rotations = raw_gpu.index({Slice(), Slice(11, 15)}).contiguous();
 
                 // Handle SH or Random Colors
                 if (use_sh)
                 {
-                    auto sh_flat = raw_gpu.index({Slice(), Slice(static_cast<int64_t>(base_stride), 
+                    auto sh_flat = raw_gpu.index({Slice(), Slice(static_cast<int64_t>(base_stride),
                                                                  static_cast<int64_t>(base_stride + sh_coeffs * 3))});
-                    sh_tensor = sh_flat.view({static_cast<int64_t>(point_count), 
-                                              static_cast<int64_t>(sh_coeffs), 3}).contiguous();
+                    sh_tensor = sh_flat.view({static_cast<int64_t>(point_count),
+                                              static_cast<int64_t>(sh_coeffs), 3})
+                                    .contiguous();
                     // Rasterizer usually ignores 'colors' if sh_degree > 0, but we can clear it to save memory/confusion
                     colors = torch::zeros({0}, device);
                 }
                 else
                 {
                     sh_tensor = torch::zeros({0}, device);
-                    
+
                     if (randomize_colors)
                     {
                         if (!random_colors.defined() || random_colors_count != static_cast<int64_t>(point_count))
@@ -353,16 +355,23 @@ int main(int argc, char **argv)
 
                 // Update Bounds (Lazy CPU check just for "Frame Camera")
                 // We do a strided check to avoid iterating 100k points on CPU
-                if (!g_bounds.valid) 
+                if (!g_bounds.valid)
                 {
                     Vec3 min_v{points[0], points[1], points[2]};
                     Vec3 max_v{points[0], points[1], points[2]};
                     // Sample every 100th point for speed
-                    for(size_t i = 0; i < points.size(); i += stride * 100) {
-                        min_v.x = std::min(min_v.x, points[i+0]); min_v.y = std::min(min_v.y, points[i+1]); min_v.z = std::min(min_v.z, points[i+2]);
-                        max_v.x = std::max(max_v.x, points[i+0]); max_v.y = std::max(max_v.y, points[i+1]); max_v.z = std::max(max_v.z, points[i+2]);
+                    for (size_t i = 0; i < points.size(); i += stride * 100)
+                    {
+                        min_v.x = std::min(min_v.x, points[i + 0]);
+                        min_v.y = std::min(min_v.y, points[i + 1]);
+                        min_v.z = std::min(min_v.z, points[i + 2]);
+                        max_v.x = std::max(max_v.x, points[i + 0]);
+                        max_v.y = std::max(max_v.y, points[i + 1]);
+                        max_v.z = std::max(max_v.z, points[i + 2]);
                     }
-                    g_bounds.min = min_v; g_bounds.max = max_v; g_bounds.valid = true;
+                    g_bounds.min = min_v;
+                    g_bounds.max = max_v;
+                    g_bounds.valid = true;
                 }
 
                 gpu_data_dirty = false;
@@ -382,11 +391,11 @@ int main(int argc, char **argv)
             Vec3 base_offset{0.0f, 0.0f, 0.0f};
             if (g_bounds.valid)
             {
-                 // Simple framing logic
-                 Vec3 center{0.5f * (g_bounds.min.x + g_bounds.max.x), 0.5f * (g_bounds.min.y + g_bounds.max.y), 0.5f * (g_bounds.min.z + g_bounds.max.z)};
-                 Vec3 extents{0.5f * (g_bounds.max.x - g_bounds.min.x), 0.5f * (g_bounds.max.y - g_bounds.min.y), 0.5f * (g_bounds.max.z - g_bounds.min.z)};
-                 const float radius = std::max({extents.x, extents.y, extents.z, 0.1f});
-                 base_offset.z = (radius * 3.0f) - center.z;
+                // Simple framing logic
+                Vec3 center{0.5f * (g_bounds.min.x + g_bounds.max.x), 0.5f * (g_bounds.min.y + g_bounds.max.y), 0.5f * (g_bounds.min.z + g_bounds.max.z)};
+                Vec3 extents{0.5f * (g_bounds.max.x - g_bounds.min.x), 0.5f * (g_bounds.max.y - g_bounds.min.y), 0.5f * (g_bounds.max.z - g_bounds.min.z)};
+                const float radius = std::max({extents.x, extents.y, extents.z, 0.1f});
+                base_offset.z = (radius * 3.0f) - center.z;
             }
 
             Vec3 pivot{g_camera.target.x, g_camera.target.y, g_camera.target.z};
@@ -399,8 +408,13 @@ int main(int argc, char **argv)
             Mat4 view_proj = Multiply(proj_mat, view_mat);
 
             torch::Tensor view_ten = Mat4ToTensorRowMajor(view_mat, device).transpose(0, 1).contiguous();
-            torch::Tensor proj_t = Mat4ToTensorRowMajor(view_proj, device).transpose(0, 1).contiguous();
+            torch::Tensor proj_ten_t = Mat4ToTensorRowMajor(proj_mat, device).transpose(0, 1).contiguous();
 
+            using namespace torch::indexing;
+            view_ten.index_put_({Slice(), 0}, view_ten.index({Slice(), 0}) * -1.0f);
+
+            torch::Tensor proj_t = torch::matmul(view_ten, proj_ten_t).contiguous();
+            
             Vec3 cam_pos_v = CameraPosFromView(view_mat);
             auto cam_pos = torch::tensor({cam_pos_v.x, cam_pos_v.y, cam_pos_v.z}, device);
 
@@ -418,8 +432,7 @@ int main(int argc, char **argv)
 
             // --- OPTIMIZATION 2: GPU Permute ---
             // Perform CHW -> HWC on GPU, then download. Fixes OpenMP spin.
-            auto img_tensor = outputs[0].detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kU8)
-                  .permute({1, 2, 0}).contiguous().cpu();
+            auto img_tensor = outputs[0].detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kU8).permute({1, 2, 0}).contiguous().cpu();
 
             glMatrixMode(GL_PROJECTION);
             glLoadIdentity();

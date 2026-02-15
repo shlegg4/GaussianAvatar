@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/torch.h>
 #include <torch/script.h> // Required for pickle_load
+#include <array>
 #include <vector>
 #include <iostream>
 #include <fstream>
@@ -80,6 +81,8 @@ struct SMPLLayer : torch::nn::Module {
     torch::Tensor J_regressor;  // [24, 6890]
     torch::Tensor parents;      // [24] (Long)
     torch::Tensor weights;      // [6890, 24]
+    torch::Tensor parents_cpu;  // [24] cached on CPU
+    std::array<int64_t, 24> parents_host{};
 
     // Constructor: Loads parameters from .pt file
     SMPLLayer(const std::string& model_path) {
@@ -134,6 +137,16 @@ struct SMPLLayer : torch::nn::Module {
         raw_parents[0] = 0;
 
         parents = register_buffer("parents", raw_parents);
+        parents_cpu = raw_parents.to(torch::kCPU).to(torch::kLong).contiguous();
+        if (parents_cpu.numel() != 24)
+        {
+            throw std::runtime_error("Expected 24 SMPL parents, got " + std::to_string(parents_cpu.numel()));
+        }
+        auto parents_acc = parents_cpu.accessor<int64_t, 1>();
+        for (int i = 0; i < 24; ++i)
+        {
+            parents_host[i] = parents_acc[i];
+        }
 
         std::cout << "SMPL Model loaded successfully." << std::endl;
     }
@@ -142,6 +155,16 @@ struct SMPLLayer : torch::nn::Module {
     SmplOutput forward(torch::Tensor betas, torch::Tensor pose_axis_angle, torch::Tensor trans) {
         auto batch_size = betas.size(0);
         auto device = betas.device();
+
+        if (trans.dim() == 1)
+        {
+            trans = trans.unsqueeze(0);
+        }
+        if (trans.dim() == 2 && trans.size(0) == 1 && batch_size > 1)
+        {
+            trans = trans.expand({batch_size, trans.size(1)});
+        }
+        trans = trans.to(device);
 
         // 1. Shape Blending
         // v_shaped = v_template + shapedirs * betas
@@ -165,10 +188,6 @@ struct SMPLLayer : torch::nn::Module {
         // 4. Forward Kinematics (FK)
         // Using vector/stack to avoid in-place version errors
         std::vector<torch::Tensor> G_vec(24);
-
-        // Move parents to CPU for loop logic
-        auto parents_cpu = parents.to(torch::kCPU);
-        auto parents_acc = parents_cpu.accessor<int64_t, 1>();
 
         // Prepare relative offsets safely
         auto J_parents = J.index_select(1, parents);
@@ -194,8 +213,15 @@ struct SMPLLayer : torch::nn::Module {
                 G_vec[i] = local_transform;
             } else {
                 // Child: Global_parent * Local_child
-                int64_t parent_idx = parents_acc[i];
-                G_vec[i] = torch::matmul(G_vec[parent_idx], local_transform);
+                int64_t parent_idx = parents_host[i];
+                if (parent_idx < 0 || parent_idx >= i)
+                {
+                    G_vec[i] = local_transform;
+                }
+                else
+                {
+                    G_vec[i] = torch::matmul(G_vec[parent_idx], local_transform);
+                }
             }
         }
 
