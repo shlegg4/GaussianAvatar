@@ -131,69 +131,65 @@ torch::Tensor QuatMultiply(const torch::Tensor &p, const torch::Tensor &q)
 
 torch::Tensor QuatToMat3(const torch::Tensor &q, torch::Device device)
 {
+    (void)device;
     auto qn = torch::nn::functional::normalize(q, torch::nn::functional::NormalizeFuncOptions().dim(1));
-    auto w = qn.select(1, 0);
-    auto x = qn.select(1, 1);
-    auto y = qn.select(1, 2);
-    auto z = qn.select(1, 3);
 
-    auto ww = w * w;
-    auto xx = x * x;
-    auto yy = y * y;
-    auto zz = z * z;
-    auto wx = w * x;
-    auto wy = w * y;
-    auto wz = w * z;
+    auto w = qn.slice(1, 0, 1);
+    auto x = qn.slice(1, 1, 2);
+    auto y = qn.slice(1, 2, 3);
+    auto z = qn.slice(1, 3, 4);
+
+    auto x2 = x * x;
+    auto y2 = y * y;
+    auto z2 = z * z;
     auto xy = x * y;
     auto xz = x * z;
     auto yz = y * z;
+    auto wx = w * x;
+    auto wy = w * y;
+    auto wz = w * z;
 
-    auto m00 = ww + xx - yy - zz;
-    auto m01 = 2.0f * (xy - wz);
-    auto m02 = 2.0f * (xz + wy);
-    auto m10 = 2.0f * (xy + wz);
-    auto m11 = ww - xx + yy - zz;
-    auto m12 = 2.0f * (yz - wx);
-    auto m20 = 2.0f * (xz - wy);
-    auto m21 = 2.0f * (yz + wx);
-    auto m22 = ww - xx - yy + zz;
+    auto r00 = 1.0f - 2.0f * (y2 + z2);
+    auto r01 = 2.0f * (xy - wz);
+    auto r02 = 2.0f * (xz + wy);
+    auto r10 = 2.0f * (xy + wz);
+    auto r11 = 1.0f - 2.0f * (x2 + z2);
+    auto r12 = 2.0f * (yz - wx);
+    auto r20 = 2.0f * (xz - wy);
+    auto r21 = 2.0f * (yz + wx);
+    auto r22 = 1.0f - 2.0f * (x2 + y2);
 
-    auto row0 = torch::stack({m00, m01, m02}, 1);
-    auto row1 = torch::stack({m10, m11, m12}, 1);
-    auto row2 = torch::stack({m20, m21, m22}, 1);
-    return torch::stack({row0, row1, row2}, 1).to(device);
+    return torch::cat({r00, r01, r02, r10, r11, r12, r20, r21, r22}, 1).view({-1, 3, 3});
 }
 
 torch::Tensor RotateSH(const torch::Tensor &sh, const torch::Tensor &rotations)
 {
-    if (!sh.defined() || sh.dim() < 3 || sh.size(1) < 4)
+    if (!sh.defined() || sh.dim() < 3 || sh.size(0) == 0)
+        return sh;
+    if (sh.size(1) < 4)
         return sh;
 
-    auto rots_norm = torch::nn::functional::normalize(rotations,
-        torch::nn::functional::NormalizeFuncOptions().dim(1));
+    auto rot_mats = QuatToMat3(rotations, sh.device());
+    auto sh_dc = sh.slice(1, 0, 1);    // [N,1,3]
+    auto sh_y = sh.slice(1, 1, 2);     // [N,1,3]
+    auto sh_z = sh.slice(1, 2, 3);     // [N,1,3]
+    auto sh_x = sh.slice(1, 3, 4);     // [N,1,3]
 
-    auto rot_mats = QuatToMat3(rots_norm, sh.device());
+    // Preserve legacy convention used by training/viewers:
+    // coeff1->Y, coeff2->Z, coeff3->X with a sign flip on X output.
+    auto sh_vec = torch::cat({sh_x, sh_y, sh_z}, 1); // [N,3,3]
+    auto rotated = torch::bmm(rot_mats, sh_vec);     // [N,3,3]
 
-    using torch::indexing::Slice;
+    auto out_y = rotated.slice(1, 1, 2);
+    auto out_z = rotated.slice(1, 2, 3);
+    auto out_x = -rotated.slice(1, 0, 1);
+    auto sh_rot_band1 = torch::cat({out_y, out_z, out_x}, 1); // [N,3,3]
 
-    auto sh_d1 = sh.index({Slice(), Slice(1, 4), Slice()});
-    auto sh_y = sh_d1.index({Slice(), 0, Slice()});
-    auto sh_z = sh_d1.index({Slice(), 1, Slice()});
-    auto sh_x = sh_d1.index({Slice(), 2, Slice()});
-
-    auto sh_vec = torch::stack({sh_x, sh_y, sh_z}, 1);
-
-    auto rotated_vec = torch::bmm(rot_mats, sh_vec);
-
-    auto out_sh = sh.clone();
-
-    out_sh.index_put_({Slice(), 1, Slice()}, rotated_vec.index({Slice(), 1, Slice()}));
-    out_sh.index_put_({Slice(), 2, Slice()}, rotated_vec.index({Slice(), 2, Slice()}));
-    out_sh.index_put_({Slice(), 3, Slice()}, -rotated_vec.index({Slice(), 0, Slice()}));
     if (sh.size(1) > 4)
     {
-        out_sh.index_put_({Slice(), Slice(4, torch::indexing::None), Slice()}, 0.0f);
+        auto sh_high_zero = torch::zeros({sh.size(0), sh.size(1) - 4, 3}, sh.options());
+        return torch::cat({sh_dc, sh_rot_band1, sh_high_zero}, 1);
     }
 
-    return out_sh;
+    return torch::cat({sh_dc, sh_rot_band1}, 1);
 }

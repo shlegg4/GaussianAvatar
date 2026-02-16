@@ -119,6 +119,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
     }
 
     auto kept_grad_norm = grad_norm.index_select(0, keep_indices);
+    auto kept_grad_offsets = grad_offsets.index_select(0, keep_indices);
     auto kept_scale_mean = scale_mean.index_select(0, keep_indices);
     auto kept_opacity_flat = opacities.index_select(0, keep_indices);
     
@@ -153,7 +154,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
         auto delta_log = torch::tensor(std::log(safe_scale_factor), g_scales.options());
 
         auto parent_scales = kept_scales.index_select(0, parent_local);
-        auto parent_offsets = kept_offsets.index_select(0, parent_local);
+        auto parent_offsets = kept_offsets.index_select(0, parent_local).contiguous();
         auto parent_rots = kept_rots.index_select(0, parent_local);
         auto parent_colors = kept_colors.index_select(0, parent_local);
         auto parent_opacities = kept_opacities.index_select(0, parent_local);
@@ -166,8 +167,15 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
         }
 
         // Generate split direction
-        auto rand_dir = torch::randn_like(parent_offsets);
-        rand_dir = rand_dir / (torch::norm(rand_dir, 2, 1, true) + 1e-8f);
+        auto parent_grad = kept_grad_offsets.index_select(0, parent_local);
+        auto rand_dir = parent_grad / (torch::norm(parent_grad, 2, 1, true) + 1e-8f);
+        auto zero_mask = torch::norm(parent_grad, 2, 1, true) <= 1e-8f;
+        if (zero_mask.any().item<bool>())
+        {
+            auto fallback = torch::zeros_like(rand_dir);
+            fallback.index_put_({torch::indexing::Slice(), 0}, 1.0f);
+            rand_dir = torch::where(zero_mask, fallback, rand_dir);
+        }
 
         auto scale_mag = kept_scale_mean.index_select(0, parent_local).unsqueeze(1);
         auto delta = rand_dir * (scale_mag * cfg.split_offset_scale);

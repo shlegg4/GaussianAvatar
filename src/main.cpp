@@ -27,6 +27,12 @@
 #include <vector>
 
 #include <torch/csrc/autograd/profiler.h>
+#if __has_include(<ATen/cuda/CUDAGraph.h>)
+#include <ATen/cuda/CUDAGraph.h>
+#define GAUSS_HAS_CUDA_GRAPH 1
+#else
+#define GAUSS_HAS_CUDA_GRAPH 0
+#endif
 
 #include "GaussianRasterizer.h"
 #include "SharedGaussian.h"
@@ -358,6 +364,7 @@ struct TrainDataGPU
     torch::Tensor all_poses;   // (N, 72)
     torch::Tensor all_trans;   // (N, 3)
     torch::Tensor all_time;    // (N, 1)
+    torch::Tensor all_crops;   // (N, 3) -> [cx, cy, size] normalized
 
     TrainDataGPU(const std::vector<TrainSample> &samples, torch::Device device)
     {
@@ -365,9 +372,11 @@ struct TrainDataGPU
         std::vector<float> flat_poses;
         std::vector<float> flat_trans;
         std::vector<float> flat_time;
+        std::vector<float> flat_crops;
         flat_poses.reserve(static_cast<size_t>(N) * 72u);
         flat_trans.reserve(static_cast<size_t>(N) * 3u);
         flat_time.reserve(static_cast<size_t>(N));
+        flat_crops.reserve(static_cast<size_t>(N) * 3u);
 
         for (int64_t i = 0; i < N; ++i)
         {
@@ -397,6 +406,15 @@ struct TrainDataGPU
             flat_trans.push_back(t[1]);
             flat_trans.push_back(t[2]);
 
+            const float img_w = std::max(1.0f, static_cast<float>(s.img_w));
+            const float img_h = std::max(1.0f, static_cast<float>(s.img_h));
+            const float norm_cx = s.crop_cx / img_w;
+            const float norm_cy = s.crop_cy / img_h;
+            const float norm_size = s.crop_size / img_w;
+            flat_crops.push_back(norm_cx);
+            flat_crops.push_back(norm_cy);
+            flat_crops.push_back(norm_size);
+
             const float time_val = static_cast<float>(i) /
                                    static_cast<float>(std::max<int64_t>(1, N - 1));
             flat_time.push_back(time_val);
@@ -406,6 +424,7 @@ struct TrainDataGPU
         all_poses = torch::from_blob(flat_poses.data(), {N, 72}, opts).clone().to(device);
         all_trans = torch::from_blob(flat_trans.data(), {N, 3}, opts).clone().to(device);
         all_time = torch::from_blob(flat_time.data(), {N, 1}, opts).clone().to(device);
+        all_crops = torch::from_blob(flat_crops.data(), {N, 3}, opts).clone().to(device);
     }
 };
 
@@ -503,33 +522,60 @@ struct GaussianAvatar : torch::nn::Module
 
     std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor betas, torch::Tensor pose, torch::Tensor trans)
     {
-        auto smpl_out = smpl->forward(betas, pose, trans);
-        auto verts_posed = smpl_out.vertices[0];
-        auto selected_faces = faces_buffer.index_select(0, g_face_indices);
+        using torch::indexing::Slice;
 
-        auto A = verts_posed.index_select(0, selected_faces.index({torch::indexing::Slice(), 0}));
-        auto B = verts_posed.index_select(0, selected_faces.index({torch::indexing::Slice(), 1}));
-        auto C = verts_posed.index_select(0, selected_faces.index({torch::indexing::Slice(), 2}));
+        auto smpl_out = smpl->forward(betas, pose, trans);
+        auto verts_posed = smpl_out.vertices;
+        const int64_t batch_count = verts_posed.size(0);
+        const int64_t gaussian_count = g_face_indices.size(0);
+
+        auto selected_faces = faces_buffer.index_select(0, g_face_indices);
+        auto face_i0 = selected_faces.index({Slice(), 0});
+        auto face_i1 = selected_faces.index({Slice(), 1});
+        auto face_i2 = selected_faces.index({Slice(), 2});
+
+        auto A = verts_posed.index_select(1, face_i0);
+        auto B = verts_posed.index_select(1, face_i1);
+        auto C = verts_posed.index_select(1, face_i2);
 
         auto verts_canon = v_template_cached.to(verts_posed.device());
-        auto A_can = verts_canon.index_select(0, selected_faces.index({torch::indexing::Slice(), 0}));
-        auto B_can = verts_canon.index_select(0, selected_faces.index({torch::indexing::Slice(), 1}));
-        auto C_can = verts_canon.index_select(0, selected_faces.index({torch::indexing::Slice(), 2}));
+        auto A_can = verts_canon.index_select(0, face_i0);
+        auto B_can = verts_canon.index_select(0, face_i1);
+        auto C_can = verts_canon.index_select(0, face_i2);
 
-        auto R_posed = ComputeTriFrames(A, B, C);
         auto R_canon = ComputeTriFrames(A_can, B_can, C_can);
-        auto R_skin = torch::bmm(R_posed, R_canon.transpose(1, 2));
-        auto posed_offsets = torch::bmm(R_skin, g_offsets.unsqueeze(2)).squeeze(2);
+        auto X = torch::nn::functional::normalize(B - A, torch::nn::functional::NormalizeFuncOptions().dim(2));
+        auto N = torch::cross(B - A, C - A, 2);
+        N = torch::nn::functional::normalize(N, torch::nn::functional::NormalizeFuncOptions().dim(2));
+        auto Y = torch::cross(N, X, 2);
+        auto R_posed = torch::stack({X, Y, N}, 3);
 
-        auto u = g_bary_coords.index({torch::indexing::Slice(), 0}).unsqueeze(1);
-        auto v = g_bary_coords.index({torch::indexing::Slice(), 1}).unsqueeze(1);
-        auto w = g_bary_coords.index({torch::indexing::Slice(), 2}).unsqueeze(1);
+        auto R_canon_batch = R_canon.unsqueeze(0).expand({batch_count, gaussian_count, 3, 3});
+        auto R_posed_flat = R_posed.reshape({-1, 3, 3});
+        auto R_canon_flat = R_canon_batch.reshape({-1, 3, 3});
+        auto R_skin_flat = torch::bmm(R_posed_flat, R_canon_flat.transpose(1, 2));
+        auto R_skin = R_skin_flat.view({batch_count, gaussian_count, 3, 3});
+
+        auto offsets_batch = g_offsets.unsqueeze(0).expand({batch_count, gaussian_count, 3});
+        auto posed_offsets = torch::bmm(R_skin_flat, offsets_batch.reshape({-1, 3, 1}))
+                                .squeeze(2)
+                                .view({batch_count, gaussian_count, 3});
+
+        auto u = g_bary_coords.index({Slice(), 0}).view({1, gaussian_count, 1});
+        auto v = g_bary_coords.index({Slice(), 1}).view({1, gaussian_count, 1});
+        auto w = g_bary_coords.index({Slice(), 2}).view({1, gaussian_count, 1});
 
         auto skinned_pos = u * A + v * B + w * C;
         auto final_pos = skinned_pos + posed_offsets;
 
-        auto q_skin = MatrixToQuat(R_skin);
-        auto final_rot = QuatMultiply(q_skin, g_rots);
+        auto q_skin_flat = MatrixToQuat(R_skin_flat);
+        auto base_rots = g_rots.unsqueeze(0).expand({batch_count, gaussian_count, 4}).reshape({-1, 4});
+        auto final_rot = QuatMultiply(q_skin_flat, base_rots).view({batch_count, gaussian_count, 4});
+
+        if (batch_count == 1)
+        {
+            return {final_pos.squeeze(0), final_rot.squeeze(0)};
+        }
 
         return {final_pos, final_rot};
     }
@@ -543,28 +589,30 @@ struct PoseRefiner : torch::nn::Module
     const float TRANS_XY_SCALE = 0.2f;
     const float TRANS_Z_SCALE = 0.2f;
 
-    PoseRefiner(int input_dim = 72 + 3)
+    PoseRefiner(int input_dim = 72 + 3 + 3)
     {
         const int embed_dim = 4;
         const int total_input = input_dim + embed_dim;
-        const int hidden_dim = 24;
+        const int hidden_dim = 128;
 
         fc1 = register_module("fc1", torch::nn::Linear(total_input, hidden_dim));
         fc2 = register_module("fc2", torch::nn::Linear(hidden_dim, hidden_dim));
-        fc3 = register_module("fc3", torch::nn::Linear(hidden_dim, input_dim));
+        fc3 = register_module("fc3", torch::nn::Linear(hidden_dim, input_dim - 3));
 
+        torch::nn::init::xavier_uniform_(fc1->weight);
+        torch::nn::init::zeros_(fc1->bias);
         torch::nn::init::zeros_(fc3->weight);
         torch::nn::init::zeros_(fc3->bias);
     }
 
-    torch::Tensor forward(torch::Tensor noisy_pose_trans, torch::Tensor time_norm)
+    torch::Tensor forward(torch::Tensor noisy_pose_trans, torch::Tensor crop_params, torch::Tensor time_norm)
     {
         auto device = time_norm.device();
         auto freqs = torch::pow(2.0, torch::arange(0, 2, torch::TensorOptions().device(device)).to(torch::kFloat));
         auto time_projected = time_norm * freqs.unsqueeze(0) * 3.14159f;
         auto time_embed = torch::cat({torch::sin(time_projected), torch::cos(time_projected)}, 1);
 
-        auto x = torch::cat({noisy_pose_trans, time_embed}, 1);
+        auto x = torch::cat({noisy_pose_trans, crop_params, time_embed}, 1);
         x = torch::relu(fc1->forward(x));
         x = torch::relu(fc2->forward(x));
         auto delta = fc3->forward(x);
@@ -664,9 +712,12 @@ public:
                     DensificationState &densify_state,
                     const torch::Tensor &canonical_betas,
                     const torch::Tensor &ssim_window,
+                    int ssim_window_size,
                     const torch::Tensor &cam_pos,
                     float render_scale_modifier,
                     float scale_cap,
+                    int graph_batch_size,
+                    bool enable_cuda_graphs,
                     bool use_sh,
                     float render_threshold,
                     float outside_mask_weight,
@@ -680,9 +731,12 @@ public:
           densify_state_(densify_state),
           canonical_betas_(canonical_betas),
           ssim_window_(ssim_window),
+          ssim_window_size_(ssim_window_size),
           cam_pos_(cam_pos),
           render_scale_modifier_(render_scale_modifier),
           scale_cap_(scale_cap),
+          graph_batch_size_(graph_batch_size),
+          enable_cuda_graphs_(enable_cuda_graphs),
           use_sh_(use_sh),
           render_threshold_(render_threshold),
           outside_mask_weight_(outside_mask_weight),
@@ -719,7 +773,7 @@ public:
 
         auto pose_flat = batch.pose_base_batch.view({-1, 72});
         auto net_input = torch::cat({pose_flat, batch.trans_base_batch}, 1);
-        auto deltas = pose_refiner_.forward(net_input, batch.time_tensor);
+        auto deltas = pose_refiner_.forward(net_input, batch.crop_params, batch.time_tensor);
 
         auto pose_deltas = deltas.slice(1, 0, 72).view({-1, 24, 3});
         auto trans_deltas = deltas.slice(1, 72, 75).view({-1, 3});
@@ -730,50 +784,133 @@ public:
             result.trans_delta_max = trans_deltas.detach().abs().max();
         }
 
+        auto pose_total = batch.pose_base_batch + pose_deltas;
+        auto trans_total = batch.trans_base_batch + trans_deltas;
+        const int64_t batch_count = pose_total.size(0);
+        auto betas_batch = canonical_betas_.expand({batch_count, canonical_betas_.size(1)});
+        auto zero_trans = torch::zeros_like(trans_total);
+
+        torch::Tensor batch_means3D;
+        torch::Tensor batch_rots;
+#if GAUSS_HAS_CUDA_GRAPH
+        if (enable_cuda_graphs_ && !cuda_graph_failed_ && batch_count == static_cast<int64_t>(graph_batch_size_))
+        {
+            static bool graph_captured = false;
+            static int64_t captured_gaussians = -1;
+            static std::unique_ptr<at::cuda::CUDAGraph> graph;
+            static torch::Tensor s_betas;
+            static torch::Tensor s_pose;
+            static torch::Tensor s_trans;
+            static torch::Tensor s_means;
+            static torch::Tensor s_rots;
+            bool used_graph = false;
+
+            try
+            {
+                const int64_t current_gaussians = avatar_.g_face_indices.size(0);
+                if (!graph_captured || !graph || captured_gaussians != current_gaussians)
+                {
+                    graph = std::make_unique<at::cuda::CUDAGraph>();
+                    s_betas = torch::empty_like(betas_batch);
+                    s_pose = torch::empty_like(pose_total);
+                    s_trans = torch::empty_like(zero_trans);
+
+                    s_betas.copy_(betas_batch);
+                    s_pose.copy_(pose_total);
+                    s_trans.copy_(zero_trans);
+
+                    {
+                        torch::Tensor warm_means;
+                        torch::Tensor warm_rots;
+                        std::tie(warm_means, warm_rots) = avatar_.forward(s_betas, s_pose, s_trans);
+                    }
+
+                    graph->capture_begin();
+                    auto graph_out = avatar_.forward(s_betas, s_pose, s_trans);
+                    s_means = std::get<0>(graph_out);
+                    s_rots = std::get<1>(graph_out);
+                    graph->capture_end();
+
+                    graph_captured = true;
+                    captured_gaussians = current_gaussians;
+                }
+
+                s_betas.copy_(betas_batch);
+                s_pose.copy_(pose_total);
+                s_trans.copy_(zero_trans);
+                graph->replay();
+
+                batch_means3D = s_means;
+                batch_rots = s_rots;
+                used_graph = true;
+            }
+            catch (...)
+            {
+                graph_captured = false;
+                captured_gaussians = -1;
+                graph.reset();
+                cuda_graph_failed_ = true;
+            }
+
+            if (!used_graph)
+            {
+                std::tie(batch_means3D, batch_rots) = avatar_.forward(betas_batch, pose_total, zero_trans);
+            }
+        }
+        else
+#endif
+        {
+            std::tie(batch_means3D, batch_rots) = avatar_.forward(betas_batch, pose_total, zero_trans);
+        }
+
+        if (batch_means3D.dim() == 2)
+        {
+            batch_means3D = batch_means3D.unsqueeze(0);
+        }
+        if (batch_rots.dim() == 2)
+        {
+            batch_rots = batch_rots.unsqueeze(0);
+        }
+
         auto ones = torch::ones_like(batch.y_signs);
-        auto y_scales = torch::stack({ones, batch.y_signs, ones}, 1);
+        auto y_scales = torch::stack({ones, batch.y_signs, ones}, 1).unsqueeze(1);
+        batch_means3D = batch_means3D * y_scales + trans_total.unsqueeze(1);
 
         for (size_t k = 0; k < batch.sample_indices.size(); ++k)
         {
-            const auto &target_slice = batch.target_slices[k];
+            const auto &image_slice = batch.image_slices[k];
             const auto &mask_slice = batch.mask_slices[k];
 
-            auto target = batch.packed_targets
-                              .narrow(0, target_slice.offset, target_slice.length)
-                              .view({target_slice.shape[0], target_slice.shape[1], target_slice.shape[2]});
+            auto target_u8 = batch.packed_images_u8
+                                 .narrow(0, image_slice.offset, image_slice.length)
+                                 .view({image_slice.shape[0], image_slice.shape[1], image_slice.shape[2]});
             auto matte_mask = batch.packed_masks
                                   .narrow(0, mask_slice.offset, mask_slice.length)
                                   .view({mask_slice.shape[0], mask_slice.shape[1], mask_slice.shape[2]});
 
-            const int H = static_cast<int>(target_slice.shape[1]);
-            const int W = static_cast<int>(target_slice.shape[2]);
+            const int H = static_cast<int>(image_slice.shape[0]);
+            const int W = static_cast<int>(image_slice.shape[1]);
+            const int C = static_cast<int>(image_slice.shape[2]);
             if (H <= 0 || W <= 0)
             {
                 continue;
             }
+            if (C != 3)
+            {
+                continue;
+            }
 
-            auto pose_base = batch.pose_base_batch.index({static_cast<int64_t>(k)}).unsqueeze(0);
-            auto trans_base = batch.trans_base_batch.index({static_cast<int64_t>(k)}).unsqueeze(0);
-            auto pose_delta = pose_deltas.index({static_cast<int64_t>(k)}).unsqueeze(0);
-            auto trans_delta = trans_deltas.index({static_cast<int64_t>(k)}).unsqueeze(0);
+            auto target = target_u8.to(torch::kFloat32).div(255.0f);
+            target = target.flip({2}).permute({2, 0, 1}).contiguous();
 
-            auto pose = pose_base + pose_delta;
-            auto trans = (trans_base + trans_delta).squeeze(0);
-
-            torch::Tensor means3D;
-            torch::Tensor current_rots;
-            std::tie(means3D, current_rots) = avatar_.forward(canonical_betas_,
-                                                              pose,
-                                                              torch::zeros({1, 3}, canonical_betas_.options()));
+            auto means3D = batch_means3D.index({static_cast<int64_t>(k)});
+            auto current_rots = batch_rots.index({static_cast<int64_t>(k)});
 
             torch::Tensor current_sh = use_sh_ ? avatar_.g_sh : torch::zeros({0}, avatar_.g_colors.options());
             if (use_sh_ && sh_degree_eff > 0)
             {
                 current_sh = RotateSH(current_sh, current_rots);
             }
-
-            auto y_scale = y_scales.index({static_cast<int64_t>(k)}).unsqueeze(0);
-            means3D = means3D * y_scale + trans;
 
             auto outputs = GaussianRasterizer::apply(
                 means3D,
@@ -800,7 +937,7 @@ public:
             auto coverage_ratio = valid_pixels.sum() / (matte_mask.sum() + 1e-6f);
             auto is_valid_sample = (coverage_ratio > 0.3f).to(torch::kFloat32).detach();
 
-            auto ssim_value = ssim(image, target, ssim_window_, 21);
+            auto ssim_value = ssim(image, target, ssim_window_, ssim_window_size_);
             auto d_ssim_loss = (1.0f - ssim_value);
             auto outside_loss = torch::mean(image * (1.0f - matte_mask));
             auto alpha_loss = torch::l1_loss(alpha, matte_mask);
@@ -899,9 +1036,13 @@ private:
     DensificationState &densify_state_;
     const torch::Tensor &canonical_betas_;
     const torch::Tensor &ssim_window_;
+    int ssim_window_size_ = 11;
     const torch::Tensor &cam_pos_;
     float render_scale_modifier_ = 1.0f;
     float scale_cap_ = -1.0f;
+    int graph_batch_size_ = 0;
+    bool enable_cuda_graphs_ = false;
+    bool cuda_graph_failed_ = false;
     bool use_sh_ = false;
     float render_threshold_ = 0.0f;
     float outside_mask_weight_ = 0.0f;
@@ -981,8 +1122,10 @@ int run_real_training(int argc, char *argv[])
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f; 
     const int batch_size = 4;
+    const bool enable_cuda_graphs = (GAUSS_HAS_CUDA_GRAPH != 0);
     const int loader_workers = 4;
     const size_t loader_prefetch_batches = 8;
+    const int metric_log_every = 100;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
     auto capped_scales = [&](const torch::Tensor &log_scales)
@@ -1021,8 +1164,7 @@ int run_real_training(int argc, char *argv[])
     }
 
     torch::Device device(torch::kCUDA);
-    auto storage_device = torch::kCPU;
-    const int ssim_window_size = 21;
+    const int ssim_window_size = 11;
     torch::Tensor ssim_window = create_window(ssim_window_size, 3).to(device);
     std::vector<CachedSampleData> cached;
     cached.resize(samples.size());
@@ -1044,34 +1186,28 @@ int run_real_training(int argc, char *argv[])
             continue;
         }
 
-        auto target = LoadImageTensor(crop, storage_device);
-        if (!target.defined() || target.dim() != 3 || target.size(0) != 3)
-        {
-            cached[i] = std::move(entry);
-            continue;
-        }
-        const int H = static_cast<int>(target.size(1));
-        const int W = static_cast<int>(target.size(2));
+        const int H = crop.rows;
+        const int W = crop.cols;
         if (H <= 0 || W <= 0)
         {
             cached[i] = std::move(entry);
             continue;
         }
+        if (crop.channels() != 3)
+        {
+            cached[i] = std::move(entry);
+            continue;
+        }
 
-        auto matte_mask = LoadMatteMaskTensor(matte, W, H, storage_device);
+        auto matte_mask = LoadMatteMaskTensor(matte, W, H, torch::kCPU);
         if (!matte_mask.defined())
         {
             cached[i] = std::move(entry);
             continue;
         }
 
-        if (storage_device == torch::kCPU)
-        {
-            target = target.pin_memory();
-            matte_mask = matte_mask.pin_memory();
-        }
+        matte_mask = matte_mask.pin_memory();
 
-        entry.target = target;
         entry.matte_mask = matte_mask;
         entry.crop_bgr = crop;
         entry.valid = true;
@@ -1161,7 +1297,7 @@ int run_real_training(int argc, char *argv[])
     const int densify_stop_epoch = options.densify_stop_epoch;
     DensificationState densify_state;
     int64_t global_step = 0;
-    const int warmup_epochs = 0;
+    const int warmup_epochs = 5;
 
     std::vector<torch::Tensor> rot_params = {avatar.g_rots};
     std::vector<torch::Tensor> offset_params = {avatar.g_offsets};
@@ -1255,9 +1391,12 @@ int run_real_training(int argc, char *argv[])
                             densify_state,
                             canonical_betas,
                             ssim_window,
+                            ssim_window_size,
                             cam_pos,
                             render_scale_modifier,
                             scale_cap,
+                            batch_size,
+                            enable_cuda_graphs,
                             use_sh,
                             render_threshold,
                             outside_mask_weight,
@@ -1323,6 +1462,7 @@ int run_real_training(int argc, char *argv[])
                                   gpu_data.all_poses,
                                   gpu_data.all_trans,
                                   gpu_data.all_time,
+                                  gpu_data.all_crops,
                                   std::move(ordered_indices),
                                   batch_size,
                                   device,
@@ -1340,7 +1480,7 @@ int run_real_training(int argc, char *argv[])
                 continue;
             }
 
-            if (batch_step % 10 == 0)
+            if (batch_step % metric_log_every == 0)
             {
                 const float current_loss_val = step_result.loss.item<float>();
                 const float valid_count = step_result.valid_sum.item<float>();
@@ -1509,9 +1649,12 @@ int run_real_training(int argc, char *argv[])
             {
                 return torch::Tensor();
             }
-            auto target = cached_entry.target;
-            const int H = static_cast<int>(target.size(1));
-            const int W = static_cast<int>(target.size(2));
+            if (cached_entry.crop_bgr.empty())
+            {
+                return torch::Tensor();
+            }
+            const int H = cached_entry.crop_bgr.rows;
+            const int W = cached_entry.crop_bgr.cols;
             if (H <= 0 || W <= 0)
             {
                 return torch::Tensor();
@@ -1532,11 +1675,17 @@ int run_real_training(int argc, char *argv[])
 
             auto pose_flat = pose_base.view({1, 72});
             auto net_input = torch::cat({pose_flat, trans_base}, 1);
+            const float img_w = std::max(1.0f, static_cast<float>(sample.img_w));
+            const float img_h = std::max(1.0f, static_cast<float>(sample.img_h));
+            auto crop_params = torch::tensor(
+                                   {sample.crop_cx / img_w, sample.crop_cy / img_h, sample.crop_size / img_w},
+                                   torch::TensorOptions().device(device).dtype(torch::kFloat))
+                                   .unsqueeze(0);
             const float time_val = static_cast<float>(sample_index) /
                                    static_cast<float>(std::max<size_t>(1, samples.size() - 1));
             auto time_tensor = torch::tensor({time_val}, torch::TensorOptions().device(device).dtype(torch::kFloat)).unsqueeze(0);
 
-            auto deltas = pose_refiner.forward(net_input, time_tensor);
+            auto deltas = pose_refiner.forward(net_input, crop_params, time_tensor);
             auto pose_delta = deltas.slice(1, 0, 72).view({1, 24, 3});
             auto trans_delta = deltas.slice(1, 72, 75).view({1, 3});
 
@@ -1637,46 +1786,38 @@ int run_real_training(int argc, char *argv[])
             return image.detach();
         };
 
-        if ((epoch + 1) % 5 == 0 || epoch == (epochs - 1))
+        if ((epoch + 1) % 10 == 0 || epoch == (epochs - 1))
         {
             const int saved_pairs = SaveEpochViewPairs(samples, cached, out_dir_path, epoch, render_view);
             std::cout << "Epoch " << epoch << " saved " << saved_pairs << " view pairs." << std::endl;
         }
     }
-
-    std::filesystem::path out_path = out_dir_path / "final_render.png";
-    if (!SaveImageTensorPng(out_path.string(), last_render))
-    {
-        std::cerr << "Failed to save final render to " << out_path.string() << std::endl;
-    }
-    else
-    {
-        std::cout << "Saved final render to " << out_path.string() << std::endl;
-    }
-
+ 
     return 0;
 }
 
 int main(int argc, char *argv[]) {
-    std::cout << "Starting Full Program Profiling..." << std::endl;
+    // std::cout << "Starting Full Program Profiling..." << std::endl;
 
-    // The RecordProfile guard automatically starts profiling.
-    // When this 'guard' variable goes out of scope (at the closing brace),
-    // it automatically stops profiling and saves the file to "trace.json".
-    {
-        // Use default config (CPU + CUDA)
-        torch::autograd::profiler::RecordProfile guard("full_profile.json");
+    // // The RecordProfile guard automatically starts profiling.
+    // // When this 'guard' variable goes out of scope (at the closing brace),
+    // // it automatically stops profiling and saves the file to "trace.json".
+    // {
+    //     // Use default config (CPU + CUDA)
+    //     torch::autograd::profiler::RecordProfile guard("full_profile.json");
         
-        try {
-            run_real_training(argc, argv);
-        } catch (const std::exception& e) {
-            std::cerr << "Exception during profiling: " << e.what() << std::endl;
-        }
+    //     try {
+    //         run_real_training(argc, argv);
+    //     } catch (const std::exception& e) {
+    //         std::cerr << "Exception during profiling: " << e.what() << std::endl;
+    //     }
         
-        // 'guard' is destroyed here -> "full_profile.json" is written to disk.
-    }
+    //     // 'guard' is destroyed here -> "full_profile.json" is written to disk.
+    // }
 
-    std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
- 
+    // std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
+    
+    run_real_training(argc, argv);
+
     return 0;
 }

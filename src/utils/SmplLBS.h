@@ -231,8 +231,16 @@ struct SMPLLayer : torch::nn::Module {
         // 5. Linear Blend Skinning
         // T_k = G_k * Translate(-J_rest)
         auto neg_J = -J;
-        auto T_rest_inv = torch::eye(4, device).unsqueeze(0).unsqueeze(0).repeat({batch_size, 24, 1, 1});
-        T_rest_inv.index_put_({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(0, 3), 3}, neg_J);
+        auto opts = neg_J.options();
+        auto zeros = torch::zeros({batch_size, 24, 1}, opts);
+        auto ones = torch::ones({batch_size, 24, 1}, opts);
+
+        auto r0 = torch::cat({ones, zeros, zeros, neg_J.slice(2, 0, 1)}, 2).unsqueeze(2);
+        auto r1 = torch::cat({zeros, ones, zeros, neg_J.slice(2, 1, 2)}, 2).unsqueeze(2);
+        auto r2 = torch::cat({zeros, zeros, ones, neg_J.slice(2, 2, 3)}, 2).unsqueeze(2);
+        auto r3 = torch::cat({zeros, zeros, zeros, ones}, 2).unsqueeze(2);
+
+        auto T_rest_inv = torch::cat({r0, r1, r2, r3}, 2);
 
         auto skinnning_transforms = torch::matmul(results_G, T_rest_inv);
 

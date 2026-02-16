@@ -10,7 +10,7 @@
             "args": [
                 "--jsonl", "${workspaceFolder}/outputs_4/gaussian_train.jsonl",
                 "--smpl", "${workspaceFolder}/src/smpl_data.pt", 
-                "--epochs", "1",
+                "--epochs", "50",
                 "--lr", "0.0005",
                 "--pose-lr", "0.001",
                 "--lr-decay-multiplier", "0.5",
@@ -37,7 +37,7 @@
                 "--densify-prune-max", "100000",
                 "--num-gaussians", "40000",
                 "--viewer",
-                "--sh-degree", "2"
+                "--sh-degree", "1"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/src/build",
