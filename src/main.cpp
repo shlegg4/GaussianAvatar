@@ -333,7 +333,7 @@ torch::Tensor create_window(int window_size, int channel)
 }
 
 torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, const torch::Tensor &window,
-                   int window_size = 21)
+                   int window_size = 11)
 {
     auto inp1 = (img1.dim() == 3) ? img1.unsqueeze(0) : img1;
     auto inp2 = (img2.dim() == 3) ? img2.unsqueeze(0) : img2;
@@ -358,6 +358,20 @@ torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, const t
 
     return ssim_map.mean();
 } 
+
+torch::Tensor Downsample(const torch::Tensor &img)
+{
+    const bool squeeze_batch = (img.dim() == 3);
+    auto inp = squeeze_batch ? img.unsqueeze(0) : img;
+    if (inp.size(-2) < 2 || inp.size(-1) < 2)
+    {
+        return img;
+    }
+    auto out = torch::nn::functional::avg_pool2d(
+        inp,
+        torch::nn::functional::AvgPool2dFuncOptions(2).stride(2));
+    return squeeze_batch ? out.squeeze(0) : out;
+}
 
 struct TrainDataGPU
 {
@@ -937,8 +951,13 @@ public:
             auto coverage_ratio = valid_pixels.sum() / (matte_mask.sum() + 1e-6f);
             auto is_valid_sample = (coverage_ratio > 0.3f).to(torch::kFloat32).detach();
 
-            auto ssim_value = ssim(image, target, ssim_window_, ssim_window_size_);
-            auto d_ssim_loss = (1.0f - ssim_value);
+            auto ssim_value_0 = ssim(image, target, ssim_window_, ssim_window_size_);
+            auto d_ssim_loss_0 = (1.0f - ssim_value_0);
+            auto image_small = Downsample(image);
+            auto target_small = Downsample(target);
+            auto ssim_value_1 = ssim(image_small, target_small, ssim_window_, ssim_window_size_);
+            auto d_ssim_loss_1 = (1.0f - ssim_value_1);
+            auto d_ssim_loss = 0.8f * d_ssim_loss_0 + 0.2f * d_ssim_loss_1;
             auto outside_loss = torch::mean(image * (1.0f - matte_mask));
             auto alpha_loss = torch::l1_loss(alpha, matte_mask);
 
@@ -1005,10 +1024,10 @@ public:
             avatar_.g_scales.grad().mul_(torch::tensor({1.0f, 1.0f, 0.0f}, avatar_.g_scales.options()));
         }
 
-        if (epoch % 3 == 0)
-        {
-            densify_state_.Accumulate(avatar_.g_offsets, avatar_.g_scales);
-        }
+        
+        
+        densify_state_.Accumulate(avatar_.g_offsets, avatar_.g_scales);
+        
 
         optimizer_.step();
 
