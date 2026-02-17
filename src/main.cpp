@@ -604,7 +604,7 @@ struct PoseRefiner : torch::nn::Module
     torch::nn::Linear fc1{nullptr}, fc2{nullptr}, fc3{nullptr};
 
     const float ROT_SCALE = 0.05f;
-    const float TRANS_XY_SCALE = 0.002f;
+    const float TRANS_XY_SCALE = 0.01f;
     const float TRANS_Z_SCALE = 0.001f;
 
     PoseRefiner(int input_dim = 72 + 3 + 3)
@@ -644,9 +644,9 @@ struct PoseRefiner : torch::nn::Module
         delta_pose.index_put_({Slice(), Slice(0, 3)}, 0.0f);
         auto delta_trans_raw = delta.slice(1, 72, 75);
 
-        auto trans_x = torch::tanh(delta_trans_raw.slice(1, 0, 1)) * TRANS_XY_SCALE;
-        auto trans_y = torch::tanh(delta_trans_raw.slice(1, 1, 2)) * TRANS_XY_SCALE;
-        auto trans_z = torch::tanh(delta_trans_raw.slice(1, 2, 3)) * TRANS_Z_SCALE;
+        auto trans_x = delta_trans_raw.slice(1, 0, 1) * TRANS_XY_SCALE;
+        auto trans_y = delta_trans_raw.slice(1, 1, 2) * TRANS_XY_SCALE;
+        auto trans_z = delta_trans_raw.slice(1, 2, 3) * TRANS_Z_SCALE;
 
         auto delta_trans = torch::cat({trans_x, trans_y, trans_z}, 1);
         return torch::cat({delta_pose, delta_trans}, 1);
@@ -1020,12 +1020,27 @@ public:
         auto scale_reg = torch::mean(current_scales.pow(2).sum(1));
         auto offset_reg = torch::mean(torch::abs(avatar_.g_offsets));
 
+        torch::Tensor sh_reg_loss = torch::zeros({1}, avatar_.g_sh.options());
+        if (use_sh_ && avatar_.g_sh.defined() && avatar_.g_sh.size(1) > 1)
+        {
+            using torch::indexing::Slice;
+            // Slice(1, None) selects indices 1 through end, SKIPPING index 0 (DC)
+            auto higher_orders = avatar_.g_sh.index({Slice(), Slice(1, torch::indexing::None), Slice()});
+            
+            // Penalize only the "shimmer/sliding" components
+            sh_reg_loss = higher_orders.pow(2).mean(); 
+        }
+
+        // Weight: Start with 0.01. If it's still sliding, increase to 0.05 or 0.1
+        float sh_reg_weight = 0.005f;
+
         auto loss = (1.0f - lambda_dssim_) * recon_loss +
                     lambda_dssim_ * avg_ssim_loss +
                     outside_mask_weight_ * outside_term +
                     alpha_loss_weight_ * alpha_term +
                     offset_reg_weight_ * offset_reg +
-                    scale_reg_weight_ * scale_reg;
+                    scale_reg_weight_ * scale_reg +
+                    sh_reg_weight * sh_reg_loss;
 
         loss.backward();
 
@@ -1168,8 +1183,8 @@ int run_real_training(int argc, char *argv[])
     const float render_threshold = 3.0f / 255.0f;
     const int batch_size = 4;
     const bool enable_cuda_graphs = (GAUSS_HAS_CUDA_GRAPH != 0);
-    const int loader_workers = 8;
-    const size_t loader_prefetch_batches = 16;
+    const int loader_workers = 4;
+    const size_t loader_prefetch_batches = 4;
     const int metric_log_every = 100;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
