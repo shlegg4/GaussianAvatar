@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <string>
 
 #include <opencv2/core.hpp>
 
@@ -19,7 +20,7 @@ struct SmplifyLiteOptions {
     float pose_reg = 100.0f;
     float betas_reg = 5e-4f;
     int log_every = 5;
-    int render_every = 5;
+    int render_every = 5; // Used to determine how often to save visualization frames
     bool optimize_translation = true;
     float target_height = 1.77f;
     float height_weight = 1000.0f; 
@@ -53,4 +54,7 @@ bool SmplifyLiteMultiView(SMPLLayer& smpl_layer,
                           const std::vector<SmplifyMultiViewObservation>& views,
                           SmplResult* io_res,
                           const SmplifyLiteOptions& options = {},
-                          float* out_y_sign = nullptr);
+                          float* out_y_sign = nullptr,
+                          const std::vector<cv::Mat>* render_frames = nullptr,
+                          const std::string* render_dir = nullptr,
+                          int frame_idx = 0);

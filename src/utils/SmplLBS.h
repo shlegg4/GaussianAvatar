@@ -6,6 +6,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <sstream>
 
 // ==========================================
 // Struct: SMPL Output Container
@@ -153,8 +154,84 @@ struct SMPLLayer : torch::nn::Module {
 
     // Forward Pass
     SmplOutput forward(torch::Tensor betas, torch::Tensor pose_axis_angle, torch::Tensor trans) {
-        auto batch_size = betas.size(0);
-        auto device = betas.device();
+        auto shape_to_string = [](const torch::Tensor& t) {
+            std::ostringstream oss;
+            oss << "[";
+            for (int64_t i = 0; i < t.dim(); ++i)
+            {
+                if (i > 0)
+                {
+                    oss << ", ";
+                }
+                oss << t.size(i);
+            }
+            oss << "]";
+            return oss.str();
+        };
+
+        const auto model_device = v_template.device();
+        const int64_t expected_beta_dim = shapedirs.size(2);
+
+        if (!betas.is_floating_point())
+        {
+            throw std::runtime_error("SMPL forward: betas must be floating-point, got dtype " +
+                                     std::string(c10::toString(betas.scalar_type())));
+        }
+        if (!pose_axis_angle.is_floating_point())
+        {
+            throw std::runtime_error("SMPL forward: pose_axis_angle must be floating-point, got dtype " +
+                                     std::string(c10::toString(pose_axis_angle.scalar_type())));
+        }
+        if (!trans.is_floating_point())
+        {
+            throw std::runtime_error("SMPL forward: trans must be floating-point, got dtype " +
+                                     std::string(c10::toString(trans.scalar_type())));
+        }
+
+        if (betas.device() != model_device || pose_axis_angle.device() != model_device || trans.device() != model_device)
+        {
+            std::ostringstream oss;
+            oss << "SMPL forward: device mismatch. Expected all inputs on " << model_device
+                << " (SMPL buffers), got betas on " << betas.device()
+                << ", pose_axis_angle on " << pose_axis_angle.device()
+                << ", trans on " << trans.device() << ".";
+            throw std::runtime_error(oss.str());
+        }
+
+        if (betas.dim() != 2)
+        {
+            throw std::runtime_error("SMPL forward: betas must have shape [B, " + std::to_string(expected_beta_dim) +
+                                     "], got " + shape_to_string(betas));
+        }
+        if (betas.size(1) != expected_beta_dim)
+        {
+            throw std::runtime_error("SMPL forward: betas second dimension must be " + std::to_string(expected_beta_dim) +
+                                     ", got " + std::to_string(betas.size(1)) + " with shape " + shape_to_string(betas));
+        }
+
+        const auto batch_size = betas.size(0);
+
+        if (pose_axis_angle.dim() == 2)
+        {
+            if (pose_axis_angle.size(0) != batch_size || pose_axis_angle.size(1) != 72)
+            {
+                throw std::runtime_error("SMPL forward: pose_axis_angle rank-2 input must have shape [B, 72], got " +
+                                         shape_to_string(pose_axis_angle));
+            }
+            pose_axis_angle = pose_axis_angle.view({batch_size, 24, 3});
+        }
+        else if (pose_axis_angle.dim() == 3)
+        {
+            if (pose_axis_angle.size(0) != batch_size || pose_axis_angle.size(1) != 24 || pose_axis_angle.size(2) != 3)
+            {
+                throw std::runtime_error("SMPL forward: pose_axis_angle rank-3 input must have shape [B, 24, 3], got " +
+                                         shape_to_string(pose_axis_angle));
+            }
+        }
+        else
+        {
+            throw std::runtime_error("SMPL forward: pose_axis_angle must be rank 2 or 3, got shape " + shape_to_string(pose_axis_angle));
+        }
 
         if (trans.dim() == 1)
         {
@@ -164,7 +241,10 @@ struct SMPLLayer : torch::nn::Module {
         {
             trans = trans.expand({batch_size, trans.size(1)});
         }
-        trans = trans.to(device);
+        if (trans.dim() != 2 || trans.size(0) != batch_size || trans.size(1) != 3)
+        {
+            throw std::runtime_error("SMPL forward: trans must resolve to shape [B, 3], got " + shape_to_string(trans));
+        }
 
         // 1. Shape Blending
         // v_shaped = v_template + shapedirs * betas
@@ -175,12 +255,11 @@ struct SMPLLayer : torch::nn::Module {
         auto J = torch::einsum("jv, bvi -> bji", {J_regressor, v_shaped});
 
         // 3. Pose Blending
-        if (pose_axis_angle.dim() == 2) pose_axis_angle = pose_axis_angle.view({batch_size, -1, 3});
         auto rot_mats = batch_rodrigues(pose_axis_angle);
 
         // Pose Feature: R_n - I
         auto pose_feature = (rot_mats.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)})
-                             - torch::eye(3, device)).view({batch_size, -1}); // [B, 207]
+                             - torch::eye(3, model_device)).view({batch_size, -1}); // [B, 207]
 
         // v_posed = v_shaped + posedirs * pose_feature
         auto v_posed = v_shaped + torch::einsum("bl,mkl->bmk", {pose_feature, posedirs});
@@ -248,7 +327,7 @@ struct SMPLLayer : torch::nn::Module {
         auto vertex_transforms = torch::einsum("bkij,vk->bvij", {skinnning_transforms, weights});
 
         // Apply skinning
-        auto v_posed_homo = torch::cat({v_posed, torch::ones({batch_size, v_posed.size(1), 1}, device)}, 2);
+        auto v_posed_homo = torch::cat({v_posed, torch::ones({batch_size, v_posed.size(1), 1}, model_device)}, 2);
         auto v_homo = torch::matmul(vertex_transforms, v_posed_homo.unsqueeze(-1)).squeeze(-1);
 
         // Extract verts and add global translation

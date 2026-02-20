@@ -11,7 +11,7 @@
                         "/C",
                         // 1. Locate this file on your PC. It sets up the compiler variables.
                         // Standard path for VS 2022 Community:
-                        "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\"",
+                        "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\"",
                         "&&"
                     ]
                 }
@@ -38,7 +38,7 @@
                     "executable": "cmd.exe",
                     "args": [
                         "/C",
-                        "\"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\"",
+                        "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\"",
                         "&&"
                     ]
                 }
