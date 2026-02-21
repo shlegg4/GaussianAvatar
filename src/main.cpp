@@ -604,8 +604,8 @@ struct PoseRefiner : torch::nn::Module
 {
     torch::nn::Linear fc1{nullptr}, fc2{nullptr}, fc3{nullptr};
 
-    const float ROT_SCALE = 0.3f;
-    const float TRANS_XY_SCALE = 0.25f;
+    const float ROT_SCALE = 0.9f;
+    const float TRANS_XY_SCALE = 0.4f;
     const float TRANS_Z_SCALE = 0.01f;
 
     PoseRefiner(int input_dim = 72 + 3 + 3)
@@ -637,7 +637,7 @@ struct PoseRefiner : torch::nn::Module
         auto delta = fc3->forward(x);
 
         auto delta_pose = torch::tanh(delta.slice(1, 0, 72)) * ROT_SCALE;
- 
+
         auto delta_trans_raw = delta.slice(1, 72, 75);
 
         auto trans_x = delta_trans_raw.slice(1, 0, 1) * TRANS_XY_SCALE;
@@ -958,8 +958,12 @@ public:
             auto coverage_ratio = valid_pixels.sum() / (matte_mask.sum() + 1e-6f);
             auto is_valid_sample = (coverage_ratio > 0.3f).to(torch::kFloat32).detach();
 
-            auto ssim_value_0 = ssim(image, target, ssim_window_, ssim_window_size_);
-            auto d_ssim_loss = (1.0f - ssim_value_0);
+            // auto ssim_value_0 = ssim(image, target, ssim_window_, ssim_window_size_);
+            // auto d_ssim_loss = (1.0f - ssim_value_0);
+
+            // TEMP ssim_value_0 is very performance heavy, test with only 0's for loss
+            auto d_ssim_loss = torch::zeros({1}, avatar_.g_colors.options());
+
             // auto image_small = Downsample(image);
             // auto target_small = Downsample(target);
             // auto ssim_value_1 = ssim(image_small, target_small, ssim_window_, ssim_window_size_);
@@ -1857,21 +1861,37 @@ int main(int argc, char *argv[])
 {
     // std::cout << "Starting Full Program Profiling..." << std::endl;
 
-    // // The RecordProfile guard automatically starts profiling.
-    // // When this 'guard' variable goes out of scope (at the closing brace),
-    // // it automatically stops profiling and saves the file to "trace.json".
+    // // 1. Configure the profiler to use the Kineto engine
+    // torch::autograd::profiler::ProfilerConfig cfg(
+    //     torch::autograd::profiler::ProfilerState::KINETO,
+    //     false, // report_input_shapes
+    //     false, // profile_memory
+    //     false, // with_stack
+    //     false, // with_flops
+    //     false  // with_modules
+    // );
+
+    // // 2. Explicitly request both CPU and CUDA activities
+    // std::set<torch::autograd::profiler::ActivityType> activities = {
+    //     torch::autograd::profiler::ActivityType::CPU,
+    //     torch::autograd::profiler::ActivityType::CUDA};
+
+    // // 3. Start tracing
+    // torch::autograd::profiler::prepareProfiler(cfg, activities);
+    // torch::autograd::profiler::enableProfiler(cfg, activities);
+
+    // try
     // {
-    //     // Use default config (CPU + CUDA)
-    //     torch::autograd::profiler::RecordProfile guard("full_profile.json");
-
-    //     try {
-    //         run_real_training(argc, argv);
-    //     } catch (const std::exception& e) {
-    //         std::cerr << "Exception during profiling: " << e.what() << std::endl;
-    //     }
-
-    //     // 'guard' is destroyed here -> "full_profile.json" is written to disk.
+    //     run_real_training(argc, argv);
     // }
+    // catch (const std::exception &e)
+    // {
+    //     std::cerr << "Exception during profiling: " << e.what() << std::endl;
+    // }
+
+    // // 4. Stop tracing and save to disk
+    // auto profiler_result = torch::autograd::profiler::disableProfiler();
+    // profiler_result->save("full_profile.json");
 
     // std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
 

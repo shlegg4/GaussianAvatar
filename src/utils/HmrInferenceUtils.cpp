@@ -774,6 +774,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
     } else {
         while (cap.read(frame)) {
             if (options.frame_stride <= 1 || (frame_idx % options.frame_stride) == 0) {
+                cv::resize(frame, frame, cv::Size(), 0.5, 0.5, cv::INTER_LINEAR);
                 process_frame(frame, frame_idx);
             }
             if (frame_idx % 30 == 0) std::cout << "Frame: " << frame_idx << std::endl;
