@@ -504,9 +504,10 @@ struct GaussianAvatar : torch::nn::Module
         auto face_quats = torch::cat({qw.unsqueeze(1), qxyz}, 1);
 
         auto face_scale_sel = face_scale.index_select(0, g_face_indices);
-        auto log_tan = torch::log(face_scale_sel / safe_scale_mod);
-        auto log_norm = torch::log((face_scale_sel * normal_scale) / safe_scale_mod);
-        g_scales = torch::stack({log_tan, log_tan, log_norm}, 1).clone().set_requires_grad(true);
+        auto log_scale_base = torch::log((face_scale_sel * 0.2f) / safe_scale_mod);
+
+        // Use the same log scale for X, Y, AND Z
+        g_scales = torch::stack({log_scale_base, log_scale_base, log_scale_base}, 1).clone().set_requires_grad(true);
 
         auto g_rots_init = face_quats.index_select(0, g_face_indices);
         g_rots = g_rots_init.detach().clone().set_requires_grad(true);
@@ -603,9 +604,9 @@ struct PoseRefiner : torch::nn::Module
 {
     torch::nn::Linear fc1{nullptr}, fc2{nullptr}, fc3{nullptr};
 
-    const float ROT_SCALE = 0.05f;
-    const float TRANS_XY_SCALE = 0.01f;
-    const float TRANS_Z_SCALE = 0.001f;
+    const float ROT_SCALE = 0.3f;
+    const float TRANS_XY_SCALE = 0.25f;
+    const float TRANS_Z_SCALE = 0.01f;
 
     PoseRefiner(int input_dim = 72 + 3 + 3)
     {
@@ -627,7 +628,7 @@ struct PoseRefiner : torch::nn::Module
     {
         auto device = time_norm.device();
         auto freqs = torch::pow(2.0, torch::arange(0, 2, torch::TensorOptions().device(device)).to(torch::kFloat));
-        auto time_projected = time_norm * freqs.unsqueeze(0) * 3.14159f;
+        auto time_projected = time_norm * freqs.unsqueeze(0) * (2.0f * 3.14159f);
         auto time_embed = torch::cat({torch::sin(time_projected), torch::cos(time_projected)}, 1);
 
         auto x = torch::cat({noisy_pose_trans, crop_params, time_embed}, 1);
@@ -635,13 +636,8 @@ struct PoseRefiner : torch::nn::Module
         x = torch::relu(fc2->forward(x));
         auto delta = fc3->forward(x);
 
-        auto delta_pose_all = torch::tanh(delta.slice(1, 0, 72)) * ROT_SCALE;
-
-        // Create a mask: 0 for first 3 items, 1 for the rest
-        // Or simpler: Manually zero them out
-        auto delta_pose = delta_pose_all.clone();
-        using torch::indexing::Slice;
-        delta_pose.index_put_({Slice(), Slice(0, 3)}, 0.0f);
+        auto delta_pose = torch::tanh(delta.slice(1, 0, 72)) * ROT_SCALE;
+ 
         auto delta_trans_raw = delta.slice(1, 72, 75);
 
         auto trans_x = delta_trans_raw.slice(1, 0, 1) * TRANS_XY_SCALE;
@@ -963,12 +959,12 @@ public:
             auto is_valid_sample = (coverage_ratio > 0.3f).to(torch::kFloat32).detach();
 
             auto ssim_value_0 = ssim(image, target, ssim_window_, ssim_window_size_);
-            auto d_ssim_loss_0 = (1.0f - ssim_value_0);
-            auto image_small = Downsample(image);
-            auto target_small = Downsample(target);
-            auto ssim_value_1 = ssim(image_small, target_small, ssim_window_, ssim_window_size_);
-            auto d_ssim_loss_1 = (1.0f - ssim_value_1);
-            auto d_ssim_loss = 0.8f * d_ssim_loss_0 + 0.2f * d_ssim_loss_1;
+            auto d_ssim_loss = (1.0f - ssim_value_0);
+            // auto image_small = Downsample(image);
+            // auto target_small = Downsample(target);
+            // auto ssim_value_1 = ssim(image_small, target_small, ssim_window_, ssim_window_size_);
+            // auto d_ssim_loss_1 = (1.0f - ssim_value_1);
+            // auto d_ssim_loss = 0.8f * d_ssim_loss_0 + 0.2f * d_ssim_loss_1;
             auto outside_loss = torch::mean(image * (1.0f - matte_mask));
             auto alpha_loss = torch::l1_loss(alpha, matte_mask);
 
@@ -1026,9 +1022,9 @@ public:
             using torch::indexing::Slice;
             // Slice(1, None) selects indices 1 through end, SKIPPING index 0 (DC)
             auto higher_orders = avatar_.g_sh.index({Slice(), Slice(1, torch::indexing::None), Slice()});
-            
+
             // Penalize only the "shimmer/sliding" components
-            sh_reg_loss = higher_orders.pow(2).mean(); 
+            sh_reg_loss = higher_orders.pow(2).mean();
         }
 
         // Weight: Start with 0.01. If it's still sliding, increase to 0.05 or 0.1
@@ -1044,11 +1040,11 @@ public:
 
         loss.backward();
 
-        if (avatar_.g_scales.grad().defined())
-        {
-            torch::NoGradGuard no_grad;
-            avatar_.g_scales.grad().mul_(torch::tensor({1.0f, 1.0f, 0.0f}, avatar_.g_scales.options()));
-        }
+        // if (avatar_.g_scales.grad().defined())
+        // {
+        //     torch::NoGradGuard no_grad;
+        //     avatar_.g_scales.grad().mul_(torch::tensor({1.0f, 1.0f, 0.0f}, avatar_.g_scales.options()));
+        // }
 
         if (pose_refiner_.parameters().size() > 0)
         {
@@ -1066,12 +1062,12 @@ public:
             rot_norm = torch::clamp_min(rot_norm, 1e-9);
             avatar_.g_rots.div_(rot_norm);
 
-            float target_thickness = 0.001f;
-            float target_log_scale = std::log(target_thickness);
+            // float target_thickness = 0.001f;
+            // float target_log_scale = std::log(target_thickness);
 
-            using torch::indexing::Slice;
-            // Set all Z-scales (index 2) to the target thickness
-            avatar_.g_scales.index_put_({Slice(), 2}, target_log_scale);
+            // using torch::indexing::Slice;
+            // // Set all Z-scales (index 2) to the target thickness
+            // avatar_.g_scales.index_put_({Slice(), 2}, target_log_scale);
         }
 
         result.stepped = true;
