@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -100,6 +101,28 @@ public:
         return true;
     }
 
+    bool WaitPopFor(T *out, const std::atomic<bool> &active, std::chrono::milliseconds timeout)
+    {
+        if (out == nullptr)
+        {
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait_for(lock, timeout, [this, &active]() {
+            return !queue_.empty() || closed_ || !active.load();
+        });
+
+        if (queue_.empty())
+        {
+            return false;
+        }
+
+        *out = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
     void Close()
     {
         {
@@ -156,27 +179,13 @@ public:
         const int worker_count = std::max(1, num_workers);
         workers_alive_.store(worker_count);
 
-        for (size_t i = 0; i < ordered_indices.size(); i += static_cast<size_t>(batch_size_))
-        {
-            std::vector<int64_t> batch_indices;
-            batch_indices.reserve(static_cast<size_t>(batch_size_));
-            const size_t end = std::min(ordered_indices.size(), i + static_cast<size_t>(batch_size_));
-            for (size_t j = i; j < end; ++j)
-            {
-                batch_indices.push_back(ordered_indices[j]);
-            }
-            if (!batch_indices.empty())
-            {
-                task_queue_.Push(std::move(batch_indices));
-            }
-        }
-        task_queue_.Close();
-
         workers_.reserve(static_cast<size_t>(worker_count));
         for (int i = 0; i < worker_count; ++i)
         {
             workers_.emplace_back(&GaussianDataLoader::WorkerLoop, this);
         }
+
+        Reset(std::move(ordered_indices));
     }
 
     ~GaussianDataLoader()
@@ -216,7 +225,7 @@ public:
             }
 
             TrainingBatch batch;
-            if (result_queue_.WaitPop(&batch, active_))
+            if (result_queue_.WaitPopFor(&batch, active_, std::chrono::milliseconds(10)))
             {
                 *out_batch = std::move(batch);
                 result_space_cv_.notify_one();
@@ -231,7 +240,9 @@ public:
                 }
             }
 
-            if (workers_alive_.load() == 0 && result_queue_.Empty())
+            const int64_t done = epoch_task_done_.load();
+            const int64_t total = epoch_task_total_.load();
+            if (done >= total && result_queue_.Empty())
             {
                 return false;
             }
@@ -241,6 +252,48 @@ public:
                 return false;
             }
         }
+    }
+
+    void Reset(std::vector<int64_t> ordered_indices)
+    {
+        if (!active_.load())
+        {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(error_mutex_);
+            if (worker_exception_)
+            {
+                std::rethrow_exception(worker_exception_);
+            }
+        }
+
+        int64_t pushed_tasks = 0;
+        epoch_task_done_.store(0);
+        epoch_task_total_.store(0);
+
+        for (size_t i = 0; i < ordered_indices.size(); i += static_cast<size_t>(batch_size_))
+        {
+            std::vector<int64_t> batch_indices;
+            batch_indices.reserve(static_cast<size_t>(batch_size_));
+            const size_t end = std::min(ordered_indices.size(), i + static_cast<size_t>(batch_size_));
+            for (size_t j = i; j < end; ++j)
+            {
+                batch_indices.push_back(ordered_indices[j]);
+            }
+            if (batch_indices.empty())
+            {
+                continue;
+            }
+            if (!task_queue_.Push(std::move(batch_indices)))
+            {
+                break;
+            }
+            ++pushed_tasks;
+        }
+
+        epoch_task_total_.store(pushed_tasks);
     }
 
 private:
@@ -258,6 +311,7 @@ private:
 
                 if (task_indices.empty())
                 {
+                    epoch_task_done_.fetch_add(1);
                     continue;
                 }
 
@@ -277,6 +331,7 @@ private:
 
                 if (valid_batch_indices.empty())
                 {
+                    epoch_task_done_.fetch_add(1);
                     continue;
                 }
 
@@ -299,13 +354,17 @@ private:
 
                 if (!active_.load())
                 {
+                    epoch_task_done_.fetch_add(1);
                     break;
                 }
 
                 if (!result_queue_.Push(std::move(batch)))
                 {
+                    epoch_task_done_.fetch_add(1);
                     break;
                 }
+
+                epoch_task_done_.fetch_add(1);
             }
         }
         catch (...)
@@ -487,6 +546,8 @@ private:
     int batch_size_ = 1;
     torch::Device device_;
     size_t max_prefetch_batches_ = 8;
+    std::atomic<int64_t> epoch_task_total_{0};
+    std::atomic<int64_t> epoch_task_done_{0};
 
     SafeQueue<std::vector<int64_t>> task_queue_;
     SafeQueue<TrainingBatch> result_queue_;

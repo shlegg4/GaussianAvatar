@@ -1569,6 +1569,17 @@ int run_real_training(int argc, char *argv[])
                             lambda_dssim,
                             offset_reg_weight,
                             scale_reg_weight);
+    GaussianDataLoader loader(samples,
+                              cached,
+                              gpu_data.all_poses,
+                              gpu_data.all_trans,
+                              gpu_data.all_time,
+                              gpu_data.all_crops,
+                              std::vector<int64_t>{},
+                              batch_size,
+                              device,
+                              loader_workers,
+                              loader_prefetch_batches);
 
     for (int epoch = 0; epoch < epochs; ++epoch)
     {
@@ -1622,17 +1633,7 @@ int run_real_training(int argc, char *argv[])
         std::iota(indices.begin(), indices.end(), 0);
         std::shuffle(indices.begin(), indices.end(), rng);
         std::vector<int64_t> ordered_indices(indices.begin(), indices.end());
-        GaussianDataLoader loader(samples,
-                                  cached,
-                                  gpu_data.all_poses,
-                                  gpu_data.all_trans,
-                                  gpu_data.all_time,
-                                  gpu_data.all_crops,
-                                  std::move(ordered_indices),
-                                  batch_size,
-                                  device,
-                                  loader_workers,
-                                  loader_prefetch_batches);
+        loader.Reset(std::move(ordered_indices));
 
         TrainingBatch batch;
         int batch_step = 0;
@@ -1715,29 +1716,34 @@ int run_real_training(int argc, char *argv[])
             batch_step++;
         }
 
+        continue; // Skip viewer export and rendering for this epoch (for testing)
+
         // --- MODIFIED SECTION START ---
 
-        // 1. Always calculate canonical geometry for saving/viewing
-        torch::Tensor positions, rotations;
-        std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
-
-        torch::Tensor colors;
-        if (use_sh)
-        {
-            using torch::indexing::Slice;
-            colors = avatar.g_sh.index({Slice(), 0, Slice()});
-        }
-        else
-        {
-            colors = avatar.g_colors;
-        }
-        auto opacities = avatar.g_opacities;
-        auto scales = capped_scales(avatar.g_scales);
-
+        torch::Tensor positions, rotations, colors, opacities, scales;
         torch::Tensor sh_to_send = sh;
-        if (use_sh && sh_degree_eff > 0)
         {
-            sh_to_send = RotateSH(avatar.g_sh, rotations);
+            torch::NoGradGuard no_grad;
+
+            // 1. Always calculate canonical geometry for saving/viewing
+            std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
+
+            if (use_sh)
+            {
+                using torch::indexing::Slice;
+                colors = avatar.g_sh.index({Slice(), 0, Slice()});
+            }
+            else
+            {
+                colors = avatar.g_colors;
+            }
+            opacities = avatar.g_opacities;
+            scales = capped_scales(avatar.g_scales);
+
+            if (use_sh && sh_degree_eff > 0)
+            {
+                sh_to_send = RotateSH(avatar.g_sh, rotations);
+            }
         }
 
         // 2. Handle Shared Memory Viewer (Only if enabled)
@@ -1964,43 +1970,43 @@ int run_real_training(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
-    // std::cout << "Starting Full Program Profiling..." << std::endl;
+    std::cout << "Starting Full Program Profiling..." << std::endl;
 
-    // // 1. Configure the profiler to use the Kineto engine
-    // torch::autograd::profiler::ProfilerConfig cfg(
-    //     torch::autograd::profiler::ProfilerState::KINETO,
-    //     false, // report_input_shapes
-    //     false, // profile_memory
-    //     false, // with_stack
-    //     false, // with_flops
-    //     false  // with_modules
-    // );
+    // 1. Configure the profiler to use the Kineto engine
+    torch::autograd::profiler::ProfilerConfig cfg(
+        torch::autograd::profiler::ProfilerState::KINETO,
+        false, // report_input_shapes
+        false, // profile_memory
+        false, // with_stack
+        false, // with_flops
+        false  // with_modules
+    );
 
-    // // 2. Explicitly request both CPU and CUDA activities
-    // std::set<torch::autograd::profiler::ActivityType> activities = {
-    //     torch::autograd::profiler::ActivityType::CPU,
-    //     torch::autograd::profiler::ActivityType::CUDA};
+    // 2. Explicitly request both CPU and CUDA activities
+    std::set<torch::autograd::profiler::ActivityType> activities = {
+        torch::autograd::profiler::ActivityType::CPU,
+        torch::autograd::profiler::ActivityType::CUDA};
 
-    // // 3. Start tracing
-    // torch::autograd::profiler::prepareProfiler(cfg, activities);
-    // torch::autograd::profiler::enableProfiler(cfg, activities);
+    // 3. Start tracing
+    torch::autograd::profiler::prepareProfiler(cfg, activities);
+    torch::autograd::profiler::enableProfiler(cfg, activities);
 
-    // try
-    // {
-    //     run_real_training(argc, argv);
-    // }
-    // catch (const std::exception &e)
-    // {
-    //     std::cerr << "Exception during profiling: " << e.what() << std::endl;
-    // }
+    try
+    {
+        run_real_training(argc, argv);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Exception during profiling: " << e.what() << std::endl;
+    }
 
-    // // 4. Stop tracing and save to disk
-    // auto profiler_result = torch::autograd::profiler::disableProfiler();
-    // profiler_result->save("full_profile.json");
+    // 4. Stop tracing and save to disk
+    auto profiler_result = torch::autograd::profiler::disableProfiler();
+    profiler_result->save("full_profile.json");
 
-    // std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
+    std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
 
-    run_real_training(argc, argv);
+    // run_real_training(argc, argv);
 
     return 0;
 }
