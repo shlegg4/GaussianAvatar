@@ -720,6 +720,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                 const auto out_path = std::filesystem::path(options.output_dir) / MakeFrameName(frame_idx);
                 cv::imwrite(out_path.string(), overlay);
 
+                float train_focal = f_geo;
                 std::string crop_path_str;
                 if (pose_crop && pose_crop->width > 0 && pose_crop->height > 0) {
                     const auto crop_path = std::filesystem::path(options.output_dir) / MakeCropName(frame_idx);
@@ -727,21 +728,71 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                     cv::Mat matte;
                     cv::Mat matted_frame;
                     bool has_matte = false;
+
                     if (use_modnet) {
                         if (modnet.ComputeMatte(crop_img, &matte)) {
                             matted_frame = modnet.ApplyMatte(crop_img, matte);
                             has_matte = true;
                         }
                     }
+
+                    const int target_w = 1024;
+                    const int target_h = 1024;
+                    const float full_cx = static_cast<float>(base_frame.cols) * 0.5f;
+                    const float full_cy = static_cast<float>(base_frame.rows) * 0.5f;
+                    const float scale_w = static_cast<float>(target_w) / static_cast<float>(crop_img.cols);
+                    const float scale_h = static_cast<float>(target_h) / static_cast<float>(crop_img.rows);
+                    const float resize_scale = std::min(1.0f, std::min(scale_w, scale_h));
+
+                    cv::Mat prepared_crop = has_matte ? matted_frame : crop_img;
+                    if (resize_scale < 1.0f) {
+                        const int resized_w = std::max(1, static_cast<int>(std::lround(static_cast<double>(prepared_crop.cols) * resize_scale)));
+                        const int resized_h = std::max(1, static_cast<int>(std::lround(static_cast<double>(prepared_crop.rows) * resize_scale)));
+                        cv::resize(prepared_crop, prepared_crop, cv::Size(resized_w, resized_h), 0.0, 0.0, cv::INTER_AREA);
+                        if (has_matte) {
+                            cv::resize(matte, matte, cv::Size(resized_w, resized_h), 0.0, 0.0, cv::INTER_AREA);
+                        }
+
+                        crop_cx = full_cx + (crop_cx - full_cx) * resize_scale;
+                        crop_cy = full_cy + (crop_cy - full_cy) * resize_scale;
+                        crop_size *= resize_scale;
+                        train_focal = f_geo * resize_scale;
+                    }
+
+                    const int pad_w = std::max(0, target_w - prepared_crop.cols);
+                    const int pad_h = std::max(0, target_h - prepared_crop.rows);
+                    const int pad_left = pad_w / 2;
+                    const int pad_top = pad_h / 2;
+                    const int pad_right = pad_w - pad_left;
+                    const int pad_bottom = pad_h - pad_top;
+
+                    cv::Mat padded_crop;
+                    cv::copyMakeBorder(prepared_crop, padded_crop,
+                                       pad_top, pad_bottom, pad_left, pad_right,
+                                       cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+                    crop_img = padded_crop;
+
+                    crop_x0 = full_cx - (resize_scale * (full_cx - crop_x0) + static_cast<float>(pad_left));
+                    crop_y0 = full_cy - (resize_scale * (full_cy - crop_y0) + static_cast<float>(pad_top));
+                    crop_w = static_cast<float>(target_w);
+                    crop_h = static_cast<float>(target_h);
+
                     if (has_matte) {
                         cv::Mat matte_u8;
                         matte.convertTo(matte_u8, CV_8U, 255.0);
+
+                        cv::Mat padded_matte_u8;
+                        cv::copyMakeBorder(matte_u8, padded_matte_u8,
+                                           pad_top, pad_bottom, pad_left, pad_right,
+                                           cv::BORDER_CONSTANT, cv::Scalar(0));
+                        matte_u8 = padded_matte_u8;
+
                         const auto matte_path = std::filesystem::path(options.output_dir) / MakeMatteName(frame_idx);
                         cv::imwrite(matte_path.string(), matte_u8);
                         const auto matte_crop_path = std::filesystem::path(options.output_dir) / MakeMatteCropName(frame_idx);
                         cv::imwrite(matte_crop_path.string(), matte_u8);
-                        crop_img = matted_frame;
                     }
+
                     cv::imwrite(crop_path.string(), crop_img);
                     crop_path_str = crop_path.generic_string();
                 }
@@ -753,7 +804,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                                  out_path.generic_string(),
                                  crop_cx, crop_cy, crop_size,
                                  crop_x0, crop_y0, crop_w, crop_h,
-                                 f_geo, smplify_y_sign,
+                                 train_focal, smplify_y_sign,
                                  base_frame.cols, base_frame.rows);
 
                 if (frame_idx == 150) {

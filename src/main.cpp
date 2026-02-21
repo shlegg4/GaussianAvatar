@@ -1223,7 +1223,7 @@ int run_real_training(int argc, char *argv[])
         return -1;
     }
 
-    at::globalContext().setBenchmarkCuDNN(false);
+    at::globalContext().setBenchmarkCuDNN(true);
 
     std::vector<TrainSample> samples;
     std::string line;
