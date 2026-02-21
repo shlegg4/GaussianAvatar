@@ -815,6 +815,21 @@ public:
     {
     }
 
+    void InvalidateGraph()
+    {
+        graph_captured_ = false;
+        captured_gaussians_ = -1;
+#if GAUSS_HAS_CUDA_GRAPH
+        graph_.reset();
+#endif
+        s_betas_ = torch::Tensor();
+        s_pose_ = torch::Tensor();
+        s_trans_ = torch::Tensor();
+        s_means_ = torch::Tensor();
+        s_rots_ = torch::Tensor();
+        cuda_graph_failed_ = false;
+    }
+
     TrainStepResult TrainStep(const TrainingBatch &batch, int epoch, int batch_step, int sh_degree_eff)
     {
         TrainStepResult result;
@@ -861,60 +876,52 @@ public:
 #if GAUSS_HAS_CUDA_GRAPH
         if (enable_cuda_graphs_ && !cuda_graph_failed_ && batch_count == static_cast<int64_t>(graph_batch_size_))
         {
-            static bool graph_captured = false;
-            static int64_t captured_gaussians = -1;
-            static std::unique_ptr<at::cuda::CUDAGraph> graph;
-            static torch::Tensor s_betas;
-            static torch::Tensor s_pose;
-            static torch::Tensor s_trans;
-            static torch::Tensor s_means;
-            static torch::Tensor s_rots;
             bool used_graph = false;
 
             try
             {
                 const int64_t current_gaussians = avatar_.g_face_indices.size(0);
-                if (!graph_captured || !graph || captured_gaussians != current_gaussians)
+                if (!graph_captured_ || !graph_ || captured_gaussians_ != current_gaussians)
                 {
-                    graph = std::make_unique<at::cuda::CUDAGraph>();
-                    s_betas = torch::empty_like(betas_batch);
-                    s_pose = torch::empty_like(pose_total);
-                    s_trans = torch::empty_like(zero_trans);
+                    graph_ = std::make_unique<at::cuda::CUDAGraph>();
+                    s_betas_ = torch::empty_like(betas_batch);
+                    s_pose_ = torch::empty_like(pose_total);
+                    s_trans_ = torch::empty_like(zero_trans);
 
-                    s_betas.copy_(betas_batch);
-                    s_pose.copy_(pose_total);
-                    s_trans.copy_(zero_trans);
+                    s_betas_.copy_(betas_batch);
+                    s_pose_.copy_(pose_total);
+                    s_trans_.copy_(zero_trans);
 
                     {
                         torch::Tensor warm_means;
                         torch::Tensor warm_rots;
-                        std::tie(warm_means, warm_rots) = avatar_.forward(s_betas, s_pose, s_trans);
+                        std::tie(warm_means, warm_rots) = avatar_.forward(s_betas_, s_pose_, s_trans_);
                     }
 
-                    graph->capture_begin();
-                    auto graph_out = avatar_.forward(s_betas, s_pose, s_trans);
-                    s_means = std::get<0>(graph_out);
-                    s_rots = std::get<1>(graph_out);
-                    graph->capture_end();
+                    graph_->capture_begin();
+                    auto graph_out = avatar_.forward(s_betas_, s_pose_, s_trans_);
+                    s_means_ = std::get<0>(graph_out);
+                    s_rots_ = std::get<1>(graph_out);
+                    graph_->capture_end();
 
-                    graph_captured = true;
-                    captured_gaussians = current_gaussians;
+                    graph_captured_ = true;
+                    captured_gaussians_ = current_gaussians;
                 }
 
-                s_betas.copy_(betas_batch);
-                s_pose.copy_(pose_total);
-                s_trans.copy_(zero_trans);
-                graph->replay();
+                s_betas_.copy_(betas_batch);
+                s_pose_.copy_(pose_total);
+                s_trans_.copy_(zero_trans);
+                graph_->replay();
 
-                batch_means3D = s_means;
-                batch_rots = s_rots;
+                batch_means3D = s_means_;
+                batch_rots = s_rots_;
                 used_graph = true;
             }
             catch (...)
             {
-                graph_captured = false;
-                captured_gaussians = -1;
-                graph.reset();
+                graph_captured_ = false;
+                captured_gaussians_ = -1;
+                graph_.reset();
                 cuda_graph_failed_ = true;
             }
 
@@ -1215,6 +1222,16 @@ private:
     float lambda_dssim_ = 0.0f;
     float offset_reg_weight_ = 0.0f;
     float scale_reg_weight_ = 0.0f;
+    bool graph_captured_ = false;
+    int64_t captured_gaussians_ = -1;
+#if GAUSS_HAS_CUDA_GRAPH
+    std::unique_ptr<at::cuda::CUDAGraph> graph_;
+#endif
+    torch::Tensor s_betas_;
+    torch::Tensor s_pose_;
+    torch::Tensor s_trans_;
+    torch::Tensor s_means_;
+    torch::Tensor s_rots_;
 };
 
 int run_real_training(int argc, char *argv[])
@@ -1716,8 +1733,7 @@ int run_real_training(int argc, char *argv[])
             batch_step++;
         }
 
-        continue; // Skip viewer export and rendering for this epoch (for testing)
-
+        
         // --- MODIFIED SECTION START ---
 
         torch::Tensor positions, rotations, colors, opacities, scales;
@@ -1808,6 +1824,9 @@ int run_real_training(int argc, char *argv[])
             SaveViewerDataOverwrite(save_dir, positions, colors, opacities, scales, rotations,
                                     sh_to_send, sh_degree);
         }
+
+        // The epoch-end canonical forward uses batch size 1, so force CUDA graph recapture next epoch.
+        trainer.InvalidateGraph();
 
         // --- MODIFIED SECTION END ---
 
@@ -1970,43 +1989,43 @@ int run_real_training(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
-    std::cout << "Starting Full Program Profiling..." << std::endl;
+    // std::cout << "Starting Full Program Profiling..." << std::endl;
 
-    // 1. Configure the profiler to use the Kineto engine
-    torch::autograd::profiler::ProfilerConfig cfg(
-        torch::autograd::profiler::ProfilerState::KINETO,
-        false, // report_input_shapes
-        false, // profile_memory
-        false, // with_stack
-        false, // with_flops
-        false  // with_modules
-    );
+    // // 1. Configure the profiler to use the Kineto engine
+    // torch::autograd::profiler::ProfilerConfig cfg(
+    //     torch::autograd::profiler::ProfilerState::KINETO,
+    //     false, // report_input_shapes
+    //     false, // profile_memory
+    //     false, // with_stack
+    //     false, // with_flops
+    //     false  // with_modules
+    // );
 
-    // 2. Explicitly request both CPU and CUDA activities
-    std::set<torch::autograd::profiler::ActivityType> activities = {
-        torch::autograd::profiler::ActivityType::CPU,
-        torch::autograd::profiler::ActivityType::CUDA};
+    // // 2. Explicitly request both CPU and CUDA activities
+    // std::set<torch::autograd::profiler::ActivityType> activities = {
+    //     torch::autograd::profiler::ActivityType::CPU,
+    //     torch::autograd::profiler::ActivityType::CUDA};
 
-    // 3. Start tracing
-    torch::autograd::profiler::prepareProfiler(cfg, activities);
-    torch::autograd::profiler::enableProfiler(cfg, activities);
+    // // 3. Start tracing
+    // torch::autograd::profiler::prepareProfiler(cfg, activities);
+    // torch::autograd::profiler::enableProfiler(cfg, activities);
 
-    try
-    {
-        run_real_training(argc, argv);
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Exception during profiling: " << e.what() << std::endl;
-    }
+    // try
+    // {
+    //     run_real_training(argc, argv);
+    // }
+    // catch (const std::exception &e)
+    // {
+    //     std::cerr << "Exception during profiling: " << e.what() << std::endl;
+    // }
 
-    // 4. Stop tracing and save to disk
-    auto profiler_result = torch::autograd::profiler::disableProfiler();
-    profiler_result->save("full_profile.json");
+    // // 4. Stop tracing and save to disk
+    // auto profiler_result = torch::autograd::profiler::disableProfiler();
+    // profiler_result->save("full_profile.json");
 
-    std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
+    // std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
 
-    // run_real_training(argc, argv);
+    run_real_training(argc, argv);
 
     return 0;
 }
