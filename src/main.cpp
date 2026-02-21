@@ -321,38 +321,62 @@ bool BuildSharedGaussianBuffer(const torch::Tensor &positions, const torch::Tens
 }
 
 // --- SSIM Implementation Start ---
-torch::Tensor create_window(int window_size, int channel)
+std::pair<torch::Tensor, torch::Tensor> create_separable_windows(int window_size, torch::Device device)
 {
-    auto t = torch::arange(window_size, torch::kFloat32) - window_size / 2;
-    auto gauss = torch::exp(-(t * t) / (2 * 1.5 * 1.5));
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    auto t = torch::arange(window_size, options) - (window_size / 2.0f);
+    auto gauss = torch::exp(-(t * t) / (2.0f * 1.5f * 1.5f));
     gauss = gauss / gauss.sum();
 
-    auto window_2d = gauss.unsqueeze(1) * gauss.unsqueeze(0);
-    return window_2d.expand({channel, 1, window_size, window_size}).contiguous();
+    auto window_v = gauss.view({1, 1, window_size, 1}).contiguous();
+    auto window_h = gauss.view({1, 1, 1, window_size}).contiguous();
+    return {window_v, window_h};
 }
 
-torch::Tensor ssim(const torch::Tensor &img1, const torch::Tensor &img2, const torch::Tensor &window,
-                   int window_size = 11)
+torch::Tensor ssim_fast(const torch::Tensor &img1,
+                        const torch::Tensor &img2,
+                        const torch::Tensor &window_v,
+                        const torch::Tensor &window_h,
+                        int window_size = 11)
 {
     auto inp1 = (img1.dim() == 3) ? img1.unsqueeze(0) : img1;
     auto inp2 = (img2.dim() == 3) ? img2.unsqueeze(0) : img2;
 
-    const int channel = static_cast<int>(inp1.size(1));
-    auto mu1 = torch::conv2d(inp1, window, {}, 1, window_size / 2, 1, channel);
-    auto mu2 = torch::conv2d(inp2, window, {}, 1, window_size / 2, 1, channel);
+    const int64_t B = inp1.size(0);
+    const int64_t C = inp1.size(1);
+    const int64_t H = inp1.size(2);
+    const int64_t W = inp1.size(3);
+
+    inp1 = inp1.reshape({B * C, 1, H, W});
+    inp2 = inp2.reshape({B * C, 1, H, W});
+
+    const int64_t pad = window_size / 2;
+    const std::vector<int64_t> stride = {1, 1};
+    const std::vector<int64_t> dilation = {1, 1};
+    const std::vector<int64_t> pad_v = {pad, 0};
+    const std::vector<int64_t> pad_h = {0, pad};
+    auto blur = [&](const torch::Tensor &x)
+    {
+        auto out = torch::conv2d(x, window_v, c10::nullopt, stride, pad_v, dilation, 1);
+        out = torch::conv2d(out, window_h, c10::nullopt, stride, pad_h, dilation, 1);
+        return out;
+    };
+
+    auto mu1 = blur(inp1);
+    auto mu2 = blur(inp2);
 
     auto mu1_sq = mu1.pow(2);
     auto mu2_sq = mu2.pow(2);
     auto mu1_mu2 = mu1 * mu2;
 
-    auto sigma1_sq = torch::conv2d(inp1 * inp1, window, {}, 1, window_size / 2, 1, channel) - mu1_sq;
-    auto sigma2_sq = torch::conv2d(inp2 * inp2, window, {}, 1, window_size / 2, 1, channel) - mu2_sq;
-    auto sigma12 = torch::conv2d(inp1 * inp2, window, {}, 1, window_size / 2, 1, channel) - mu1_mu2;
+    auto sigma1_sq = blur(inp1 * inp1) - mu1_sq;
+    auto sigma2_sq = blur(inp2 * inp2) - mu2_sq;
+    auto sigma12 = blur(inp1 * inp2) - mu1_mu2;
 
     const float C1 = 0.01f * 0.01f;
     const float C2 = 0.03f * 0.03f;
 
-    auto ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) /
+    auto ssim_map = ((2.0f * mu1_mu2 + C1) * (2.0f * sigma12 + C2)) /
                     ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2));
 
     return ssim_map.mean();
@@ -732,7 +756,8 @@ public:
                     torch::optim::Adam &optimizer,
                     DensificationState &densify_state,
                     const torch::Tensor &canonical_betas,
-                    const torch::Tensor &ssim_window,
+                    const torch::Tensor &window_v,
+                    const torch::Tensor &window_h,
                     int ssim_window_size,
                     const torch::Tensor &cam_pos,
                     float render_scale_modifier,
@@ -751,7 +776,8 @@ public:
           optimizer_(optimizer),
           densify_state_(densify_state),
           canonical_betas_(canonical_betas),
-          ssim_window_(ssim_window),
+          window_v_(window_v),
+          window_h_(window_h),
           ssim_window_size_(ssim_window_size),
           cam_pos_(cam_pos),
           render_scale_modifier_(render_scale_modifier),
@@ -958,17 +984,8 @@ public:
             auto coverage_ratio = valid_pixels.sum() / (matte_mask.sum() + 1e-6f);
             auto is_valid_sample = (coverage_ratio > 0.3f).to(torch::kFloat32).detach();
 
-            // auto ssim_value_0 = ssim(image, target, ssim_window_, ssim_window_size_);
-            // auto d_ssim_loss = (1.0f - ssim_value_0);
-
-            // TEMP ssim_value_0 is very performance heavy, test with only 0's for loss
-            auto d_ssim_loss = torch::zeros({1}, avatar_.g_colors.options());
-
-            // auto image_small = Downsample(image);
-            // auto target_small = Downsample(target);
-            // auto ssim_value_1 = ssim(image_small, target_small, ssim_window_, ssim_window_size_);
-            // auto d_ssim_loss_1 = (1.0f - ssim_value_1);
-            // auto d_ssim_loss = 0.8f * d_ssim_loss_0 + 0.2f * d_ssim_loss_1;
+            auto ssim_value_0 = ssim_fast(image, target, window_v_, window_h_, ssim_window_size_);
+            auto d_ssim_loss = (1.0f - ssim_value_0);
             auto outside_loss = torch::mean(image * (1.0f - matte_mask));
             auto alpha_loss = torch::l1_loss(alpha, matte_mask);
 
@@ -1097,7 +1114,8 @@ private:
     torch::optim::Adam &optimizer_;
     DensificationState &densify_state_;
     const torch::Tensor &canonical_betas_;
-    const torch::Tensor &ssim_window_;
+    const torch::Tensor &window_v_;
+    const torch::Tensor &window_h_;
     int ssim_window_size_ = 11;
     const torch::Tensor &cam_pos_;
     float render_scale_modifier_ = 1.0f;
@@ -1225,7 +1243,8 @@ int run_real_training(int argc, char *argv[])
 
     torch::Device device(torch::kCUDA);
     const int ssim_window_size = 11;
-    torch::Tensor ssim_window = create_window(ssim_window_size, 3).to(device);
+    torch::Tensor window_v, window_h;
+    std::tie(window_v, window_h) = create_separable_windows(ssim_window_size, device);
     std::vector<CachedSampleData> cached;
     cached.resize(samples.size());
     for (size_t i = 0; i < samples.size(); ++i)
@@ -1450,7 +1469,8 @@ int run_real_training(int argc, char *argv[])
                             optimizer,
                             densify_state,
                             canonical_betas,
-                            ssim_window,
+                            window_v,
+                            window_h,
                             ssim_window_size,
                             cam_pos,
                             render_scale_modifier,
@@ -1859,43 +1879,43 @@ int run_real_training(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
-    // std::cout << "Starting Full Program Profiling..." << std::endl;
+    std::cout << "Starting Full Program Profiling..." << std::endl;
 
-    // // 1. Configure the profiler to use the Kineto engine
-    // torch::autograd::profiler::ProfilerConfig cfg(
-    //     torch::autograd::profiler::ProfilerState::KINETO,
-    //     false, // report_input_shapes
-    //     false, // profile_memory
-    //     false, // with_stack
-    //     false, // with_flops
-    //     false  // with_modules
-    // );
+    // 1. Configure the profiler to use the Kineto engine
+    torch::autograd::profiler::ProfilerConfig cfg(
+        torch::autograd::profiler::ProfilerState::KINETO,
+        false, // report_input_shapes
+        false, // profile_memory
+        false, // with_stack
+        false, // with_flops
+        false  // with_modules
+    );
 
-    // // 2. Explicitly request both CPU and CUDA activities
-    // std::set<torch::autograd::profiler::ActivityType> activities = {
-    //     torch::autograd::profiler::ActivityType::CPU,
-    //     torch::autograd::profiler::ActivityType::CUDA};
+    // 2. Explicitly request both CPU and CUDA activities
+    std::set<torch::autograd::profiler::ActivityType> activities = {
+        torch::autograd::profiler::ActivityType::CPU,
+        torch::autograd::profiler::ActivityType::CUDA};
 
-    // // 3. Start tracing
-    // torch::autograd::profiler::prepareProfiler(cfg, activities);
-    // torch::autograd::profiler::enableProfiler(cfg, activities);
+    // 3. Start tracing
+    torch::autograd::profiler::prepareProfiler(cfg, activities);
+    torch::autograd::profiler::enableProfiler(cfg, activities);
 
-    // try
-    // {
-    //     run_real_training(argc, argv);
-    // }
-    // catch (const std::exception &e)
-    // {
-    //     std::cerr << "Exception during profiling: " << e.what() << std::endl;
-    // }
+    try
+    {
+        run_real_training(argc, argv);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Exception during profiling: " << e.what() << std::endl;
+    }
 
-    // // 4. Stop tracing and save to disk
-    // auto profiler_result = torch::autograd::profiler::disableProfiler();
-    // profiler_result->save("full_profile.json");
+    // 4. Stop tracing and save to disk
+    auto profiler_result = torch::autograd::profiler::disableProfiler();
+    profiler_result->save("full_profile.json");
 
-    // std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
+    std::cout << "Profiling complete. Saved to full_profile.json" << std::endl;
 
-    run_real_training(argc, argv);
+    // run_real_training(argc, argv);
 
     return 0;
 }
