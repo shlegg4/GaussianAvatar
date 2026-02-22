@@ -50,66 +50,85 @@ torch::Tensor ComputeTriFrames(const torch::Tensor &A, const torch::Tensor &B, c
     auto Y = torch::cross(N, X, 1);
     return torch::stack({X, Y, N}, 2);
 }
-
 torch::Tensor MatrixToQuat(const torch::Tensor &rot_mat)
 {
     using torch::indexing::Slice;
+
+    // 1. Extract all 9 elements of the rotation matrices
     auto m00 = rot_mat.index({Slice(), 0, 0});
+    auto m01 = rot_mat.index({Slice(), 0, 1});
+    auto m02 = rot_mat.index({Slice(), 0, 2});
+
+    auto m10 = rot_mat.index({Slice(), 1, 0});
     auto m11 = rot_mat.index({Slice(), 1, 1});
+    auto m12 = rot_mat.index({Slice(), 1, 2});
+
+    auto m20 = rot_mat.index({Slice(), 2, 0});
+    auto m21 = rot_mat.index({Slice(), 2, 1});
     auto m22 = rot_mat.index({Slice(), 2, 2});
+
     auto tr = m00 + m11 + m22;
 
-    const auto num = rot_mat.size(0);
-    auto q = torch::zeros({num, 4}, rot_mat.options());
-
-    // --- OPTIMIZATION: Removed if(mask.any().item<bool>()) checks ---
-    // We execute the tensor operations blindly. 
-    // If a mask is empty, the index operation is a fast GPU no-op 
-    // and does not trigger a CPU sync.
-
-    // Case 1: Trace > 0
-    auto mask1 = tr > 0;
-    {
-        // Safe S calculation (masked values ignored by index_put_)
-        auto S = torch::sqrt(torch::clamp_min(tr.index({mask1}) + 1.0f, 0.0f)) * 2.0f;
-        q.index_put_({mask1, 0}, 0.25f * S);
-        q.index_put_({mask1, 1}, (rot_mat.index({mask1, 2, 1}) - rot_mat.index({mask1, 1, 2})) / S);
-        q.index_put_({mask1, 2}, (rot_mat.index({mask1, 0, 2}) - rot_mat.index({mask1, 2, 0})) / S);
-        q.index_put_({mask1, 3}, (rot_mat.index({mask1, 1, 0}) - rot_mat.index({mask1, 0, 1})) / S);
-    }
-
-    // Case 2: m00 is max
+    // 2. Define the exact same masks, but keep them as booleans
+    auto mask1 = tr > 0.0f;
     auto mask2 = (~mask1) & (m00 > m11) & (m00 > m22);
-    {
-        auto S = torch::sqrt(torch::clamp_min(1.0f + m00.index({mask2}) - m11.index({mask2}) - m22.index({mask2}), 0.0f)) * 2.0f;
-        q.index_put_({mask2, 0}, (rot_mat.index({mask2, 2, 1}) - rot_mat.index({mask2, 1, 2})) / S);
-        q.index_put_({mask2, 1}, 0.25f * S);
-        q.index_put_({mask2, 2}, (rot_mat.index({mask2, 0, 1}) + rot_mat.index({mask2, 1, 0})) / S);
-        q.index_put_({mask2, 3}, (rot_mat.index({mask2, 0, 2}) + rot_mat.index({mask2, 2, 0})) / S);
-    }
-
-    // Case 3: m11 is max
     auto mask3 = (~mask1) & (~mask2) & (m11 > m22);
-    {
-        auto S = torch::sqrt(torch::clamp_min(1.0f + m11.index({mask3}) - m00.index({mask3}) - m22.index({mask3}), 0.0f)) * 2.0f;
-        q.index_put_({mask3, 0}, (rot_mat.index({mask3, 0, 2}) - rot_mat.index({mask3, 2, 0})) / S);
-        q.index_put_({mask3, 1}, (rot_mat.index({mask3, 0, 1}) + rot_mat.index({mask3, 1, 0})) / S);
-        q.index_put_({mask3, 2}, 0.25f * S);
-        q.index_put_({mask3, 3}, (rot_mat.index({mask3, 1, 2}) + rot_mat.index({mask3, 2, 1})) / S);
-    }
+    // mask4 is implicitly whatever is left
 
-    // Case 4: m22 is max
-    auto mask4 = (~mask1) & (~mask2) & (~mask3);
-    {
-        auto S = torch::sqrt(torch::clamp_min(1.0f + m22.index({mask4}) - m00.index({mask4}) - m11.index({mask4}), 0.0f)) * 2.0f;
-        q.index_put_({mask4, 0}, (rot_mat.index({mask4, 1, 0}) - rot_mat.index({mask4, 0, 1})) / S);
-        q.index_put_({mask4, 1}, (rot_mat.index({mask4, 0, 2}) + rot_mat.index({mask4, 2, 0})) / S);
-        q.index_put_({mask4, 2}, (rot_mat.index({mask4, 1, 2}) + rot_mat.index({mask4, 2, 1})) / S);
-        q.index_put_({mask4, 3}, 0.25f * S);
-    }
+    // Expand masks for torch::where broadcasting [N] -> [N, 1]
+    auto m1_exp = mask1.unsqueeze(1);
+    auto m2_exp = mask2.unsqueeze(1);
+    auto m3_exp = mask3.unsqueeze(1);
 
-    return torch::nn::functional::normalize(q, torch::nn::functional::NormalizeFuncOptions().dim(1));
+    // Safe epsilon to prevent NaN in sqrt or division by zero in unselected branches
+    const float eps = 1e-6f;
+
+    // --- Case 1 ---
+    auto S1 = torch::sqrt(torch::clamp_min(tr + 1.0f, eps)) * 2.0f;
+    auto q1 = torch::stack({
+        0.25f * S1,
+        (m21 - m12) / S1,
+        (m02 - m20) / S1,
+        (m10 - m01) / S1
+    }, 1);
+
+    // --- Case 2 ---
+    auto S2 = torch::sqrt(torch::clamp_min(1.0f + m00 - m11 - m22, eps)) * 2.0f;
+    auto q2 = torch::stack({
+        (m21 - m12) / S2,
+        0.25f * S2,
+        (m01 + m10) / S2,
+        (m02 + m20) / S2
+    }, 1);
+
+    // --- Case 3 ---
+    auto S3 = torch::sqrt(torch::clamp_min(1.0f + m11 - m00 - m22, eps)) * 2.0f;
+    auto q3 = torch::stack({
+        (m02 - m20) / S3,
+        (m01 + m10) / S3,
+        0.25f * S3,
+        (m12 + m21) / S3
+    }, 1);
+
+    // --- Case 4 ---
+    auto S4 = torch::sqrt(torch::clamp_min(1.0f + m22 - m00 - m11, eps)) * 2.0f;
+    auto q4 = torch::stack({
+        (m10 - m01) / S4,
+        (m02 + m20) / S4,
+        (m12 + m21) / S4,
+        0.25f * S4
+    }, 1);
+
+    // 3. Blend everything together using nested torch::where
+    auto q_final = torch::where(m1_exp, q1,
+                        torch::where(m2_exp, q2,
+                            torch::where(m3_exp, q3, q4)));
+
+    // 4. Normalize and return
+    return torch::nn::functional::normalize(q_final, torch::nn::functional::NormalizeFuncOptions().dim(1));
 }
+
+
 torch::Tensor QuatMultiply(const torch::Tensor &p, const torch::Tensor &q)
 {
     auto pw = p.select(1, 0);

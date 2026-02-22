@@ -742,15 +742,23 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                     const float full_cy = static_cast<float>(base_frame.rows) * 0.5f;
                     const float scale_w = static_cast<float>(target_w) / static_cast<float>(crop_img.cols);
                     const float scale_h = static_cast<float>(target_h) / static_cast<float>(crop_img.rows);
-                    const float resize_scale = std::min(1.0f, std::min(scale_w, scale_h));
+
+                    // Allow upscaling by removing the std::min(1.0f, ...) clamp
+                    const float resize_scale = std::min(scale_w, scale_h);
 
                     cv::Mat prepared_crop = has_matte ? matted_frame : crop_img;
-                    if (resize_scale < 1.0f) {
+
+                    // Execute if we need to scale up OR down
+                    if (resize_scale != 1.0f) {
                         const int resized_w = std::max(1, static_cast<int>(std::lround(static_cast<double>(prepared_crop.cols) * resize_scale)));
                         const int resized_h = std::max(1, static_cast<int>(std::lround(static_cast<double>(prepared_crop.rows) * resize_scale)));
-                        cv::resize(prepared_crop, prepared_crop, cv::Size(resized_w, resized_h), 0.0, 0.0, cv::INTER_AREA);
+
+                        // Use CUBIC for upscaling (smoother), AREA for downscaling
+                        int interp_method = (resize_scale > 1.0f) ? cv::INTER_CUBIC : cv::INTER_AREA;
+
+                        cv::resize(prepared_crop, prepared_crop, cv::Size(resized_w, resized_h), 0.0, 0.0, interp_method);
                         if (has_matte) {
-                            cv::resize(matte, matte, cv::Size(resized_w, resized_h), 0.0, 0.0, cv::INTER_AREA);
+                            cv::resize(matte, matte, cv::Size(resized_w, resized_h), 0.0, 0.0, interp_method);
                         }
 
                         crop_cx = full_cx + (crop_cx - full_cx) * resize_scale;
@@ -825,7 +833,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
     } else {
         while (cap.read(frame)) {
             if (options.frame_stride <= 1 || (frame_idx % options.frame_stride) == 0) {
-                cv::resize(frame, frame, cv::Size(), 0.5, 0.5, cv::INTER_LINEAR);
+                // Removed hardcoded frame halving; process at native video resolution.
                 process_frame(frame, frame_idx);
             }
             if (frame_idx % 30 == 0) std::cout << "Frame: " << frame_idx << std::endl;
