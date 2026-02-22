@@ -182,19 +182,19 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
 
         // FIX: Subtract log to shrink, 0.5 opacity for both
         auto new_scale = parent_scales - delta_log;
-        auto new_opacity = parent_opacities * 0.5f;
+        // auto new_opacity = parent_opacities * 0.5f;
 
         // Update Parent
         kept_scales.index_put_({parent_local}, new_scale);
         kept_offsets.index_put_({parent_local}, parent_offsets + delta);
-        kept_opacities.index_put_({parent_local}, new_opacity);
+        kept_opacities.index_put_({parent_local}, parent_opacities);
 
         // Append Child
         auto child_scales = new_scale;
         auto child_offsets = parent_offsets - delta;
         auto child_rots = parent_rots;
         auto child_colors = parent_colors;
-        auto child_opacities = new_opacity;
+        auto child_opacities = parent_opacities;
         auto child_bary = parent_bary;
         auto child_faces = parent_faces;
 

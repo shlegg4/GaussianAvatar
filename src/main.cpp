@@ -63,7 +63,9 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
             }
             else
             {
-                if (key != "--viewer" && key != "--headless" && key != "--viewer-stream-poses")
+                if (key != "--viewer" && key != "--headless" &&
+                    key != "--viewer-stream-poses" &&
+                    key != "--verbose" && key != "--verbose-diagnostics")
                 {
                     if (i + 1 >= argc)
                     {
@@ -97,6 +99,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->viewer_export_dir = value;
             else if (key == "--scale-reg")
                 options->scale_reg_weight = std::stof(value);
+            else if (key == "--sh-reg" || key == "--sh-reg-weight" || key == "--shregweight")
+                options->sh_reg_weight = std::stof(value);
+            else if (key == "--sugar-weight" || key == "--sugar-reg-weight" || key == "--sugarweight")
+                options->sugar_weight = std::stof(value);
             else if (key == "--scale-lr")
                 options->scale_lr = std::stof(value);
             else if (key == "--scale-max")
@@ -151,6 +157,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->enable_viewer = false;
             else if (key == "--viewer-stream-poses")
                 options->viewer_stream_poses = true;
+            else if (key == "--verbose" || key == "--verbose-diagnostics")
+                options->verbose_diagnostics = true;
+            else if (key == "--verbose-every")
+                options->verbose_every = std::stoi(value);
             else if (key == "--viewer-every")
                 options->viewer_every = std::stoi(value);
             else if (key == "--viewer-shm")
@@ -517,9 +527,14 @@ struct GaussianAvatar : torch::nn::Module
         auto ab = face_b - face_a;
         auto ac = face_c - face_a;
         auto cross = torch::cross(ab, ac, 1);
-        auto face_area = 0.5f * torch::norm(cross, 2, 1);
-        auto face_prob = face_area + 1e-12f;
-        face_prob = face_prob / face_prob.sum();
+        auto face_area = 0.5f * torch::norm(cross, 2, 1); 
+        auto area_prob = face_area / torch::clamp_min(face_area.sum(), 1e-8f);
+ 
+        auto uniform_prob = torch::ones_like(face_area);
+        uniform_prob = uniform_prob / uniform_prob.sum();
+ 
+        auto face_prob = (area_prob * 0.5f) + (uniform_prob * 0.5f);
+
         g_face_indices = torch::multinomial(face_prob, num_gaussians, true);
 
         register_buffer("g_face_indices", g_face_indices);
@@ -542,8 +557,15 @@ struct GaussianAvatar : torch::nn::Module
         auto qxyz = axis_unit * torch::sin(half).unsqueeze(1);
         auto face_quats = torch::cat({qw.unsqueeze(1), qxyz}, 1);
 
-        auto face_scale_sel = face_scale.index_select(0, g_face_indices);
-        auto log_scale_base = torch::log((face_scale_sel * 0.2f) / safe_scale_mod);
+        // 1. Get the base scale from the face area
+        auto face_scale_sel = face_scale.index_select(0, g_face_indices) * 0.3f;
+
+        // 2. Enforce a minimum physical radius (e.g., 3mm) so they don't start "dead"
+        float min_init_scale = 0.003f;
+        face_scale_sel = torch::clamp_min(face_scale_sel, min_init_scale);
+
+        // 3. Convert to log-space for the optimizer
+        auto log_scale_base = torch::log(face_scale_sel / safe_scale_mod);
 
         // Use the same log scale for X, Y, AND Z
         g_scales = torch::stack({log_scale_base, log_scale_base, log_scale_base}, 1).clone().set_requires_grad(true);
@@ -761,6 +783,27 @@ struct TrainStepResult
     int total_samples = 0;
     torch::Tensor rot_delta_mean;
     torch::Tensor trans_delta_max;
+    bool verbose_captured = false;
+    torch::Tensor final_recon;
+    torch::Tensor final_ssim;
+    torch::Tensor final_outside;
+    torch::Tensor final_alpha;
+    torch::Tensor offset_reg;
+    torch::Tensor scale_reg;
+    torch::Tensor sh_reg_loss;
+    torch::Tensor sugar_reg;
+    torch::Tensor grad_rot_norm;
+    torch::Tensor grad_offset_norm;
+    torch::Tensor grad_scale_norm;
+    torch::Tensor grad_color_norm;
+    torch::Tensor grad_opacity_norm;
+    torch::Tensor grad_pose_norm;
+    torch::Tensor scale_mean;
+    torch::Tensor scale_min;
+    torch::Tensor scale_max;
+    torch::Tensor scale_cap_hit_ratio;
+    torch::Tensor opacity_low_ratio;
+    torch::Tensor opacity_high_ratio;
 };
 
 class GaussianTrainer
@@ -784,7 +827,9 @@ public:
                     float alpha_loss_weight,
                     float lambda_dssim,
                     float offset_reg_weight,
-                    float scale_reg_weight)
+                    float scale_reg_weight,
+                    float sh_reg_weight,
+                    float sugar_weight)
         : avatar_(avatar),
           pose_refiner_(pose_refiner),
           optimizer_(optimizer),
@@ -803,11 +848,17 @@ public:
           alpha_loss_weight_(alpha_loss_weight),
           lambda_dssim_(lambda_dssim),
           offset_reg_weight_(offset_reg_weight),
-          scale_reg_weight_(scale_reg_weight)
+          scale_reg_weight_(scale_reg_weight),
+          sh_reg_weight_(sh_reg_weight),
+          sugar_weight_(sugar_weight)
     {
     }
 
-    TrainStepResult TrainStep(const TrainingBatch &batch, int epoch, int batch_step, int sh_degree_eff)
+    TrainStepResult TrainStep(const TrainingBatch &batch,
+                              int epoch,
+                              int batch_step,
+                              int sh_degree_eff,
+                              bool capture_verbose_metrics)
     {
         TrainStepResult result;
         if (batch.sample_indices.empty())
@@ -836,7 +887,7 @@ public:
         auto pose_deltas = deltas.slice(1, 0, 72).view({-1, 24, 3});
         auto trans_deltas = deltas.slice(1, 72, 75).view({-1, 3});
 
-        if (batch_step % 50 == 0)
+        if ((batch_step % 50 == 0) || capture_verbose_metrics)
         {
             result.rot_delta_mean = pose_deltas.detach().abs().mean();
             result.trans_delta_max = trans_deltas.detach().abs().max();
@@ -1048,6 +1099,29 @@ public:
         auto scale_reg = torch::mean(current_scales.pow(2).sum(1));
         auto offset_reg = torch::mean(torch::abs(avatar_.g_offsets));
 
+        torch::Tensor cap_penalty = torch::zeros({1}, current_scales.options());
+        if (scale_cap_ > 0.0f)
+        {
+            // ReLU ensures we ONLY penalize scales that are larger than scale_cap_
+            // Squaring it makes the penalty grow exponentially the further it exceeds the cap
+            auto excess = torch::relu(current_scales - (scale_cap_ * render_scale_modifier_));
+            cap_penalty = excess.pow(2).mean();
+        }
+
+        using torch::indexing::Slice;
+
+        // 1. Flattening Loss (Force the local Z-axis scale to be very thin) 
+        auto z_scales = current_scales.index({Slice(), 2});
+        auto flatten_loss = z_scales.pow(2).mean();
+
+        // 2. Alignment Loss (Force the Gaussian orientation to match the face normal)
+        auto rot_x = avatar_.g_rots.index({Slice(), 1});
+        auto rot_y = avatar_.g_rots.index({Slice(), 2});
+        auto align_loss = rot_x.pow(2).mean() + rot_y.pow(2).mean();
+
+        // Combine for total SuGaR regularization
+        auto sugar_loss = flatten_loss + align_loss;
+
         torch::Tensor sh_reg_loss = torch::zeros({1}, avatar_.g_sh.options());
         if (use_sh_ && avatar_.g_sh.defined() && avatar_.g_sh.size(1) > 1)
         {
@@ -1059,18 +1133,86 @@ public:
             sh_reg_loss = higher_orders.pow(2).mean();
         }
 
-        // Weight: Start with 0.01. If it's still sliding, increase to 0.05 or 0.1
-        float sh_reg_weight = 0.005f;
-
         auto loss = (1.0f - lambda_dssim_) * final_recon +
                     lambda_dssim_ * final_ssim +
                     outside_mask_weight_ * final_outside +
                     alpha_loss_weight_ * final_alpha +
                     offset_reg_weight_ * offset_reg +
                     scale_reg_weight_ * scale_reg +
-                    sh_reg_weight * sh_reg_loss;
+                    sh_reg_weight_ * sh_reg_loss +
+                    sugar_weight_ * sugar_loss +
+                    10000.0f * cap_penalty;
+
+        if (capture_verbose_metrics)
+        {
+            result.verbose_captured = true;
+            result.final_recon = final_recon.detach();
+            result.final_ssim = final_ssim.detach();
+            result.final_outside = final_outside.detach();
+            result.final_alpha = final_alpha.detach();
+            result.offset_reg = offset_reg.detach();
+            result.scale_reg = scale_reg.detach();
+            result.sh_reg_loss = sh_reg_loss.detach();
+            result.sugar_reg = sugar_loss.detach();
+            result.scale_mean = current_scales.mean().detach();
+            result.scale_min = current_scales.min().detach();
+            result.scale_max = current_scales.max().detach();
+
+            auto cap_hit_ratio = torch::zeros({1}, current_scales.options());
+            if (scale_cap_ > 0.0f)
+            {
+                const float final_scale_cap = scale_cap_ * render_scale_modifier_;
+                cap_hit_ratio =
+                    (current_scales >= (final_scale_cap * 0.999f))
+                        .to(current_scales.options().dtype())
+                        .mean();
+            }
+            result.scale_cap_hit_ratio = cap_hit_ratio.detach();
+
+            auto opacity_values = torch::clamp(avatar_.g_opacities.detach(), 0.0f, 1.0f);
+            result.opacity_low_ratio =
+                (opacity_values <= 0.001f).to(opacity_values.options().dtype()).mean().detach();
+            result.opacity_high_ratio =
+                (opacity_values >= 0.999f).to(opacity_values.options().dtype()).mean().detach();
+        }
 
         loss.backward();
+
+        if (capture_verbose_metrics)
+        {
+            auto grad_norm_from_param = [](const torch::Tensor &param) -> torch::Tensor
+            {
+                auto grad = param.grad();
+                if (!grad.defined())
+                {
+                    return torch::Tensor();
+                }
+                return grad.detach().pow(2).sum().sqrt();
+            };
+
+            result.grad_rot_norm = grad_norm_from_param(avatar_.g_rots);
+            result.grad_offset_norm = grad_norm_from_param(avatar_.g_offsets);
+            result.grad_scale_norm = grad_norm_from_param(avatar_.g_scales);
+            result.grad_color_norm = grad_norm_from_param(use_sh_ ? avatar_.g_sh : avatar_.g_colors);
+            result.grad_opacity_norm = grad_norm_from_param(avatar_.g_opacities);
+
+            torch::Tensor pose_grad_sq = torch::zeros({1}, avatar_.g_offsets.options());
+            bool has_pose_grad = false;
+            for (const auto &param : pose_refiner_.parameters())
+            {
+                auto grad = param.grad();
+                if (!grad.defined())
+                {
+                    continue;
+                }
+                pose_grad_sq = pose_grad_sq + grad.detach().pow(2).sum();
+                has_pose_grad = true;
+            }
+            if (has_pose_grad)
+            {
+                result.grad_pose_norm = pose_grad_sq.sqrt();
+            }
+        }
 
         // if (avatar_.g_scales.grad().defined())
         // {
@@ -1103,8 +1245,8 @@ public:
         }
 
         result.stepped = true;
-        result.loss = loss;
-        result.valid_sum = valid_sum;
+        result.loss = loss.detach();
+        result.valid_sum = valid_sum.detach();
         result.total_samples = static_cast<int>(total_losses.size(0));
         return result;
     }
@@ -1112,12 +1254,8 @@ public:
 private:
     torch::Tensor CappedScales(const torch::Tensor &log_scales) const
     {
-        auto scales = torch::exp(log_scales);
-        if (scale_cap_ > 0.0f)
-        {
-            scales = torch::clamp(scales, 0.0f, scale_cap_);
-        }
-        return scales;
+        // Remove the torch::clamp so gradients can always flow back!
+        return torch::exp(log_scales);
     }
 
     GaussianAvatar &avatar_;
@@ -1139,6 +1277,8 @@ private:
     float lambda_dssim_ = 0.0f;
     float offset_reg_weight_ = 0.0f;
     float scale_reg_weight_ = 0.0f;
+    float sh_reg_weight_ = 0.0f;
+    float sugar_weight_ = 0.0f;
     bool graph_captured_ = false;
     int64_t captured_gaussians_ = -1;
 #if GAUSS_HAS_CUDA_GRAPH
@@ -1160,7 +1300,7 @@ int run_real_training(int argc, char *argv[])
                      " [--lr-decay-epoch <int>] [--lr-decay-multiplier <float>]"
                      " [--lr-min-multiplier <float>]"
                      " [--train-dir <path>] [--viewer-export-dir <path>]"
-                     " [--scale-reg <float>] [--scale-max <float>]"
+                     " [--scale-reg <float>] [--sh-reg <float>] [--sugar-weight <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
                      " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>]"
                      " [--lambda-dssim <float>]"
@@ -1173,6 +1313,7 @@ int run_real_training(int argc, char *argv[])
                      " [--densify-prune-opacity <float>]"
                      " [--densify-prune-max <int>] [--densify-reset-opacity <float>]"
                      " [--densify-stop-epoch <int>]"
+                     " [--verbose|--verbose-diagnostics] [--verbose-every <int>]"
                      " [--viewer|--headless]"
                      " [--viewer-every <int>] [--viewer-shm <name>] [--viewer-pose-shm <name>]"
                      " [--viewer-bind-shm <name>] [--viewer-stream-poses]\n";
@@ -1200,6 +1341,8 @@ int run_real_training(int argc, char *argv[])
     const std::string &output_dir = options.output_dir;
     const std::string &viewer_export_dir = options.viewer_export_dir;
     const float scale_reg_weight = options.scale_reg_weight;
+    const float sh_reg_weight = options.sh_reg_weight;
+    const float sugar_weight = options.sugar_weight;
     const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
     const float scale_max_value = options.scale_max_value;
     const float rot_lr = (options.rot_lr < 0.0f) ? lr : options.rot_lr;
@@ -1212,6 +1355,8 @@ int run_real_training(int argc, char *argv[])
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
     const bool viewer_stream_poses = options.viewer_stream_poses;
+    const bool verbose_diagnostics = options.verbose_diagnostics;
+    const int verbose_log_every = std::max(1, options.verbose_every);
     const int densify_every = std::max(1, options.densify_every);
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
@@ -1224,6 +1369,10 @@ int run_real_training(int argc, char *argv[])
     const int metric_log_every = 100;
     const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
     const float scale_cap = (scale_max_value > 0.0f) ? (scale_max_value / safe_scale_mod) : -1.0f;
+    if (verbose_diagnostics)
+    {
+        std::cout << "Verbose diagnostics enabled (every " << verbose_log_every << " steps)." << std::endl;
+    }
     auto capped_scales = [&](const torch::Tensor &log_scales)
     {
         auto scales = torch::exp(log_scales);
@@ -1394,7 +1543,7 @@ int run_real_training(int argc, char *argv[])
     const int densify_stop_epoch = options.densify_stop_epoch;
     DensificationState densify_state;
     int64_t global_step = 0;
-    const int warmup_epochs = 0;
+    const int warmup_epochs = 10;
 
     std::vector<torch::Tensor> rot_params = {avatar.g_rots};
     std::vector<torch::Tensor> offset_params = {avatar.g_offsets};
@@ -1500,7 +1649,9 @@ int run_real_training(int argc, char *argv[])
                             alpha_loss_weight,
                             lambda_dssim,
                             offset_reg_weight,
-                            scale_reg_weight);
+                            scale_reg_weight,
+                            sh_reg_weight,
+                            sugar_weight);
     GaussianDataLoader loader(samples,
                               cached,
                               gpu_data.all_poses,
@@ -1571,14 +1722,16 @@ int run_real_training(int argc, char *argv[])
         int batch_step = 0;
         while (loader.Next(&batch))
         {
-            auto step_result = trainer.TrainStep(batch, epoch, batch_step, sh_degree_eff);
+            const bool should_log_metrics = (batch_step % metric_log_every) == 0;
+            const bool should_log_verbose = verbose_diagnostics && ((batch_step % verbose_log_every) == 0);
+            auto step_result = trainer.TrainStep(batch, epoch, batch_step, sh_degree_eff, should_log_verbose);
             if (!step_result.stepped)
             {
                 batch_step++;
                 continue;
             }
 
-            if (batch_step % metric_log_every == 0)
+            if (should_log_metrics)
             {
                 const float current_loss_val = step_result.loss.item<float>();
                 const float valid_count = step_result.valid_sum.item<float>();
@@ -1605,10 +1758,116 @@ int run_real_training(int argc, char *argv[])
                 }
             }
 
+            if (should_log_verbose && step_result.verbose_captured)
+            {
+                auto tensor_to_float = [](const torch::Tensor &value) -> float
+                {
+                    if (!value.defined())
+                    {
+                        return std::numeric_limits<float>::quiet_NaN();
+                    }
+                    return value.item<float>();
+                };
+
+                const float recon_val = tensor_to_float(step_result.final_recon);
+                const float ssim_val = tensor_to_float(step_result.final_ssim);
+                const float outside_val = tensor_to_float(step_result.final_outside);
+                const float alpha_val = tensor_to_float(step_result.final_alpha);
+                const float offset_reg_val = tensor_to_float(step_result.offset_reg);
+                const float scale_reg_val = tensor_to_float(step_result.scale_reg);
+                const float sh_reg_val = tensor_to_float(step_result.sh_reg_loss);
+                const float sugar_reg_val = tensor_to_float(step_result.sugar_reg);
+
+                const float grad_rot = tensor_to_float(step_result.grad_rot_norm);
+                const float grad_offset = tensor_to_float(step_result.grad_offset_norm);
+                const float grad_scale = tensor_to_float(step_result.grad_scale_norm);
+                const float grad_color = tensor_to_float(step_result.grad_color_norm);
+                const float grad_opacity = tensor_to_float(step_result.grad_opacity_norm);
+                const float grad_pose = tensor_to_float(step_result.grad_pose_norm);
+
+                const float scale_mean_val = tensor_to_float(step_result.scale_mean);
+                const float scale_min_val = tensor_to_float(step_result.scale_min);
+                const float scale_max_val = tensor_to_float(step_result.scale_max);
+                const float scale_cap_hit_ratio = tensor_to_float(step_result.scale_cap_hit_ratio);
+                const float opacity_low_ratio = tensor_to_float(step_result.opacity_low_ratio);
+                const float opacity_high_ratio = tensor_to_float(step_result.opacity_high_ratio);
+
+                const float rot_delta_val = tensor_to_float(step_result.rot_delta_mean);
+                const float trans_delta_val = tensor_to_float(step_result.trans_delta_max);
+                const float pose_offset_grad_ratio = (std::isfinite(grad_offset) && std::abs(grad_offset) > 1e-12f)
+                                                         ? (grad_pose / grad_offset)
+                                                         : 0.0f;
+
+                float densify_avg_pos_grad = std::numeric_limits<float>::quiet_NaN();
+                float densify_above_min = std::numeric_limits<float>::quiet_NaN();
+                const int64_t densify_accum_steps = densify_state.steps;
+                if (densify_accum_steps > 0 && densify_state.grad_offsets_accum.defined())
+                {
+                    auto grad_offsets_avg =
+                        densify_state.grad_offsets_accum / static_cast<float>(std::max<int64_t>(1, densify_accum_steps));
+                    auto grad_norm = torch::norm(grad_offsets_avg, 2, 1);
+                    densify_avg_pos_grad = grad_norm.mean().item<float>();
+                    densify_above_min =
+                        (grad_norm > densify_cfg.min_grad_norm).to(torch::kFloat32).mean().item<float>();
+                }
+
+                std::ostringstream loss_line;
+                loss_line.setf(std::ios::fixed);
+                loss_line << std::setprecision(6)
+                          << "[Verbose/Loss] recon=" << recon_val
+                          << " ssim=" << ssim_val
+                          << " outside=" << outside_val
+                          << " alpha=" << alpha_val
+                          << " offset_reg=" << offset_reg_val
+                          << " scale_reg=" << scale_reg_val
+                          << " sh_reg=" << sh_reg_val
+                          << " sugar_reg=" << sugar_reg_val;
+                metric_logger.Log(loss_line.str());
+
+                std::ostringstream grad_line;
+                grad_line.setf(std::ios::fixed);
+                grad_line << std::setprecision(6)
+                          << "[Verbose/Grad] rot=" << grad_rot
+                          << " offset=" << grad_offset
+                          << " scale=" << grad_scale
+                          << " color=" << grad_color
+                          << " opacity=" << grad_opacity
+                          << " pose_mlp=" << grad_pose;
+                metric_logger.Log(grad_line.str());
+
+                std::ostringstream clamp_line;
+                clamp_line.setf(std::ios::fixed);
+                clamp_line << std::setprecision(6)
+                           << "[Verbose/Clamp] scale_mean=" << scale_mean_val
+                           << " scale_min=" << scale_min_val
+                           << " scale_max=" << scale_max_val
+                           << " scale_cap_hit_ratio=" << scale_cap_hit_ratio
+                           << " opacity_low_ratio=" << opacity_low_ratio
+                           << " opacity_high_ratio=" << opacity_high_ratio;
+                metric_logger.Log(clamp_line.str());
+
+                std::ostringstream conflict_line;
+                conflict_line.setf(std::ios::fixed);
+                conflict_line << std::setprecision(6)
+                              << "[Verbose/Conflict] rot_delta_mean=" << rot_delta_val
+                              << " trans_delta_max=" << trans_delta_val
+                              << " pose_to_offset_grad_ratio=" << pose_offset_grad_ratio;
+                metric_logger.Log(conflict_line.str());
+
+                std::ostringstream densify_line;
+                densify_line.setf(std::ios::fixed);
+                densify_line << std::setprecision(6)
+                             << "[Verbose/Densify] avg_pos_grad=" << densify_avg_pos_grad
+                             << " above_min_grad_ratio=" << densify_above_min
+                             << " min_grad=" << densify_cfg.min_grad_norm
+                             << " accum_steps=" << densify_accum_steps;
+                metric_logger.Log(densify_line.str());
+            }
+
             global_step++;
 
             if (
-                epoch >= warmup_epochs &&
+                epoch >= warmup_epochs && epoch < densify_stop_epoch &&
                 densify_cfg.max_splits > 0 && densify_cfg.every > 0 &&
                 (global_step % densify_cfg.every) == 0)
             {
@@ -1741,22 +2000,23 @@ int run_real_training(int argc, char *argv[])
 
             auto render_view = [&](size_t sample_index,
                                    const TrainSample &sample,
-                                   const CachedSampleData &cached_entry) -> torch::Tensor
+                                   const CachedSampleData &cached_entry) -> RenderViewResult
             {
+                RenderViewResult render_result;
                 torch::NoGradGuard no_grad;
                 if (!cached_entry.valid)
                 {
-                    return torch::Tensor();
+                    return render_result;
                 }
                 if (cached_entry.crop_bgr.empty())
                 {
-                    return torch::Tensor();
+                    return render_result;
                 }
                 const int H = cached_entry.crop_bgr.rows;
                 const int W = cached_entry.crop_bgr.cols;
                 if (H <= 0 || W <= 0)
                 {
-                    return torch::Tensor();
+                    return render_result;
                 }
 
                 SmplResult res;
@@ -1792,10 +2052,52 @@ int run_real_training(int argc, char *argv[])
                 auto pose = pose_base + pose_delta;
                 auto trans = (trans_base + trans_delta).squeeze(0);
 
+                PoseSampleExport pose_export;
+                auto pose_base_cpu = pose_base.detach().to(torch::kCPU).contiguous().view({24, 3});
+                auto pose_delta_cpu = pose_delta.detach().to(torch::kCPU).contiguous().view({24, 3});
+                auto pose_refined_cpu = pose.detach().to(torch::kCPU).contiguous().view({24, 3});
+                auto trans_base_cpu = trans_base.detach().to(torch::kCPU).contiguous().view({3});
+                auto trans_delta_cpu = trans_delta.detach().to(torch::kCPU).contiguous().view({3});
+                auto trans_cpu = trans.detach().to(torch::kCPU).contiguous().view({3});
+
+                const float *pose_base_ptr = pose_base_cpu.data_ptr<float>();
+                const float *pose_delta_ptr = pose_delta_cpu.data_ptr<float>();
+                const float *pose_refined_ptr = pose_refined_cpu.data_ptr<float>();
+                const float *trans_base_ptr = trans_base_cpu.data_ptr<float>();
+                const float *trans_delta_ptr = trans_delta_cpu.data_ptr<float>();
+                const float *trans_ptr = trans_cpu.data_ptr<float>();
+
+                pose_export.original_transl = {trans_base_ptr[0], trans_base_ptr[1], trans_base_ptr[2]};
+                pose_export.delta_transl = {trans_delta_ptr[0], trans_delta_ptr[1], trans_delta_ptr[2]};
+                pose_export.refined_transl = {trans_ptr[0], trans_ptr[1], trans_ptr[2]};
+
+                for (int joint_idx = 0; joint_idx < 24; ++joint_idx)
+                {
+                    const size_t offset = static_cast<size_t>(joint_idx) * 3u;
+                    pose_export.original_pose[joint_idx].rot = {
+                        pose_base_ptr[offset + 0],
+                        pose_base_ptr[offset + 1],
+                        pose_base_ptr[offset + 2]};
+                    pose_export.pose_delta[joint_idx].rot = {
+                        pose_delta_ptr[offset + 0],
+                        pose_delta_ptr[offset + 1],
+                        pose_delta_ptr[offset + 2]};
+                    pose_export.refined_pose[joint_idx].rot = {
+                        pose_refined_ptr[offset + 0],
+                        pose_refined_ptr[offset + 1],
+                        pose_refined_ptr[offset + 2]};
+
+                    pose_export.original_pose[joint_idx].transl = pose_export.original_transl;
+                    pose_export.pose_delta[joint_idx].transl = pose_export.delta_transl;
+                    pose_export.refined_pose[joint_idx].transl = pose_export.refined_transl;
+                }
+                pose_export.valid = true;
+                render_result.pose_export = pose_export;
+
                 if (viewer_stream_poses)
                 {
-                    auto pose_cpu = pose.detach().to(torch::kCPU).contiguous();
-                    const float *pose_ptr = pose_cpu.data_ptr<float>();
+                    auto pose_stream_cpu = pose_refined_cpu.contiguous();
+                    const float *pose_ptr = pose_stream_cpu.data_ptr<float>();
                     std::ostringstream pose_line;
                     pose_line.setf(std::ios::fixed);
                     pose_line << std::setprecision(6);
@@ -1809,10 +2111,9 @@ int run_real_training(int argc, char *argv[])
                     pose_line << "]";
                     std::cout << pose_line.str() << "\n";
 
-                    auto trans_cpu = trans.detach().to(torch::kCPU).contiguous();
-                    const float tx = trans_cpu[0].item<float>();
-                    const float ty = trans_cpu[1].item<float>();
-                    const float tz = trans_cpu[2].item<float>();
+                    const float tx = trans_ptr[0];
+                    const float ty = trans_ptr[1];
+                    const float tz = trans_ptr[2];
                     std::ostringstream trans_line;
                     trans_line.setf(std::ios::fixed);
                     trans_line << std::setprecision(6);
@@ -1880,10 +2181,11 @@ int run_real_training(int argc, char *argv[])
                 if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
                     image.size(1) != H || image.size(2) != W)
                 {
-                    return torch::Tensor();
+                    return render_result;
                 }
 
-                return image.detach();
+                render_result.image = image.detach();
+                return render_result;
             };
 
             if ((epoch + 1) % 10 == 0 || epoch == (epochs - 1))

@@ -44,6 +44,8 @@ struct TrainOptions
     float pose_reg_weight = 0.01f;
     float pose_lr = 5e-3f;
     float alpha_loss_weight = 0.1f;
+    float sh_reg_weight = 5e-5f;
+    float sugar_weight = 1e-3f;
     float lambda_dssim = 0.2f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;
@@ -66,4 +68,6 @@ struct TrainOptions
     std::string viewer_pose_shm_name;
     std::string viewer_bind_shm_name;
     bool viewer_stream_poses = false;
+    bool verbose_diagnostics = false;
+    int verbose_every = 100;
 };
