@@ -1,17 +1,31 @@
 #include "utils/train/ViewerExport.h"
 
+#include "GaussianRasterizer.h"
+#include "utils/render/RenderMathUtils.h"
+
+#if defined(GAUSS_HAS_OPEN3D) && GAUSS_HAS_OPEN3D
+#include <open3d/Open3D.h>
+#include <Eigen/Dense>
+#endif
+
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <vector>
-#include <cstring>
 
 namespace
 {
-std::filesystem::path MakeEpochDir(const std::filesystem::path &root, int epoch)
-{
-    return root / ("epoch_" + std::to_string(epoch));
-}
+    std::filesystem::path MakeEpochDir(const std::filesystem::path &root, int epoch)
+    {
+        return root / ("epoch_" + std::to_string(epoch));
+    }
 }
 
 bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
@@ -117,7 +131,7 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
         buffer[base + 6] = std::clamp(opa_ptr[i], 0.0f, 1.0f);
 
         // --- FIXED: PADDING at Index 7 ---
-        // Some viewers use this for average scale, others skip it. 
+        // Some viewers use this for average scale, others skip it.
         // Filling it with avg scale is safer than 0.0 if a viewer tries to use it.
         buffer[base + 7] = (sca_ptr[pos_base + 0] + sca_ptr[pos_base + 1] + sca_ptr[pos_base + 2]) / 3.0f;
 
@@ -173,7 +187,7 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
         std::cerr << "SaveViewerData: failed to open " << json_path.string() << std::endl;
         return false;
     }
-    
+
     // Writing standard JSON Manifest
     json_file << "{\n";
     json_file << "  \"num_gaussians\": " << count << ",\n";
@@ -217,4 +231,542 @@ bool SaveViewerDataOverwrite(const std::filesystem::path &output_dir,
                              int sh_degree)
 {
     return SaveViewerData(output_dir, 0, positions, colors, opacities, scales, rotations, sh, sh_degree);
+}
+
+bool ExportOrientedPointCloudPly(const std::filesystem::path &path,
+                                 const torch::Tensor &positions,
+                                 const torch::Tensor &rotations,
+                                 const torch::Tensor &scales,
+                                 const torch::Tensor &opacities,
+                                 const torch::Tensor &colors,
+                                 float opacity_threshold,
+                                 int samples_per_gaussian)
+{
+    if (!positions.defined() || !rotations.defined() || !scales.defined() ||
+        !opacities.defined() || !colors.defined())
+    {
+        std::cerr << "ExportOrientedPointCloudPly: missing tensor inputs." << std::endl;
+        return false;
+    }
+    if (positions.dim() != 2 || positions.size(1) != 3)
+    {
+        std::cerr << "ExportOrientedPointCloudPly: positions must be Nx3." << std::endl;
+        return false;
+    }
+    if (rotations.dim() != 2 || rotations.size(1) != 4)
+    {
+        std::cerr << "ExportOrientedPointCloudPly: rotations must be Nx4." << std::endl;
+        return false;
+    }
+    if (scales.dim() != 2 || scales.size(1) != 3)
+    {
+        std::cerr << "ExportOrientedPointCloudPly: scales must be Nx3." << std::endl;
+        return false;
+    }
+    if (opacities.dim() != 2 || opacities.size(1) != 1)
+    {
+        std::cerr << "ExportOrientedPointCloudPly: opacities must be Nx1." << std::endl;
+        return false;
+    }
+    if (colors.dim() != 2 || colors.size(1) != 3)
+    {
+        std::cerr << "ExportOrientedPointCloudPly: colors must be Nx3." << std::endl;
+        return false;
+    }
+
+    const int64_t count = positions.size(0);
+    if (rotations.size(0) != count || scales.size(0) != count ||
+        opacities.size(0) != count || colors.size(0) != count)
+    {
+        std::cerr << "ExportOrientedPointCloudPly: tensor counts do not match." << std::endl;
+        return false;
+    }
+
+    auto pos_cpu = positions.to(torch::kCPU).contiguous();
+    auto rot_cpu = rotations.to(torch::kCPU).contiguous();
+    auto sca_cpu = scales.to(torch::kCPU).contiguous();
+    auto opa_cpu = opacities.to(torch::kCPU).contiguous();
+    auto col_cpu = colors.to(torch::kCPU).contiguous();
+
+    const float *pos_ptr = pos_cpu.data_ptr<float>();
+    const float *rot_ptr = rot_cpu.data_ptr<float>();
+    const float *sca_ptr = sca_cpu.data_ptr<float>();
+    const float *opa_ptr = opa_cpu.data_ptr<float>();
+    const float *col_ptr = col_cpu.data_ptr<float>();
+
+    struct OrientedPoint
+    {
+        float x, y, z;
+        float nx, ny, nz;
+        uint8_t r, g, b;
+    };
+
+    std::vector<OrientedPoint> points;
+    const int sample_count = std::max(0, samples_per_gaussian);
+    points.reserve(static_cast<size_t>(count) * static_cast<size_t>(sample_count + 1));
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    const float threshold = std::clamp(opacity_threshold, 0.0f, 1.0f);
+    for (int64_t i = 0; i < count; ++i)
+    {
+        const float opacity = std::clamp(opa_ptr[i], 0.0f, 1.0f);
+        if (opacity < threshold)
+        {
+            continue;
+        }
+
+        float qw = rot_ptr[i * 4 + 0];
+        float qx = rot_ptr[i * 4 + 1];
+        float qy = rot_ptr[i * 4 + 2];
+        float qz = rot_ptr[i * 4 + 3];
+
+        const float q_norm_sq = qw * qw + qx * qx + qy * qy + qz * qz;
+        if (q_norm_sq > 1e-12f)
+        {
+            const float inv_norm = 1.0f / std::sqrt(q_norm_sq);
+            qw *= inv_norm;
+            qx *= inv_norm;
+            qy *= inv_norm;
+            qz *= inv_norm;
+        }
+
+        float vx_x = 1.0f - 2.0f * (qy * qy + qz * qz);
+        float vx_y = 2.0f * (qx * qy + qw * qz);
+        float vx_z = 2.0f * (qx * qz - qw * qy);
+
+        float vy_x = 2.0f * (qx * qy - qw * qz);
+        float vy_y = 1.0f - 2.0f * (qx * qx + qz * qz);
+        float vy_z = 2.0f * (qy * qz + qw * qx);
+
+        float nz_x = 2.0f * (qx * qz + qw * qy);
+        float nz_y = 2.0f * (qy * qz - qw * qx);
+        float nz_z = 1.0f - 2.0f * (qx * qx + qy * qy);
+
+        const float n_norm_sq = nz_x * nz_x + nz_y * nz_y + nz_z * nz_z;
+        if (n_norm_sq > 1e-12f)
+        {
+            const float inv_n_norm = 1.0f / std::sqrt(n_norm_sq);
+            nz_x *= inv_n_norm;
+            nz_y *= inv_n_norm;
+            nz_z *= inv_n_norm;
+        }
+
+        const size_t base3 = static_cast<size_t>(i) * 3u;
+        const float cx = pos_ptr[base3 + 0];
+        const float cy = pos_ptr[base3 + 1];
+        const float cz = pos_ptr[base3 + 2];
+        const float sx = std::max(0.0f, sca_ptr[base3 + 0]);
+        const float sy = std::max(0.0f, sca_ptr[base3 + 1]);
+
+        OrientedPoint p{};
+        p.x = cx;
+        p.y = cy;
+        p.z = cz;
+        p.nx = nz_x;
+        p.ny = nz_y;
+        p.nz = nz_z;
+        p.r = static_cast<uint8_t>(std::lround(std::clamp(col_ptr[base3 + 0], 0.0f, 1.0f) * 255.0f));
+        p.g = static_cast<uint8_t>(std::lround(std::clamp(col_ptr[base3 + 1], 0.0f, 1.0f) * 255.0f));
+        p.b = static_cast<uint8_t>(std::lround(std::clamp(col_ptr[base3 + 2], 0.0f, 1.0f) * 255.0f));
+        points.push_back(p);
+
+        const float radius_cutoff = 0.8f;
+
+        for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx)
+        {
+            float r = radius_cutoff * std::sqrt(dist(gen));
+            float theta = 2.0f * 3.1415926535f * dist(gen);
+
+            float u = r * std::cos(theta) * sx;
+            float v = r * std::sin(theta) * sy;
+
+            OrientedPoint p_samp = p;
+            p_samp.x = cx + (u * vx_x) + (v * vy_x);
+            p_samp.y = cy + (u * vx_y) + (v * vy_y);
+            p_samp.z = cz + (u * vx_z) + (v * vy_z);
+            points.push_back(p_samp);
+        }
+    }
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open())
+    {
+        std::cerr << "ExportOrientedPointCloudPly: failed to open " << path.string() << std::endl;
+        return false;
+    }
+
+    out << "ply\n";
+    out << "format binary_little_endian 1.0\n";
+    out << "element vertex " << points.size() << "\n";
+    out << "property float x\n";
+    out << "property float y\n";
+    out << "property float z\n";
+    out << "property float nx\n";
+    out << "property float ny\n";
+    out << "property float nz\n";
+    out << "property uchar red\n";
+    out << "property uchar green\n";
+    out << "property uchar blue\n";
+    out << "end_header\n";
+
+    for (const auto &p : points)
+    {
+        out.write(reinterpret_cast<const char *>(&p.x), sizeof(float));
+        out.write(reinterpret_cast<const char *>(&p.y), sizeof(float));
+        out.write(reinterpret_cast<const char *>(&p.z), sizeof(float));
+        out.write(reinterpret_cast<const char *>(&p.nx), sizeof(float));
+        out.write(reinterpret_cast<const char *>(&p.ny), sizeof(float));
+        out.write(reinterpret_cast<const char *>(&p.nz), sizeof(float));
+        out.write(reinterpret_cast<const char *>(&p.r), sizeof(uint8_t));
+        out.write(reinterpret_cast<const char *>(&p.g), sizeof(uint8_t));
+        out.write(reinterpret_cast<const char *>(&p.b), sizeof(uint8_t));
+    }
+
+    if (!out.good())
+    {
+        std::cerr << "ExportOrientedPointCloudPly: failed while writing " << path.string() << std::endl;
+        return false;
+    }
+
+    std::cout << "Exported oriented point cloud to " << path.string()
+              << " with " << points.size() << " points." << std::endl;
+    return true;
+}
+
+bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
+                            const torch::Tensor &means3D,
+                            const torch::Tensor &colors_or_sh,
+                            const torch::Tensor &opacities,
+                            const torch::Tensor &scales,
+                            const torch::Tensor &rotations,
+                            int sh_degree,
+                            int H,
+                            int W,
+                            bool save_debug_frames)
+{
+#if !(defined(GAUSS_HAS_OPEN3D) && GAUSS_HAS_OPEN3D)
+    (void)output_path;
+    (void)means3D;
+    (void)colors_or_sh;
+    (void)opacities;
+    (void)scales;
+    (void)rotations;
+    (void)sh_degree;
+    (void)H;
+    (void)W;
+    (void)save_debug_frames;
+    std::cerr << "ExtractMeshTSDF_Open3D: Open3D support is disabled in this build. "
+                 "Set Open3D_DIR (or CMAKE_PREFIX_PATH) and rebuild to enable TSDF export."
+              << std::endl;
+    return false;
+#else
+    if (!means3D.defined() || means3D.dim() != 2 || means3D.size(1) != 3)
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: means3D must be Nx3." << std::endl;
+        return false;
+    }
+    if (!opacities.defined() || opacities.dim() != 2 || opacities.size(1) != 1)
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: opacities must be Nx1." << std::endl;
+        return false;
+    }
+    if (!scales.defined() || scales.dim() != 2 || scales.size(1) != 3)
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: scales must be Nx3." << std::endl;
+        return false;
+    }
+    if (!rotations.defined() || rotations.dim() != 2 || rotations.size(1) != 4)
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: rotations must be Nx4." << std::endl;
+        return false;
+    }
+    if (H <= 0 || W <= 0)
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: invalid image size." << std::endl;
+        return false;
+    }
+    if (!means3D.is_cuda())
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: means3D must be on CUDA." << std::endl;
+        return false;
+    }
+
+    const int64_t count = means3D.size(0);
+    if (count <= 0 || opacities.size(0) != count || scales.size(0) != count || rotations.size(0) != count)
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: tensor counts do not match." << std::endl;
+        return false;
+    }
+    if (opacities.device() != means3D.device() || scales.device() != means3D.device() ||
+        rotations.device() != means3D.device())
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: all render tensors must share the same device." << std::endl;
+        return false;
+    }
+
+    torch::Tensor colors;
+    torch::Tensor sh;
+    int degree = 0;
+
+    if (colors_or_sh.defined() && colors_or_sh.dim() == 3)
+    {
+        const int64_t expected_coeffs = static_cast<int64_t>((sh_degree + 1) * (sh_degree + 1));
+        if (sh_degree <= 0 || colors_or_sh.size(0) != count || colors_or_sh.size(2) != 3 ||
+            colors_or_sh.size(1) < expected_coeffs)
+        {
+            std::cerr << "ExtractMeshTSDF_Open3D: sh tensor must be Nx((degree+1)^2)x3." << std::endl;
+            return false;
+        }
+        if (colors_or_sh.device() != means3D.device())
+        {
+            std::cerr << "ExtractMeshTSDF_Open3D: sh tensor must be on the same device as means3D." << std::endl;
+            return false;
+        }
+        colors = torch::zeros({0}, colors_or_sh.options().dtype(torch::kFloat32));
+        sh = colors_or_sh.contiguous();
+        degree = sh_degree;
+    }
+    else
+    {
+        if (!colors_or_sh.defined() || colors_or_sh.dim() != 2 || colors_or_sh.size(0) != count || colors_or_sh.size(1) != 3)
+        {
+            std::cerr << "ExtractMeshTSDF_Open3D: colors tensor must be Nx3." << std::endl;
+            return false;
+        }
+        if (colors_or_sh.device() != means3D.device())
+        {
+            std::cerr << "ExtractMeshTSDF_Open3D: colors tensor must be on the same device as means3D." << std::endl;
+            return false;
+        }
+        colors = colors_or_sh.contiguous();
+        sh = torch::zeros({0}, colors_or_sh.options().dtype(torch::kFloat32));
+        degree = 0;
+    }
+
+    torch::NoGradGuard no_grad;
+
+    std::cout << "Starting in-memory TSDF integration..." << std::endl;
+
+    constexpr int kNumCameras = 60;
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr float kFovY = 60.0f * (kPi / 180.0f);
+    constexpr float kDepthScale = 1000.0f;
+    constexpr float kDepthTruncMeters = 4.0f;
+
+    const float focal = (static_cast<float>(H) * 0.5f) / std::tan(kFovY * 0.5f);
+    const torch::Device device = means3D.device();
+    auto float_opts = means3D.options().dtype(torch::kFloat32);
+ 
+
+    open3d::pipelines::integration::ScalableTSDFVolume volume(
+        0.005,
+        0.02,
+        open3d::pipelines::integration::TSDFVolumeColorType::RGB8);
+ 
+
+    std::filesystem::path debug_dir;
+    if (save_debug_frames)
+    {
+        debug_dir = output_path.parent_path() / "tsdf_views";
+        std::error_code debug_ec;
+        std::filesystem::create_directories(debug_dir, debug_ec);
+        if (debug_ec)
+        {
+            std::cerr << "ExtractMeshTSDF_Open3D: failed to create debug frame directory: "
+                      << debug_dir.string() << std::endl;
+            return false;
+        }
+    }
+
+    // 1. Perspective Constants (Match Viewer Exactly)
+    const float fovy_deg = 45.0f; // Viewer uses 45 degrees
+    const float aspect = static_cast<float>(W) / static_cast<float>(H);
+    const float fovy_rad = fovy_deg * kPi / 180.0f;
+    const float tan_fovy = std::tan(fovy_rad * 0.5f);
+    const float tan_fovx = tan_fovy * aspect;
+    const float zNear = 0.01f;
+    const float zFar = 100.0f;
+
+    // OpenGL Perspective Matrix
+    auto proj_cpu = torch::zeros({4, 4}, float_opts);
+    proj_cpu.index_put_({0, 0}, 1.0f / (aspect * tan_fovy));
+    proj_cpu.index_put_({1, 1}, 1.0f / tan_fovy);
+    proj_cpu.index_put_({2, 2}, -(zFar + zNear) / (zFar - zNear));
+    proj_cpu.index_put_({2, 3}, -(2.0f * zFar * zNear) / (zFar - zNear));
+    proj_cpu.index_put_({3, 2}, -1.0f);
+    auto proj_ten_t = proj_cpu.transpose(0, 1).contiguous().to(device);
+
+    // 2. Center and Radius (Match Viewer's Bounds)
+    auto pos_cpu = means3D.detach().to(torch::kCPU).contiguous();
+    const float *p_ptr = pos_cpu.data_ptr<float>();
+    const int64_t num_pts = means3D.size(0);
+    Eigen::Vector3f min_b(p_ptr[0], p_ptr[1], p_ptr[2]);
+    Eigen::Vector3f max_b(p_ptr[0], p_ptr[1], p_ptr[2]);
+    for (int64_t idx = 0; idx < num_pts; idx += 10)
+    {
+        min_b.x() = std::min(min_b.x(), p_ptr[idx * 3 + 0]);
+        min_b.y() = std::min(min_b.y(), p_ptr[idx * 3 + 1]);
+        min_b.z() = std::min(min_b.z(), p_ptr[idx * 3 + 2]);
+        max_b.x() = std::max(max_b.x(), p_ptr[idx * 3 + 0]);
+        max_b.y() = std::max(max_b.y(), p_ptr[idx * 3 + 1]);
+        max_b.z() = std::max(max_b.z(), p_ptr[idx * 3 + 2]);
+    }
+    const Eigen::Vector3f center = (min_b + max_b) * 0.5f;
+    const Eigen::Vector3f extents = (max_b - min_b) * 0.5f;
+    const float radius = std::max({extents.x(), extents.y(), extents.z(), 0.1f});
+    const float cam_dist = radius * 3.0f;
+
+    // Open3D Camera Intrinsic (needs focal length in pixels)
+    const float focal_y = (static_cast<float>(H) * 0.5f) / tan_fovy;
+    const float focal_x = (static_cast<float>(W) * 0.5f) / tan_fovx;
+    open3d::camera::PinholeCameraIntrinsic intrinsic(
+        W, H, focal_x, focal_y, static_cast<double>(W) * 0.5, static_cast<double>(H) * 0.5);
+
+    // Safeguard colors/SH tensors for the PyTorch Wrapper
+    auto render_colors = (colors_or_sh.dim() == 2) ? colors_or_sh : torch::zeros({0}, float_opts.device(device));
+    auto render_sh = (colors_or_sh.dim() == 3) ? colors_or_sh : torch::zeros({0}, float_opts.device(device));
+
+    for (int i = 0; i < kNumCameras; ++i)
+    {
+        float angle = (static_cast<float>(i) / static_cast<float>(kNumCameras)) * 2.0f * kPi;
+
+        // 3. Quat Rotation Orbit (Match Viewer exactly)
+        Eigen::AngleAxisf q_model(angle, Eigen::Vector3f::UnitY());
+        Eigen::Matrix3f R = q_model.toRotationMatrix();
+        Eigen::Vector3f view_trans = Eigen::Vector3f(0.0f, 0.0f, cam_dist) - R * center;
+
+        auto view_cpu = torch::eye(4, float_opts);
+        view_cpu.index_put_({0, 0}, R(0, 0));
+        view_cpu.index_put_({0, 1}, R(0, 1));
+        view_cpu.index_put_({0, 2}, R(0, 2));
+        view_cpu.index_put_({0, 3}, view_trans.x());
+        view_cpu.index_put_({1, 0}, R(1, 0));
+        view_cpu.index_put_({1, 1}, R(1, 1));
+        view_cpu.index_put_({1, 2}, R(1, 2));
+        view_cpu.index_put_({1, 3}, view_trans.y());
+        view_cpu.index_put_({2, 0}, R(2, 0));
+        view_cpu.index_put_({2, 1}, R(2, 1));
+        view_cpu.index_put_({2, 2}, R(2, 2));
+        view_cpu.index_put_({2, 3}, view_trans.z());
+
+        auto view_ten = view_cpu.transpose(0, 1).contiguous().to(device);
+
+        // Viewer's Magic X-Axis Flip
+        using namespace torch::indexing;
+        view_ten.index_put_({Slice(), 0}, view_ten.index({Slice(), 0}) * -1.0f);
+
+        auto proj_t = torch::matmul(view_ten, proj_ten_t).contiguous();
+
+        Eigen::Vector3f cam_pos_eigen = -R.transpose() * view_trans;
+        auto campos = torch::tensor({cam_pos_eigen.x(), cam_pos_eigen.y(), cam_pos_eigen.z()}, float_opts.device(device));
+
+        // 4. Use GaussianRasterizer::apply directly!
+        auto outputs = GaussianRasterizer::apply(
+            means3D,
+            render_colors,
+            opacities,
+            scales,
+            rotations,
+            1.0f, // scale_modifier
+            view_ten,
+            proj_t,
+            tan_fovx,
+            tan_fovy,
+            H, W,
+            render_sh,
+            0, // sh_degree forced to 0
+            campos,
+            false);
+
+        auto out_color = outputs[0];
+        auto out_depth = outputs[2];
+        auto out_alpha = outputs[1];
+
+        auto rgb_u8 = out_color.detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kUInt8).permute({1, 2, 0}).contiguous().to(torch::kCPU);
+
+        auto depth_meters = out_depth.detach() / torch::clamp_min(out_alpha.detach(), 1e-6f);
+        depth_meters = torch::abs(depth_meters);
+        depth_meters = torch::where(out_alpha.detach() > 1e-4f, depth_meters, torch::zeros_like(depth_meters));
+        depth_meters = torch::clamp(depth_meters, 0.0f, kDepthTruncMeters);
+        auto depth_u16 = (depth_meters.squeeze(0) * kDepthScale).to(torch::kUInt16).contiguous().to(torch::kCPU);
+
+        // 5. Flip horizontally to undo the rasterizer's X-Flip
+        cv::Mat rgb_mat(H, W, CV_8UC3, rgb_u8.data_ptr<uint8_t>());
+        cv::Mat depth_mat(H, W, CV_16UC1, depth_u16.data_ptr<uint16_t>());
+        cv::flip(rgb_mat, rgb_mat, 1);
+        cv::flip(depth_mat, depth_mat, 1);
+
+        if (save_debug_frames)
+        {
+            cv::Mat bgr;
+            cv::cvtColor(rgb_mat, bgr, cv::COLOR_RGB2BGR);
+            const auto rgb_path = (debug_dir / ("rgb_" + std::to_string(i) + ".png")).string();
+            const auto depth_path = (debug_dir / ("depth_" + std::to_string(i) + ".png")).string();
+            cv::imwrite(rgb_path, bgr);
+            cv::imwrite(depth_path, depth_mat);
+        }
+
+        open3d::geometry::Image o3d_color;
+        o3d_color.Prepare(W, H, 3, 1);
+        std::memcpy(o3d_color.data_.data(), rgb_mat.data, o3d_color.data_.size());
+
+        open3d::geometry::Image o3d_depth;
+        o3d_depth.Prepare(W, H, 1, 2);
+        std::memcpy(o3d_depth.data_.data(), depth_mat.data, o3d_depth.data_.size());
+
+        auto rgbd = open3d::geometry::RGBDImage::CreateFromColorAndDepth(
+            o3d_color, o3d_depth, kDepthScale, kDepthTruncMeters, false);
+
+        // 6. Extrinsic for Open3D (World-to-Camera, OpenCV coordinate system)
+        Eigen::Matrix4d extrinsic = Eigen::Matrix4d::Identity();
+        for (int r = 0; r < 4; ++r)
+        {
+            for (int c = 0; c < 4; ++c)
+            {
+                extrinsic(r, c) = view_cpu.index({r, c}).item<float>();
+            }
+        }
+        extrinsic.row(1) *= -1.0; // OpenGL Up to OpenCV Down
+        extrinsic.row(2) *= -1.0; // OpenGL Back to OpenCV Forward
+
+        volume.Integrate(*rgbd, intrinsic, extrinsic);
+
+        if (i % 10 == 0)
+            std::cout << "Integrated frame " << i << "/" << kNumCameras << std::endl;
+    }
+
+    std::cout << "Extracting triangle mesh via Marching Cubes..." << std::endl;
+    auto mesh = volume.ExtractTriangleMesh();
+    if (!mesh || mesh->vertices_.empty())
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: failed to extract mesh (empty volume)." << std::endl;
+        return false;
+    }
+
+    mesh->ComputeVertexNormals();
+
+    std::error_code ec;
+    const auto out_parent = output_path.parent_path();
+    if (!out_parent.empty())
+    {
+        std::filesystem::create_directories(out_parent, ec);
+    }
+    if (ec)
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: failed to create output directory: "
+                  << out_parent.string() << std::endl;
+        return false;
+    }
+
+    if (!open3d::io::WriteTriangleMesh(output_path.string(), *mesh))
+    {
+        std::cerr << "ExtractMeshTSDF_Open3D: failed to write mesh: " << output_path.string() << std::endl;
+        return false;
+    }
+
+    std::cout << "Saved TSDF mesh to " << output_path.string() << std::endl;
+    return true;
+#endif
 }

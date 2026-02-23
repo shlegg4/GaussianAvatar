@@ -6,6 +6,13 @@ project(smpl_lbs_test LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
+if(MSVC)
+    # Only apply the /utf-8 flag to C++ files, NOT CUDA files
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+    
+    # If NVCC also needs it, it must be wrapped in -Xcompiler
+    add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+endif()
 
 # --- CONFIGURATION START ---
 # SET THIS: Path to your TensorRT install folder
@@ -16,6 +23,8 @@ set(CUDA_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8")
 set(ONNX_MODEL_FILE "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx")
 # SET THIS: Path to your ONNX Runtime install folder
 set(ONNXRUNTIME_ROOT "C:/onnxruntime-win-x64-gpu-1.23.2" )
+
+set(Open3D_DIR "C:/open3d/CMake")
 # --- CONFIGURATION END ---
 
 # ==========================================
@@ -30,6 +39,17 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 # ==========================================
 set(OpenCV_DIR "C:/opencv/build")
 find_package(OpenCV REQUIRED)
+
+option(ENABLE_OPEN3D_TSDF "Enable Open3D-based TSDF mesh extraction" ON)
+if(ENABLE_OPEN3D_TSDF)
+    find_package(Open3D QUIET)
+    if(Open3D_FOUND)
+        message(STATUS "Open3D found: ${Open3D_DIR}")
+    else()
+        message(WARNING "Open3D not found. TSDF mesh extraction will be disabled. "
+                        "Set Open3D_DIR or CMAKE_PREFIX_PATH to your Open3D install.")
+    endif()
+endif()
 
 option(ENABLE_VIEWER "Build GLFW viewer support" ON)
 if(ENABLE_VIEWER)
@@ -102,6 +122,12 @@ target_link_libraries(smpl_test
     GaussianRasterizer
     ${OpenCV_LIBS}
 )
+if(ENABLE_OPEN3D_TSDF AND Open3D_FOUND)
+    target_link_libraries(smpl_test PRIVATE Open3D::Open3D)
+    target_compile_definitions(smpl_test PRIVATE GAUSS_HAS_OPEN3D=1)
+else()
+    target_compile_definitions(smpl_test PRIVATE GAUSS_HAS_OPEN3D=0)
+endif()
 target_include_directories(smpl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(ENABLE_VIEWER)
     target_compile_definitions(smpl_test PRIVATE GAUSS_VIEWER)
@@ -217,6 +243,15 @@ else()
     )
 endif()
 
+
+if(ENABLE_OPEN3D_TSDF AND Open3D_FOUND)
+    add_custom_command(TARGET smpl_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "C:/open3d/bin/Open3D.dll"  # Update this if your path is different
+        $<TARGET_FILE_DIR:smpl_test>
+    )
+endif()
+
 # ==========================================
 # FILE COPYING
 # ==========================================
@@ -233,3 +268,4 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/${ONNX_MODEL_FILE}")
 else()
     message(WARNING "Could not find ${ONNX_MODEL_FILE} in source directory. You will need to copy it manually.")
 endif()
+

@@ -51,6 +51,8 @@ struct TrainOptions
     float lambda_dssim = 0.2f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;
+    float psr_opacity_threshold = 0.3f;
+    int psr_samples_per_gaussian = 8;
     int sh_degree = 3;
     int densify_every = 500;
     int densify_max_splits = 64;

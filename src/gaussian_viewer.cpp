@@ -414,11 +414,13 @@ int main(int argc, char **argv)
             view_ten.index_put_({Slice(), 0}, view_ten.index({Slice(), 0}) * -1.0f);
 
             torch::Tensor proj_t = torch::matmul(view_ten, proj_ten_t).contiguous();
-            
+
             Vec3 cam_pos_v = CameraPosFromView(view_mat);
             auto cam_pos = torch::tensor({cam_pos_v.x, cam_pos_v.y, cam_pos_v.z}, device);
 
             float scale_final = render_scale_modifier * options.point_size;
+
+            std::cout << "CAMPOS, full_proj_mat, view_mat, tan_fovx, tan_fovy: " << cam_pos << ", " << proj_t.sizes() << ", " << view_ten.sizes() << ", " << tan_fovx << ", " << tan_fovy << std::endl;
 
             auto outputs = GaussianRasterizer::apply(
                 means3D, colors, opacities, scales, rotations,

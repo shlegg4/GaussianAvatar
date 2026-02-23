@@ -129,6 +129,10 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->color_lr = std::stof(value);
             else if (key == "--opacity-lr")
                 options->opacity_lr = std::stof(value);
+            else if (key == "--psr-opacity-threshold")
+                options->psr_opacity_threshold = std::stof(value);
+            else if (key == "--psr-samples-per-gaussian")
+                options->psr_samples_per_gaussian = std::stoi(value);
             else if (key == "--sh-degree")
                 options->sh_degree = std::stoi(value);
             else if (key == "--densify-every")
@@ -204,6 +208,16 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
     if (options->sh_degree < 0 || options->sh_degree > 3)
     {
         std::cerr << "Invalid --sh-degree (supported: 0-3)." << std::endl;
+        return false;
+    }
+    if (options->psr_opacity_threshold < 0.0f || options->psr_opacity_threshold > 1.0f)
+    {
+        std::cerr << "Invalid --psr-opacity-threshold (supported: 0.0-1.0)." << std::endl;
+        return false;
+    }
+    if (options->psr_samples_per_gaussian < 0)
+    {
+        std::cerr << "Invalid --psr-samples-per-gaussian (must be >= 0)." << std::endl;
         return false;
     }
     return true;
@@ -1162,15 +1176,10 @@ public:
 
         // 1. Flattening Loss (Force the local Z-axis scale to be very thin) 
         auto z_scales = current_scales.index({Slice(), 2});
-        auto flatten_loss = z_scales.pow(2).mean();
-
-        // 2. Alignment Loss (Force the Gaussian orientation to match the face normal)
-        auto rot_x = avatar_.g_rots.index({Slice(), 1});
-        auto rot_y = avatar_.g_rots.index({Slice(), 2});
-        auto align_loss = rot_x.pow(2).mean() + rot_y.pow(2).mean();
+        auto flatten_loss = z_scales.pow(2).mean(); 
 
         // Combine for total SuGaR regularization
-        auto sugar_loss = flatten_loss + align_loss;
+        auto sugar_loss = flatten_loss;
 
         auto clamped_opacities = torch::clamp(avatar_.g_opacities, 0.0f, 1.0f);
         auto opacity_binarization_loss = (clamped_opacities * (1.0f - clamped_opacities)).mean();
@@ -1375,6 +1384,8 @@ int run_real_training(int argc, char *argv[])
                      " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>] [--opacity-reg <float>]"
                      " [--lambda-dssim <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
+                     " [--psr-opacity-threshold <float>]"
+                     " [--psr-samples-per-gaussian <int>]"
                      " [--sh-degree <int>]"
                      " [--densify-every <int>] [--densify-max <int>] [--densify-max-clones <int>]"
                      " [--densify-scale <float>]"
@@ -1423,6 +1434,8 @@ int run_real_training(int argc, char *argv[])
     const float pose_lr = options.pose_lr;
     const float color_lr = options.color_lr;
     const float opacity_lr = (options.opacity_lr < 0.0f) ? lr : options.opacity_lr;
+    const float psr_opacity_threshold = options.psr_opacity_threshold;
+    const int psr_samples_per_gaussian = options.psr_samples_per_gaussian;
     const int sh_degree = options.sh_degree;
     const int viewer_every = std::max(1, options.viewer_every);
     const bool viewer_stream_poses = options.viewer_stream_poses;
@@ -1757,7 +1770,7 @@ int run_real_training(int argc, char *argv[])
         {
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(0.0f);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(0.0f);
-            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(0.0f);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * pose_lr_multiplier);
@@ -2312,6 +2325,59 @@ int run_real_training(int argc, char *argv[])
                 const int saved_pairs = SaveEpochViewPairs(samples, cached, out_dir_path, epoch, render_view);
                 std::cout << "Epoch " << epoch << " saved " << saved_pairs << " view pairs." << std::endl;
             }
+        }
+    }
+
+    {
+        torch::NoGradGuard no_grad;
+        torch::Tensor positions, rotations, scales, colors;
+        std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
+        scales = capped_scales(avatar.g_scales);
+        if (use_sh)
+        {
+            using torch::indexing::Slice;
+            colors = avatar.g_sh.index({Slice(), 0, Slice()});
+        }
+        else
+        {
+            colors = avatar.g_colors;
+        }
+
+        const auto oriented_ply_path = out_dir_path / "canonical_oriented_points.ply";
+        if (!ExportOrientedPointCloudPly(oriented_ply_path,
+                                         positions,
+                                         rotations,
+                                         scales,
+                                         avatar.g_opacities,
+                                         colors,
+                                         psr_opacity_threshold,
+                                         psr_samples_per_gaussian))
+        {
+            std::cerr << "Warning: failed to export oriented point cloud for PSR." << std::endl;
+        }
+
+        torch::Tensor tsdf_colors_or_sh;
+        int tsdf_sh_degree = 0;
+        if (use_sh && sh_degree > 0)
+        {
+            tsdf_colors_or_sh = RotateSH(avatar.g_sh, rotations);
+            tsdf_sh_degree = sh_degree;
+        }
+        else
+        {
+            tsdf_colors_or_sh = colors;
+        }
+
+        const auto tsdf_obj_path = out_dir_path / "avatar_tsdf.obj";
+        if (!ExtractMeshTSDF_Open3D(tsdf_obj_path,
+                                    positions,
+                                    tsdf_colors_or_sh,
+                                    avatar.g_opacities,
+                                    scales,
+                                    rotations,
+                                    tsdf_sh_degree))
+        {
+            std::cerr << "Warning: failed to extract TSDF mesh." << std::endl;
         }
     }
     return 0;

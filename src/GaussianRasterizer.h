@@ -115,7 +115,7 @@ public:
         ctx->saved_data["debug"] = debug;
         ctx->saved_data["R"] = num_rendered;
 
-        return {out_color, out_alpha};
+        return {out_color, out_alpha, out_depth};
     }
 
     static torch::autograd::variable_list backward(torch::autograd::AutogradContext *ctx, torch::autograd::variable_list grad_outputs) {
