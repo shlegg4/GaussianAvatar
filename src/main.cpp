@@ -809,6 +809,11 @@ struct TrainStepResult
     torch::Tensor scale_cap_hit_ratio;
     torch::Tensor opacity_low_ratio;
     torch::Tensor opacity_high_ratio;
+    torch::Tensor std_rot;
+    torch::Tensor std_offset;
+    torch::Tensor std_scale;
+    torch::Tensor std_color;
+    torch::Tensor std_opacity;
 };
 
 class GaussianTrainer
@@ -1218,6 +1223,13 @@ public:
             result.grad_color_norm = grad_norm_from_param(use_sh_ ? avatar_.g_sh : avatar_.g_colors);
             result.grad_opacity_norm = grad_norm_from_param(avatar_.g_opacities);
 
+            const auto color_param = use_sh_ ? avatar_.g_sh : avatar_.g_colors;
+            result.std_rot = avatar_.g_rots.detach().std();
+            result.std_offset = avatar_.g_offsets.detach().std();
+            result.std_scale = avatar_.g_scales.detach().std();
+            result.std_color = color_param.defined() ? color_param.detach().std() : torch::Tensor();
+            result.std_opacity = avatar_.g_opacities.detach().std();
+
             torch::Tensor pose_grad_sq = torch::zeros({1}, avatar_.g_offsets.options());
             bool has_pose_grad = false;
             for (const auto &param : pose_refiner_.parameters())
@@ -1587,7 +1599,7 @@ int run_real_training(int argc, char *argv[])
     const int densify_stop_epoch = options.densify_stop_epoch;
     DensificationState densify_state;
     int64_t global_step = 0;
-    const int warmup_epochs = 10;
+    const int warmup_epochs = 20;
 
     std::vector<torch::Tensor> rot_params = {avatar.g_rots};
     std::vector<torch::Tensor> offset_params = {avatar.g_offsets};
@@ -1616,12 +1628,7 @@ int run_real_training(int argc, char *argv[])
 
     auto apply_lr_multiplier = [&](float pose_multiplier)
     {
-        pose_lr_multiplier = pose_multiplier;
-        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(rot_lr * lr_multiplier);
-        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(offset_lr * lr_multiplier);
-        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
-        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
-        // static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
+        pose_lr_multiplier = pose_multiplier; 
         static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * pose_lr_multiplier);
     };
 
@@ -1831,6 +1838,11 @@ int run_real_training(int argc, char *argv[])
                 const float grad_color = tensor_to_float(step_result.grad_color_norm);
                 const float grad_opacity = tensor_to_float(step_result.grad_opacity_norm);
                 const float grad_pose = tensor_to_float(step_result.grad_pose_norm);
+                const float std_rot = tensor_to_float(step_result.std_rot);
+                const float std_offset = tensor_to_float(step_result.std_offset);
+                const float std_scale = tensor_to_float(step_result.std_scale);
+                const float std_color = tensor_to_float(step_result.std_color);
+                const float std_opacity = tensor_to_float(step_result.std_opacity);
 
                 const float scale_mean_val = tensor_to_float(step_result.scale_mean);
                 const float scale_min_val = tensor_to_float(step_result.scale_min);
@@ -1882,6 +1894,16 @@ int run_real_training(int argc, char *argv[])
                           << " opacity=" << grad_opacity
                           << " pose_mlp=" << grad_pose;
                 metric_logger.Log(grad_line.str());
+
+                std::ostringstream std_line;
+                std_line.setf(std::ios::fixed);
+                std_line << std::setprecision(6)
+                         << "[Verbose/Std] rot=" << std_rot
+                         << " offset=" << std_offset
+                         << " scale=" << std_scale
+                         << " color=" << std_color
+                         << " opacity=" << std_opacity;
+                metric_logger.Log(std_line.str());
 
                 std::ostringstream clamp_line;
                 clamp_line.setf(std::ios::fixed);
@@ -2052,11 +2074,8 @@ int run_real_training(int argc, char *argv[])
             }
 
             // 3. Save to Disk (Every epoch, Overwrite)
-            {
-                // Use viewer_export_dir if provided, otherwise default to output_dir
-                std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path;
-
-                // Overwrite a constant epoch index on each save.
+            { 
+                std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path; 
                 SaveViewerDataOverwrite(save_dir, positions, colors, opacities, scales, rotations,
                                         sh_to_send, sh_degree);
             }

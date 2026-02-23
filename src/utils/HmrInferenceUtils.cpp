@@ -736,8 +736,8 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                         }
                     }
 
-                    const int target_w = 1024;
-                    const int target_h = 1024;
+                    const int target_w = std::max(1, options.output_res);
+                    const int target_h = target_w;
                     const float full_cx = static_cast<float>(base_frame.cols) * 0.5f;
                     const float full_cy = static_cast<float>(base_frame.rows) * 0.5f;
                     const float scale_w = static_cast<float>(target_w) / static_cast<float>(crop_img.cols);

@@ -29,6 +29,7 @@ struct HmrOutputOptions {
     float yolo_crop_scale = 1.2f;
     float focal_length_scale = 1.2f;
     int frame_stride = 1;
+    int output_res = 1024;
     bool smplify_requires_yolo = false;
     bool use_modnet = false;
     std::string modnet_model_path = "modnet.onnx";

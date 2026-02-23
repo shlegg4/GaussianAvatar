@@ -20,6 +20,7 @@ void PrintUsage() {
         << "  --rtmpose-cuda                  Enable CUDA for RTMPose (if available)\n"
         << "  --focal-scale <float>           Focal length scale (default 1.2)\n"
         << "  --frame-stride <int>            Process every Nth frame (default 1)\n"
+        << "  --output-res <int>              Output crop resolution (default 1024)\n"
         << "  --smplify-requires-yolo         Only run Smplify when YOLO detects a person\n"
         << "  --texture-iters <int>           Opt iterations (default 30)\n"
         << "  --texture-batch <int>           Opt batch size (default 30)\n"
@@ -118,6 +119,15 @@ int main(int argc, char* argv[]) {
             }
             continue;
         }
+        if (arg == "--output-res" && i + 1 < argc) {
+            try {
+                options.output_res = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                std::cerr << "Invalid output-res value." << std::endl;
+                return -1;
+            }
+            continue;
+        }
         if (arg == "--smplify-requires-yolo") {
             options.smplify_requires_yolo = true;
             continue;
@@ -175,6 +185,10 @@ int main(int argc, char* argv[]) {
     if (options.frame_stride < 1) {
         std::cerr << "frame-stride must be >= 1. Using 1." << std::endl;
         options.frame_stride = 1;
+    }
+    if (options.output_res < 1) {
+        std::cerr << "output-res must be >= 1. Using 1024." << std::endl;
+        options.output_res = 1024;
     }
     if (options.save_outputs && options.output_dir.empty()) {
         std::cerr << "Output saving requested but no output dir set." << std::endl;
