@@ -28,6 +28,7 @@ struct TrainOptions
     std::string jsonl_path;
     std::string smpl_model_path = "smpl_data.pt";
     int num_gaussians = 5000;
+    int max_gaussians = -1;
     int epochs = 1;
     float lr = 0.01f;
     int lr_decay_epoch = -1;
@@ -44,6 +45,7 @@ struct TrainOptions
     float pose_reg_weight = 0.01f;
     float pose_lr = 5e-3f;
     float alpha_loss_weight = 0.1f;
+    float opacity_reg_weight = 0.0f;
     float sh_reg_weight = 5e-5f;
     float sugar_weight = 1e-3f;
     float lambda_dssim = 0.2f;

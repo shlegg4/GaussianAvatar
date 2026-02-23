@@ -81,6 +81,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->smpl_model_path = value;
             else if (key == "--num-gaussians")
                 options->num_gaussians = std::stoi(value);
+            else if (key == "--max-gaussians" || key == "--viewer-max-gaussians")
+                options->max_gaussians = std::stoi(value);
             else if (key == "--epochs")
                 options->epochs = std::stoi(value);
             else if (key == "--lr")
@@ -119,6 +121,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->pose_lr = std::stof(value);
             else if (key == "--alpha-loss")
                 options->alpha_loss_weight = std::stof(value);
+            else if (key == "--opacity-reg" || key == "--opacity-reg-weight")
+                options->opacity_reg_weight = std::stof(value);
             else if (key == "--lambda-dssim")
                 options->lambda_dssim = std::stof(value);
             else if (key == "--color-lr")
@@ -792,6 +796,7 @@ struct TrainStepResult
     torch::Tensor scale_reg;
     torch::Tensor sh_reg_loss;
     torch::Tensor sugar_reg;
+    torch::Tensor opacity_reg;
     torch::Tensor grad_rot_norm;
     torch::Tensor grad_offset_norm;
     torch::Tensor grad_scale_norm;
@@ -829,7 +834,9 @@ public:
                     float offset_reg_weight,
                     float scale_reg_weight,
                     float sh_reg_weight,
-                    float sugar_weight)
+                    float sugar_weight,
+                    float opacity_reg_weight,
+                    int opacity_reg_start_epoch)
         : avatar_(avatar),
           pose_refiner_(pose_refiner),
           optimizer_(optimizer),
@@ -850,7 +857,9 @@ public:
           offset_reg_weight_(offset_reg_weight),
           scale_reg_weight_(scale_reg_weight),
           sh_reg_weight_(sh_reg_weight),
-          sugar_weight_(sugar_weight)
+          sugar_weight_(sugar_weight),
+          opacity_reg_weight_(opacity_reg_weight),
+          opacity_reg_start_epoch_(opacity_reg_start_epoch)
     {
     }
 
@@ -1061,7 +1070,13 @@ public:
         auto b_alphas = torch::stack(alphas_list);
         auto b_valids = torch::cat(valids_list).to(b_images.options().dtype());
 
-        auto diff = torch::abs(b_images - b_targets) * b_masks;
+        const int64_t B = b_images.size(0);
+         
+        auto bg_color = torch::rand({B, 3, 1, 1}, b_images.options()); 
+        auto comp_images = b_images + bg_color * (1.0f - b_alphas); 
+        auto comp_targets = (b_targets * b_masks) + bg_color * (1.0f - b_masks);
+
+        auto diff = torch::abs(comp_images - comp_targets);
         auto recon_losses = diff.sum({1, 2, 3}) /
                             torch::clamp_min(b_masks.sum({1, 2, 3}) * 3.0f, 1e-6f);
         auto outside_losses = (b_images * (1.0f - b_masks)).mean({1, 2, 3});
@@ -1122,6 +1137,11 @@ public:
         // Combine for total SuGaR regularization
         auto sugar_loss = flatten_loss + align_loss;
 
+        auto clamped_opacities = torch::clamp(avatar_.g_opacities, 0.0f, 1.0f);
+        auto opacity_binarization_loss = (clamped_opacities * (1.0f - clamped_opacities)).mean();
+        const float opacity_reg_scale = (epoch >= opacity_reg_start_epoch_) ? 1.0f : 0.0f;
+        auto opacity_reg_loss = opacity_binarization_loss * opacity_reg_scale;
+
         torch::Tensor sh_reg_loss = torch::zeros({1}, avatar_.g_sh.options());
         if (use_sh_ && avatar_.g_sh.defined() && avatar_.g_sh.size(1) > 1)
         {
@@ -1141,6 +1161,7 @@ public:
                     scale_reg_weight_ * scale_reg +
                     sh_reg_weight_ * sh_reg_loss +
                     sugar_weight_ * sugar_loss +
+                    opacity_reg_weight_ * opacity_reg_loss +
                     10000.0f * cap_penalty;
 
         if (capture_verbose_metrics)
@@ -1154,6 +1175,7 @@ public:
             result.scale_reg = scale_reg.detach();
             result.sh_reg_loss = sh_reg_loss.detach();
             result.sugar_reg = sugar_loss.detach();
+            result.opacity_reg = opacity_reg_loss.detach();
             result.scale_mean = current_scales.mean().detach();
             result.scale_min = current_scales.min().detach();
             result.scale_max = current_scales.max().detach();
@@ -1279,6 +1301,8 @@ private:
     float scale_reg_weight_ = 0.0f;
     float sh_reg_weight_ = 0.0f;
     float sugar_weight_ = 0.0f;
+    float opacity_reg_weight_ = 0.0f;
+    int opacity_reg_start_epoch_ = 0;
     bool graph_captured_ = false;
     int64_t captured_gaussians_ = -1;
 #if GAUSS_HAS_CUDA_GRAPH
@@ -1296,13 +1320,14 @@ int run_real_training(int argc, char *argv[])
     if (argc < 2)
     {
         std::cout << "Usage: gaussian_train --jsonl <path> [--smpl <path>] [--num-gaussians <int>]"
+                     " [--max-gaussians <int>]"
                      " [--epochs <int>] [--lr <float>] [--output-dir <path>]"
                      " [--lr-decay-epoch <int>] [--lr-decay-multiplier <float>]"
                      " [--lr-min-multiplier <float>]"
                      " [--train-dir <path>] [--viewer-export-dir <path>]"
                      " [--scale-reg <float>] [--sh-reg <float>] [--sugar-weight <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
-                     " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>]"
+                     " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>] [--opacity-reg <float>]"
                      " [--lambda-dssim <float>]"
                      " [--color-lr <float>] [--opacity-lr <float>]"
                      " [--sh-degree <int>]"
@@ -1333,6 +1358,7 @@ int run_real_training(int argc, char *argv[])
     const std::string &jsonl_path = options.jsonl_path;
     const std::string &smpl_model_path = options.smpl_model_path;
     const int num_gaussians = options.num_gaussians;
+    const int max_gaussians = options.max_gaussians;
     const int epochs = options.epochs;
     const float lr = options.lr;
     const int lr_decay_epoch = options.lr_decay_epoch;
@@ -1360,6 +1386,7 @@ int run_real_training(int argc, char *argv[])
     const int densify_every = std::max(1, options.densify_every);
     const float outside_mask_weight = 0.1f;
     const float alpha_loss_weight = options.alpha_loss_weight;
+    const float opacity_reg_weight = options.opacity_reg_weight;
     const float lambda_dssim = options.lambda_dssim;
     const float render_scale_modifier = 1.0f;
     const float render_threshold = 3.0f / 255.0f;
@@ -1496,6 +1523,19 @@ int run_real_training(int argc, char *argv[])
 
     const uint32_t shared_stride = shared_gaussian::kSharedStrideFloats + 7u +
                                    (use_sh ? static_cast<uint32_t>((sh_degree + 1) * (sh_degree + 1) * 3) : 0u);
+    const int64_t max_u32 = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+    int64_t requested_viewer_capacity = (max_gaussians > 0)
+                                            ? static_cast<int64_t>(max_gaussians)
+                                            : (static_cast<int64_t>(num_gaussians) * 3);
+    if (max_gaussians > 0 && max_gaussians < num_gaussians)
+    {
+        std::cerr << "Warning: --max-gaussians (" << max_gaussians
+                  << ") is smaller than --num-gaussians (" << num_gaussians
+                  << "); clamping to start count." << std::endl;
+    }
+    requested_viewer_capacity = std::max<int64_t>(requested_viewer_capacity, static_cast<int64_t>(num_gaussians));
+    requested_viewer_capacity = std::min<int64_t>(requested_viewer_capacity, max_u32);
+    const uint32_t viewer_capacity = static_cast<uint32_t>(requested_viewer_capacity);
     shared_gaussian::SharedGaussianWriter shared_writer;
     bool publish_viewer = options.enable_viewer;
     const std::string bind_shm_name = options.viewer_bind_shm_name.empty()
@@ -1504,7 +1544,7 @@ int run_real_training(int argc, char *argv[])
     shared_gaussian::SharedBindWriter bind_writer;
     if (publish_viewer)
     {
-        if (!shared_writer.Init(options.viewer_shm_name, static_cast<uint32_t>(num_gaussians),
+        if (!shared_writer.Init(options.viewer_shm_name, viewer_capacity,
                                 shared_stride, static_cast<uint32_t>(sh_degree),
                                 render_scale_modifier))
         {
@@ -1513,8 +1553,10 @@ int run_real_training(int argc, char *argv[])
         }
         if (publish_viewer)
         {
+            std::cout << "Viewer shared memory capacity: " << viewer_capacity
+                      << " gaussians (start: " << num_gaussians << ")" << std::endl;
             const uint32_t betas_count = static_cast<uint32_t>(canonical_betas.numel());
-            if (!bind_writer.Init(bind_shm_name, static_cast<uint32_t>(num_gaussians),
+            if (!bind_writer.Init(bind_shm_name, viewer_capacity,
                                   shared_gaussian::kSharedBindStrideFloats, betas_count))
             {
                 std::cerr << "Failed to open bind shared memory mapping: " << bind_shm_name << std::endl;
@@ -1523,6 +1565,8 @@ int run_real_training(int argc, char *argv[])
     }
     std::vector<float> shared_buffer;
     uint64_t shared_frame = 0;
+    bool shared_capacity_warned = false;
+    bool bind_capacity_warned = false;
     std::vector<float> bind_buffer;
     std::vector<float> bind_betas_buffer;
 
@@ -1651,7 +1695,9 @@ int run_real_training(int argc, char *argv[])
                             offset_reg_weight,
                             scale_reg_weight,
                             sh_reg_weight,
-                            sugar_weight);
+                            sugar_weight,
+                            opacity_reg_weight,
+                            warmup_epochs);
     GaussianDataLoader loader(samples,
                               cached,
                               gpu_data.all_poses,
@@ -1671,7 +1717,7 @@ int run_real_training(int argc, char *argv[])
         {
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[0].options()).lr(0.0f);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[1].options()).lr(0.0f);
-            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(0.0f);
+            static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[2].options()).lr(scale_lr * lr_multiplier);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[3].options()).lr(color_lr * lr_multiplier);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[4].options()).lr(opacity_lr * lr_multiplier);
             static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * pose_lr_multiplier);
@@ -1777,6 +1823,7 @@ int run_real_training(int argc, char *argv[])
                 const float scale_reg_val = tensor_to_float(step_result.scale_reg);
                 const float sh_reg_val = tensor_to_float(step_result.sh_reg_loss);
                 const float sugar_reg_val = tensor_to_float(step_result.sugar_reg);
+                const float opacity_reg_val = tensor_to_float(step_result.opacity_reg);
 
                 const float grad_rot = tensor_to_float(step_result.grad_rot_norm);
                 const float grad_offset = tensor_to_float(step_result.grad_offset_norm);
@@ -1821,7 +1868,8 @@ int run_real_training(int argc, char *argv[])
                           << " offset_reg=" << offset_reg_val
                           << " scale_reg=" << scale_reg_val
                           << " sh_reg=" << sh_reg_val
-                          << " sugar_reg=" << sugar_reg_val;
+                          << " sugar_reg=" << sugar_reg_val
+                          << " opacity_reg=" << opacity_reg_val;
                 metric_logger.Log(loss_line.str());
 
                 std::ostringstream grad_line;
@@ -1939,6 +1987,14 @@ int run_real_training(int argc, char *argv[])
                 const int64_t bind_count = avatar.g_offsets.size(0);
                 if (bind_count > 0)
                 {
+                    if (!bind_capacity_warned &&
+                        bind_count > static_cast<int64_t>(viewer_capacity))
+                    {
+                        std::cerr << "Warning: bind shared memory capacity exceeded ("
+                                  << bind_count << " > " << viewer_capacity
+                                  << "). Viewer bind data will be truncated." << std::endl;
+                        bind_capacity_warned = true;
+                    }
                     auto bary_cpu = avatar.g_bary_coords.to(torch::kCPU).contiguous();
                     auto offsets_cpu = avatar.g_offsets.to(torch::kCPU).contiguous();
                     auto rots_cpu = avatar.g_rots.to(torch::kCPU).contiguous();
@@ -1981,6 +2037,15 @@ int run_real_training(int argc, char *argv[])
                 if (BuildSharedGaussianBuffer(positions, colors, opacities, scales, rotations, sh_to_send, sh_degree,
                                               &shared_buffer))
                 {
+                    const int64_t point_count = positions.size(0);
+                    if (!shared_capacity_warned &&
+                        point_count > static_cast<int64_t>(viewer_capacity))
+                    {
+                        std::cerr << "Warning: shared memory capacity exceeded ("
+                                  << point_count << " > " << viewer_capacity
+                                  << "). Viewer output will be truncated." << std::endl;
+                        shared_capacity_warned = true;
+                    }
                     shared_writer.Write(shared_buffer.data(), static_cast<uint32_t>(positions.size(0)),
                                         shared_frame++);
                 }

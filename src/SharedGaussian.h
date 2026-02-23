@@ -451,12 +451,13 @@ struct SharedBindMapping
 class SharedBindWriter
 {
   public:
-    bool Init(const std::string &name, uint32_t count, uint32_t stride_floats, uint32_t betas_count)
+    bool Init(const std::string &name, uint32_t capacity, uint32_t stride_floats, uint32_t betas_count)
     {
 #ifdef _WIN32
         Close();
+        capacity_ = capacity;
         const size_t total_floats = static_cast<size_t>(betas_count) +
-                                    static_cast<size_t>(count) * static_cast<size_t>(stride_floats);
+                                    static_cast<size_t>(capacity_) * static_cast<size_t>(stride_floats);
         const size_t total_size = sizeof(SharedBindHeader) + total_floats * sizeof(float);
         DWORD size_low = static_cast<DWORD>(total_size & 0xFFFFFFFF);
         DWORD size_high = static_cast<DWORD>((total_size >> 32) & 0xFFFFFFFF);
@@ -481,14 +482,14 @@ class SharedBindWriter
         std::memset(map_.base, 0, sizeof(SharedBindHeader));
         map_.header->magic = kSharedBindMagic;
         map_.header->version = kSharedBindVersion;
-        map_.header->count = count;
+        map_.header->count = 0;
         map_.header->stride_floats = stride_floats;
         map_.header->betas_count = betas_count;
         map_.header->data_version.store(0, std::memory_order_relaxed);
         return true;
 #else
         (void)name;
-        (void)count;
+        (void)capacity;
         (void)stride_floats;
         (void)betas_count;
         return false;
@@ -502,13 +503,17 @@ class SharedBindWriter
             return false;
         if (betas_count > map_.header->betas_count)
             betas_count = map_.header->betas_count;
-        if (count > map_.header->count)
-            count = map_.header->count;
+        if (count > capacity_)
+            count = capacity_;
         const size_t betas_bytes = static_cast<size_t>(betas_count) * sizeof(float);
         std::memcpy(map_.data, betas, betas_bytes);
         const size_t stride = static_cast<size_t>(map_.header->stride_floats);
         const size_t data_bytes = static_cast<size_t>(count) * stride * sizeof(float);
-        std::memcpy(map_.data + map_.header->betas_count, data, data_bytes);
+        if (data_bytes > 0)
+        {
+            std::memcpy(map_.data + map_.header->betas_count, data, data_bytes);
+        }
+        map_.header->count = count;
         uint64_t next = map_.header->data_version.load(std::memory_order_relaxed) + 1;
         map_.header->data_version.store(next, std::memory_order_release);
         return true;
@@ -534,12 +539,14 @@ class SharedBindWriter
         }
 #endif
         map_ = SharedBindMapping{};
+        capacity_ = 0;
     }
 
     ~SharedBindWriter() { Close(); }
 
   private:
     SharedBindMapping map_{};
+    uint32_t capacity_ = 0;
 };
 
 class SharedBindReader
