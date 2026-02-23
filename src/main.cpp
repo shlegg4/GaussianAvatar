@@ -790,6 +790,7 @@ struct TrainStepResult
     bool verbose_captured = false;
     torch::Tensor final_recon;
     torch::Tensor final_ssim;
+    torch::Tensor final_sobel;
     torch::Tensor final_outside;
     torch::Tensor final_alpha;
     torch::Tensor offset_reg;
@@ -1094,10 +1095,38 @@ public:
         auto ssim_values = ssim_fast(b_images_down, b_targets_down, window_v_, window_h_, b_masks_down, ssim_window_size_);
         auto ssim_losses = 1.0f - ssim_values;
 
+        // Sobel edge consistency on composited images/targets (RGB depthwise).
+        auto sobel_options = b_images.options().dtype(torch::kFloat32);
+        auto sobel_x = torch::tensor({{-1.0f, 0.0f, 1.0f},
+                                      {-2.0f, 0.0f, 2.0f},
+                                      {-1.0f, 0.0f, 1.0f}},
+                                     sobel_options)
+                           .view({1, 1, 3, 3})
+                           .repeat({3, 1, 1, 1});
+        auto sobel_y = torch::tensor({{-1.0f, -2.0f, -1.0f},
+                                      {0.0f, 0.0f, 0.0f},
+                                      {1.0f, 2.0f, 1.0f}},
+                                     sobel_options)
+                           .view({1, 1, 3, 3})
+                           .repeat({3, 1, 1, 1});
+
+        auto conv_opts = torch::nn::functional::Conv2dFuncOptions().padding(1).groups(3);
+        auto pred_gx = torch::nn::functional::conv2d(comp_images, sobel_x, conv_opts);
+        auto pred_gy = torch::nn::functional::conv2d(comp_images, sobel_y, conv_opts);
+        auto targ_gx = torch::nn::functional::conv2d(comp_targets, sobel_x, conv_opts);
+        auto targ_gy = torch::nn::functional::conv2d(comp_targets, sobel_y, conv_opts);
+
+        auto pred_mag = torch::sqrt(pred_gx.pow(2) + pred_gy.pow(2) + 1e-6f);
+        auto targ_mag = torch::sqrt(targ_gx.pow(2) + targ_gy.pow(2) + 1e-6f);
+        auto sobel_diff = torch::abs(pred_mag - targ_mag);
+        auto sobel_losses = sobel_diff.sum({1, 2, 3}) /
+                            torch::clamp_min(b_masks.sum({1, 2, 3}) * 3.0f, 1e-6f);
+
         recon_losses = recon_losses * b_valids;
         outside_losses = outside_losses * b_valids;
         alpha_losses = alpha_losses * b_valids;
         ssim_losses = ssim_losses * b_valids;
+        sobel_losses = sobel_losses * b_valids;
 
         auto total_losses = recon_losses + outside_mask_weight_ * outside_losses + alpha_loss_weight_ * alpha_losses;
         total_losses = torch::where(torch::isfinite(total_losses), total_losses, torch::zeros_like(total_losses));
@@ -1114,6 +1143,7 @@ public:
         auto final_ssim = (ssim_losses * final_weight).sum() / denom;
         auto final_outside = (outside_losses * final_weight).sum() / denom;
         auto final_alpha = (alpha_losses * final_weight).sum() / denom;
+        auto final_sobel = (sobel_losses * final_weight).sum() / denom;
 
         auto current_scales = CappedScales(avatar_.g_scales) * render_scale_modifier_;
         auto scale_reg = torch::mean(current_scales.pow(2).sum(1));
@@ -1158,8 +1188,10 @@ public:
             sh_reg_loss = higher_orders.pow(2).mean();
         }
 
+        const float sobel_weight = 0.05f;
         auto loss = (1.0f - lambda_dssim_) * final_recon +
                     lambda_dssim_ * final_ssim +
+                    sobel_weight * final_sobel +
                     outside_mask_weight_ * final_outside +
                     alpha_loss_weight_ * final_alpha +
                     offset_reg_weight_ * offset_reg +
@@ -1174,6 +1206,7 @@ public:
             result.verbose_captured = true;
             result.final_recon = final_recon.detach();
             result.final_ssim = final_ssim.detach();
+            result.final_sobel = final_sobel.detach();
             result.final_outside = final_outside.detach();
             result.final_alpha = final_alpha.detach();
             result.offset_reg = offset_reg.detach();
@@ -1824,6 +1857,7 @@ int run_real_training(int argc, char *argv[])
 
                 const float recon_val = tensor_to_float(step_result.final_recon);
                 const float ssim_val = tensor_to_float(step_result.final_ssim);
+                const float sobel_val = tensor_to_float(step_result.final_sobel);
                 const float outside_val = tensor_to_float(step_result.final_outside);
                 const float alpha_val = tensor_to_float(step_result.final_alpha);
                 const float offset_reg_val = tensor_to_float(step_result.offset_reg);
@@ -1875,6 +1909,7 @@ int run_real_training(int argc, char *argv[])
                 loss_line << std::setprecision(6)
                           << "[Verbose/Loss] recon=" << recon_val
                           << " ssim=" << ssim_val
+                          << " sobel=" << sobel_val
                           << " outside=" << outside_val
                           << " alpha=" << alpha_val
                           << " offset_reg=" << offset_reg_val
