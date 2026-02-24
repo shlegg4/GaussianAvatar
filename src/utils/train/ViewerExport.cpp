@@ -446,22 +446,9 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
                             int W,
                             bool save_debug_frames)
 {
-#if !(defined(GAUSS_HAS_OPEN3D) && GAUSS_HAS_OPEN3D)
-    (void)output_path;
-    (void)means3D;
-    (void)colors_or_sh;
-    (void)opacities;
-    (void)scales;
-    (void)rotations;
-    (void)sh_degree;
-    (void)H;
-    (void)W;
-    (void)save_debug_frames;
-    std::cerr << "ExtractMeshTSDF_Open3D: Open3D support is disabled in this build. "
-                 "Set Open3D_DIR (or CMAKE_PREFIX_PATH) and rebuild to enable TSDF export."
-              << std::endl;
-    return false;
-#else
+    // ==========================================
+    // 1. Input Validation
+    // ==========================================
     if (!means3D.defined() || means3D.dim() != 2 || means3D.size(1) != 3)
     {
         std::cerr << "ExtractMeshTSDF_Open3D: means3D must be Nx3." << std::endl;
@@ -499,34 +486,35 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
         std::cerr << "ExtractMeshTSDF_Open3D: tensor counts do not match." << std::endl;
         return false;
     }
-    if (opacities.device() != means3D.device() || scales.device() != means3D.device() ||
-        rotations.device() != means3D.device())
+
+    const torch::Device device = means3D.device();
+    if (opacities.device() != device || scales.device() != device || rotations.device() != device)
     {
         std::cerr << "ExtractMeshTSDF_Open3D: all render tensors must share the same device." << std::endl;
         return false;
     }
 
+    // ==========================================
+    // 2. Colors and Spherical Harmonics Setup
+    // ==========================================
     torch::Tensor colors;
     torch::Tensor sh;
-    int degree = 0;
 
     if (colors_or_sh.defined() && colors_or_sh.dim() == 3)
     {
         const int64_t expected_coeffs = static_cast<int64_t>((sh_degree + 1) * (sh_degree + 1));
-        if (sh_degree <= 0 || colors_or_sh.size(0) != count || colors_or_sh.size(2) != 3 ||
-            colors_or_sh.size(1) < expected_coeffs)
+        if (sh_degree <= 0 || colors_or_sh.size(0) != count || colors_or_sh.size(2) != 3 || colors_or_sh.size(1) < expected_coeffs)
         {
             std::cerr << "ExtractMeshTSDF_Open3D: sh tensor must be Nx((degree+1)^2)x3." << std::endl;
             return false;
         }
-        if (colors_or_sh.device() != means3D.device())
+        if (colors_or_sh.device() != device)
         {
             std::cerr << "ExtractMeshTSDF_Open3D: sh tensor must be on the same device as means3D." << std::endl;
             return false;
         }
         colors = torch::zeros({0}, colors_or_sh.options().dtype(torch::kFloat32));
         sh = colors_or_sh.contiguous();
-        degree = sh_degree;
     }
     else
     {
@@ -535,36 +523,32 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
             std::cerr << "ExtractMeshTSDF_Open3D: colors tensor must be Nx3." << std::endl;
             return false;
         }
-        if (colors_or_sh.device() != means3D.device())
+        if (colors_or_sh.device() != device)
         {
             std::cerr << "ExtractMeshTSDF_Open3D: colors tensor must be on the same device as means3D." << std::endl;
             return false;
         }
         colors = colors_or_sh.contiguous();
         sh = torch::zeros({0}, colors_or_sh.options().dtype(torch::kFloat32));
-        degree = 0;
     }
 
+    // ==========================================
+    // 3. Environment & Camera Initialization
+    // ==========================================
     torch::NoGradGuard no_grad;
-
     std::cout << "Starting in-memory TSDF integration..." << std::endl;
 
-    constexpr int kNumCameras = 60;
+    constexpr int kNumCameras = 400;
     constexpr float kPi = 3.14159265358979323846f;
-    constexpr float kFovY = 60.0f * (kPi / 180.0f);
     constexpr float kDepthScale = 1000.0f;
     constexpr float kDepthTruncMeters = 4.0f;
 
-    const float focal = (static_cast<float>(H) * 0.5f) / std::tan(kFovY * 0.5f);
-    const torch::Device device = means3D.device();
     auto float_opts = means3D.options().dtype(torch::kFloat32);
- 
 
     open3d::pipelines::integration::ScalableTSDFVolume volume(
         0.005,
-        0.02,
+        0.04,
         open3d::pipelines::integration::TSDFVolumeColorType::RGB8);
- 
 
     std::filesystem::path debug_dir;
     if (save_debug_frames)
@@ -574,14 +558,13 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
         std::filesystem::create_directories(debug_dir, debug_ec);
         if (debug_ec)
         {
-            std::cerr << "ExtractMeshTSDF_Open3D: failed to create debug frame directory: "
-                      << debug_dir.string() << std::endl;
+            std::cerr << "ExtractMeshTSDF_Open3D: failed to create debug frame directory: " << debug_dir.string() << std::endl;
             return false;
         }
     }
 
-    // 1. Perspective Constants (Match Viewer Exactly)
-    const float fovy_deg = 45.0f; // Viewer uses 45 degrees
+    // Perspective Constants (Match Viewer Exactly)
+    const float fovy_deg = 45.0f;
     const float aspect = static_cast<float>(W) / static_cast<float>(H);
     const float fovy_rad = fovy_deg * kPi / 180.0f;
     const float tan_fovy = std::tan(fovy_rad * 0.5f);
@@ -598,10 +581,11 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
     proj_cpu.index_put_({3, 2}, -1.0f);
     auto proj_ten_t = proj_cpu.transpose(0, 1).contiguous().to(device);
 
-    // 2. Center and Radius (Match Viewer's Bounds)
+    // Center and Radius (Match Viewer's Bounds)
     auto pos_cpu = means3D.detach().to(torch::kCPU).contiguous();
     const float *p_ptr = pos_cpu.data_ptr<float>();
     const int64_t num_pts = means3D.size(0);
+
     Eigen::Vector3f min_b(p_ptr[0], p_ptr[1], p_ptr[2]);
     Eigen::Vector3f max_b(p_ptr[0], p_ptr[1], p_ptr[2]);
     for (int64_t idx = 0; idx < num_pts; idx += 10)
@@ -613,12 +597,13 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
         max_b.y() = std::max(max_b.y(), p_ptr[idx * 3 + 1]);
         max_b.z() = std::max(max_b.z(), p_ptr[idx * 3 + 2]);
     }
+
     const Eigen::Vector3f center = (min_b + max_b) * 0.5f;
     const Eigen::Vector3f extents = (max_b - min_b) * 0.5f;
     const float radius = std::max({extents.x(), extents.y(), extents.z(), 0.1f});
     const float cam_dist = radius * 3.0f;
 
-    // Open3D Camera Intrinsic (needs focal length in pixels)
+    // Open3D Camera Intrinsic
     const float focal_y = (static_cast<float>(H) * 0.5f) / tan_fovy;
     const float focal_x = (static_cast<float>(W) * 0.5f) / tan_fovx;
     open3d::camera::PinholeCameraIntrinsic intrinsic(
@@ -628,13 +613,55 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
     auto render_colors = (colors_or_sh.dim() == 2) ? colors_or_sh : torch::zeros({0}, float_opts.device(device));
     auto render_sh = (colors_or_sh.dim() == 3) ? colors_or_sh : torch::zeros({0}, float_opts.device(device));
 
+    // Reusable image buffers
+    open3d::geometry::Image o3d_color;
+    open3d::geometry::Image o3d_depth;
+    using namespace torch::indexing; // Lifted outside the loop
+
+    // ==========================================
+    // 4. Rendering & Integration Loop
+    // ==========================================
+    const float golden_ratio = (1.0f + std::sqrt(5.0f)) / 2.0f;
+    const float angle_increment = 2.0f * kPi * golden_ratio;
+
     for (int i = 0; i < kNumCameras; ++i)
     {
-        float angle = (static_cast<float>(i) / static_cast<float>(kNumCameras)) * 2.0f * kPi;
+        // 1. Calculate Fibonacci Sphere position (y goes smoothly from 1 to -1)
+        float t = static_cast<float>(i) / static_cast<float>(kNumCameras - 1);
+        float y = 1.0f - (t * 2.0f);
+        float radius_at_y = std::sqrt(1.0f - y * y);
+        float theta = angle_increment * static_cast<float>(i);
 
-        // 3. Quat Rotation Orbit (Match Viewer exactly)
-        Eigen::AngleAxisf q_model(angle, Eigen::Vector3f::UnitY());
-        Eigen::Matrix3f R = q_model.toRotationMatrix();
+        float x = std::cos(theta) * radius_at_y;
+        float z = std::sin(theta) * radius_at_y;
+
+        // V is the unit vector pointing from the center outward to the camera
+        Eigen::Vector3f V(x, y, z);
+        Eigen::Vector3f eye = center + V * cam_dist;
+
+        // 2. Build the Rotation Matrix (R) exactly like your current math expects
+        // In your math, the object is at +Z in camera space, so the Forward vector (Row 2)
+        // must point from the camera (eye) to the object (center).
+        Eigen::Vector3f F = (center - eye).normalized();
+
+        // Handle the singularity if the camera is exactly at the North/South pole
+        Eigen::Vector3f world_up(0.0f, 1.0f, 0.0f);
+        if (std::abs(F.y()) > 0.999f)
+        {
+            world_up = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+        }
+
+        // Calculate Right (Row 0) and Up (Row 1) vectors orthogonally
+        Eigen::Vector3f right = world_up.cross(F).normalized();
+        Eigen::Vector3f up = F.cross(right).normalized();
+
+        Eigen::Matrix3f R;
+        R.row(0) = right;
+        R.row(1) = up;
+        R.row(2) = F;
+
+        // 3. EXACT same View Translation math as your current code!
+        // This perfectly centers the object at `cam_dist` on the Z-axis.
         Eigen::Vector3f view_trans = Eigen::Vector3f(0.0f, 0.0f, cam_dist) - R * center;
 
         auto view_cpu = torch::eye(4, float_opts);
@@ -653,36 +680,23 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
 
         auto view_ten = view_cpu.transpose(0, 1).contiguous().to(device);
 
-        // Viewer's Magic X-Axis Flip
-        using namespace torch::indexing;
-        view_ten.index_put_({Slice(), 0}, view_ten.index({Slice(), 0}) * -1.0f);
-
         auto proj_t = torch::matmul(view_ten, proj_ten_t).contiguous();
 
         Eigen::Vector3f cam_pos_eigen = -R.transpose() * view_trans;
         auto campos = torch::tensor({cam_pos_eigen.x(), cam_pos_eigen.y(), cam_pos_eigen.z()}, float_opts.device(device));
 
-        // 4. Use GaussianRasterizer::apply directly!
+        // Render Frame via GaussianRasterizer
         auto outputs = GaussianRasterizer::apply(
-            means3D,
-            render_colors,
-            opacities,
-            scales,
-            rotations,
+            means3D, render_colors, opacities, scales, rotations,
             1.0f, // scale_modifier
-            view_ten,
-            proj_t,
-            tan_fovx,
-            tan_fovy,
-            H, W,
+            view_ten, proj_t, tan_fovx, tan_fovy, H, W,
             render_sh,
             0, // sh_degree forced to 0
-            campos,
-            false);
+            campos, false);
 
         auto out_color = outputs[0];
-        auto out_depth = outputs[2];
         auto out_alpha = outputs[1];
+        auto out_depth = outputs[2];
 
         auto rgb_u8 = out_color.detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kUInt8).permute({1, 2, 0}).contiguous().to(torch::kCPU);
 
@@ -690,36 +704,56 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
         depth_meters = torch::abs(depth_meters);
         depth_meters = torch::where(out_alpha.detach() > 1e-4f, depth_meters, torch::zeros_like(depth_meters));
         depth_meters = torch::clamp(depth_meters, 0.0f, kDepthTruncMeters);
+
         auto depth_u16 = (depth_meters.squeeze(0) * kDepthScale).to(torch::kUInt16).contiguous().to(torch::kCPU);
 
-        // 5. Flip horizontally to undo the rasterizer's X-Flip
+        // Flip horizontally to undo the rasterizer's X-Flip
         cv::Mat rgb_mat(H, W, CV_8UC3, rgb_u8.data_ptr<uint8_t>());
         cv::Mat depth_mat(H, W, CV_16UC1, depth_u16.data_ptr<uint16_t>());
         cv::flip(rgb_mat, rgb_mat, 1);
         cv::flip(depth_mat, depth_mat, 1);
 
+        cv::medianBlur(depth_mat, depth_mat, 5);
+
         if (save_debug_frames)
         {
+            // 1. Convert RGB for saving
             cv::Mat bgr;
             cv::cvtColor(rgb_mat, bgr, cv::COLOR_RGB2BGR);
+
+            // 2. Create a visualizable version of the depth map
+            cv::Mat depth_vis;
+            // Scale the 16-bit values (0 to Max Depth) down to 8-bit (0 to 255)
+            // We use kDepthTruncMeters * kDepthScale as the logical maximum distance
+            double scale_factor = 255.0 / (kDepthTruncMeters * kDepthScale);
+            depth_mat.convertTo(depth_vis, CV_8UC1, scale_factor);
+
+            // 3. Apply a heatmap color scheme (Jet or Turbo) so depth changes pop out
+            cv::Mat depth_color;
+            cv::applyColorMap(depth_vis, depth_color, cv::COLORMAP_JET);
+
+            // 4. Save the frames
             const auto rgb_path = (debug_dir / ("rgb_" + std::to_string(i) + ".png")).string();
-            const auto depth_path = (debug_dir / ("depth_" + std::to_string(i) + ".png")).string();
+            const auto depth_vis_path = (debug_dir / ("depth_vis_" + std::to_string(i) + ".png")).string();
+
             cv::imwrite(rgb_path, bgr);
-            cv::imwrite(depth_path, depth_mat);
+            cv::imwrite(depth_vis_path, depth_color);
+
+            // Optional: You can also save the raw 16-bit depth if you need to inspect actual values later
+            // const auto depth_raw_path = (debug_dir / ("depth_raw_" + std::to_string(i) + ".png")).string();
+            // cv::imwrite(depth_raw_path, depth_mat);
         }
 
-        open3d::geometry::Image o3d_color;
         o3d_color.Prepare(W, H, 3, 1);
         std::memcpy(o3d_color.data_.data(), rgb_mat.data, o3d_color.data_.size());
 
-        open3d::geometry::Image o3d_depth;
         o3d_depth.Prepare(W, H, 1, 2);
         std::memcpy(o3d_depth.data_.data(), depth_mat.data, o3d_depth.data_.size());
 
         auto rgbd = open3d::geometry::RGBDImage::CreateFromColorAndDepth(
             o3d_color, o3d_depth, kDepthScale, kDepthTruncMeters, false);
 
-        // 6. Extrinsic for Open3D (World-to-Camera, OpenCV coordinate system)
+        // Extrinsic for Open3D (World-to-Camera, OpenCV coordinate system)
         Eigen::Matrix4d extrinsic = Eigen::Matrix4d::Identity();
         for (int r = 0; r < 4; ++r)
         {
@@ -728,17 +762,37 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
                 extrinsic(r, c) = view_cpu.index({r, c}).item<float>();
             }
         }
-        extrinsic.row(1) *= -1.0; // OpenGL Up to OpenCV Down
-        extrinsic.row(2) *= -1.0; // OpenGL Back to OpenCV Forward
+        // extrinsic.row(0) *= -1.0;
+        extrinsic.row(1) *= -1.0;
 
         volume.Integrate(*rgbd, intrinsic, extrinsic);
 
         if (i % 10 == 0)
+        {
             std::cout << "Integrated frame " << i << "/" << kNumCameras << std::endl;
+        }
     }
 
+    // POINT CLOUD EXTRACTION FOR DEBUGGING
+    std::cout << "Extracting TSDF point cloud for debugging..." << std::endl;
+    auto pcd = volume.ExtractPointCloud();
+    if (pcd && !pcd->points_.empty())
+    {
+        std::string pcd_out = (output_path.parent_path() / "debug_tsdf_cloud.ply").string();
+        open3d::io::WritePointCloud(pcd_out, *pcd);
+        std::cout << "Saved debug point cloud to " << pcd_out << std::endl;
+    }
+    else
+    {
+        std::cerr << "Warning: Extracted point cloud is empty!" << std::endl;
+    }
+
+    // ==========================================
+    // 5. Mesh Extraction & Output
+    // ==========================================
     std::cout << "Extracting triangle mesh via Marching Cubes..." << std::endl;
     auto mesh = volume.ExtractTriangleMesh();
+
     if (!mesh || mesh->vertices_.empty())
     {
         std::cerr << "ExtractMeshTSDF_Open3D: failed to extract mesh (empty volume)." << std::endl;
@@ -753,10 +807,10 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
     {
         std::filesystem::create_directories(out_parent, ec);
     }
+
     if (ec)
     {
-        std::cerr << "ExtractMeshTSDF_Open3D: failed to create output directory: "
-                  << out_parent.string() << std::endl;
+        std::cerr << "ExtractMeshTSDF_Open3D: failed to create output directory: " << out_parent.string() << std::endl;
         return false;
     }
 
@@ -768,5 +822,4 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
 
     std::cout << "Saved TSDF mesh to " << output_path.string() << std::endl;
     return true;
-#endif
 }

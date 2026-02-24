@@ -107,6 +107,34 @@ namespace
         g_camera.position = {center.x, center.y, center.z + dist};
     }
 
+    torch::Tensor DepthToHeatmap(const torch::Tensor &out_depth, const torch::Tensor &out_alpha)
+    {
+        auto depth = torch::abs(out_depth / torch::clamp_min(out_alpha, 1e-6f));
+        auto valid = out_alpha > 1e-4f;
+        auto valid_depth_values = depth.masked_select(valid);
+
+        auto depth_norm = torch::zeros_like(depth);
+        if (valid_depth_values.numel() > 0)
+        {
+            auto dmin = valid_depth_values.min();
+            auto dmax = valid_depth_values.max();
+            auto denom = torch::clamp_min(dmax - dmin, 1e-6f);
+            depth_norm = ((depth - dmin) / denom).clamp(0.0f, 1.0f);
+            depth_norm = torch::where(valid, depth_norm, torch::zeros_like(depth_norm));
+        }
+
+        // Invert so nearer depth appears warmer.
+        auto t = (1.0f - depth_norm).squeeze(0);
+        auto r = (1.5f - torch::abs(4.0f * t - 3.0f)).clamp(0.0f, 1.0f);
+        auto g = (1.5f - torch::abs(4.0f * t - 2.0f)).clamp(0.0f, 1.0f);
+        auto b = (1.5f - torch::abs(4.0f * t - 1.0f)).clamp(0.0f, 1.0f);
+        auto heat_rgb = torch::stack({r, g, b}, 0);
+
+        auto valid_hw = valid.squeeze(0);
+        heat_rgb = torch::where(valid_hw.unsqueeze(0), heat_rgb, torch::zeros_like(heat_rgb));
+        return heat_rgb;
+    }
+
     bool ParseArgs(int argc, char **argv, ViewerOptions *options)
     {
         for (int i = 1; i < argc; ++i)
@@ -199,7 +227,9 @@ int main(int argc, char **argv)
     bool prev_y = false;
     bool prev_z = false;
     bool prev_r = false;
+    bool prev_h = false;
     bool randomize_colors = false;
+    bool show_depth_heatmap = false;
 
     float render_scale_modifier = 1.0f;
     uint64_t last_version = 0;
@@ -219,6 +249,7 @@ int main(int argc, char **argv)
         const bool key_y = glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS;
         const bool key_z = glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS;
         const bool key_r = glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
+        const bool key_h = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
         if (key_x && !prev_x)
         {
             g_camera.model_rot = NormalizeQuat(MulQuat(AxisAngleQuat({1.0f, 0.0f, 0.0f}, 1.57079633f),
@@ -245,6 +276,12 @@ int main(int argc, char **argv)
             gpu_data_dirty = true; // Force color update
         }
         prev_r = key_r;
+        if (key_h && !prev_h)
+        {
+            show_depth_heatmap = !show_depth_heatmap;
+            std::cout << "[viewer] depth heatmap: " << (show_depth_heatmap ? "ON" : "OFF") << std::endl;
+        }
+        prev_h = key_h;
         if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS)
         {
             FrameCameraToBounds();
@@ -419,9 +456,7 @@ int main(int argc, char **argv)
             auto cam_pos = torch::tensor({cam_pos_v.x, cam_pos_v.y, cam_pos_v.z}, device);
 
             float scale_final = render_scale_modifier * options.point_size;
-
-            std::cout << "CAMPOS, full_proj_mat, view_mat, tan_fovx, tan_fovy: " << cam_pos << ", " << proj_t.sizes() << ", " << view_ten.sizes() << ", " << tan_fovx << ", " << tan_fovy << std::endl;
-
+ 
             auto outputs = GaussianRasterizer::apply(
                 means3D, colors, opacities, scales, rotations,
                 scale_final,
@@ -434,7 +469,11 @@ int main(int argc, char **argv)
 
             // --- OPTIMIZATION 2: GPU Permute ---
             // Perform CHW -> HWC on GPU, then download. Fixes OpenMP spin.
-            auto img_tensor = outputs[0].detach().clamp(0.0f, 1.0f).mul(255.0f).to(torch::kU8).permute({1, 2, 0}).contiguous().cpu();
+            torch::Tensor display_rgb = show_depth_heatmap
+                ? DepthToHeatmap(outputs[2].detach(), outputs[1].detach())
+                : outputs[0].detach();
+
+            auto img_tensor = display_rgb.clamp(0.0f, 1.0f).mul(255.0f).to(torch::kU8).permute({1, 2, 0}).contiguous().cpu();
 
             glMatrixMode(GL_PROJECTION);
             glLoadIdentity();
