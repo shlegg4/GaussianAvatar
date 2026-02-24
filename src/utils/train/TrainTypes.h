@@ -53,7 +53,7 @@ struct TrainOptions
     float opacity_lr = -1.0f;
     float psr_opacity_threshold = 0.3f;
     int psr_samples_per_gaussian = 8;
-    std::string mesh_method = "tsdf";
+    std::string mesh_method = "poisson";
     int sh_degree = 3;
     int densify_every = 500;
     int densify_max_splits = 64;

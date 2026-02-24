@@ -12,12 +12,15 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -435,6 +438,417 @@ bool ExportOrientedPointCloudPly(const std::filesystem::path &path,
               << " with " << points.size() << " points." << std::endl;
     return true;
 }
+
+torch::Tensor LoadSmplUVsFromOBJ(const std::string &obj_path)
+{
+    std::ifstream file(obj_path);
+    if (!file.is_open())
+    {
+        std::cerr << "LoadSmplUVsFromOBJ: failed to open " << obj_path << std::endl;
+        return torch::Tensor();
+    }
+
+    std::vector<std::array<float, 2>> tex_coords;
+    std::vector<std::array<int64_t, 3>> face_tex_indices;
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        if (line.empty() || line[0] == '#')
+        {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string prefix;
+        iss >> prefix;
+
+        if (prefix == "vt")
+        {
+            float u = 0.0f;
+            float v = 0.0f;
+            if (!(iss >> u >> v))
+            {
+                continue;
+            }
+            tex_coords.push_back({u, v});
+        }
+        else if (prefix == "f")
+        {
+            std::vector<int64_t> poly_vt_indices;
+            std::string vert_token;
+            while (iss >> vert_token)
+            {
+                const size_t slash_1 = vert_token.find('/');
+                if (slash_1 == std::string::npos)
+                {
+                    std::cerr << "LoadSmplUVsFromOBJ: face token missing UV index: " << vert_token << std::endl;
+                    return torch::Tensor();
+                }
+
+                const size_t slash_2 = vert_token.find('/', slash_1 + 1);
+                const std::string vt_str = (slash_2 == std::string::npos)
+                                               ? vert_token.substr(slash_1 + 1)
+                                               : vert_token.substr(slash_1 + 1, slash_2 - slash_1 - 1);
+
+                if (vt_str.empty())
+                {
+                    std::cerr << "LoadSmplUVsFromOBJ: empty UV index in face token: " << vert_token << std::endl;
+                    return torch::Tensor();
+                }
+
+                int64_t vt_idx = -1;
+                try
+                {
+                    vt_idx = static_cast<int64_t>(std::stoll(vt_str));
+                }
+                catch (const std::exception &)
+                {
+                    std::cerr << "LoadSmplUVsFromOBJ: invalid UV index in face token: " << vert_token << std::endl;
+                    return torch::Tensor();
+                }
+
+                // OBJ: positive indices are 1-based, negative indices are relative to the end.
+                if (vt_idx > 0)
+                {
+                    vt_idx -= 1;
+                }
+                else if (vt_idx < 0)
+                {
+                    vt_idx = static_cast<int64_t>(tex_coords.size()) + vt_idx;
+                }
+                else
+                {
+                    std::cerr << "LoadSmplUVsFromOBJ: UV index 0 is invalid in OBJ." << std::endl;
+                    return torch::Tensor();
+                }
+
+                if (vt_idx < 0 || vt_idx >= static_cast<int64_t>(tex_coords.size()))
+                {
+                    std::cerr << "LoadSmplUVsFromOBJ: UV index out of bounds: " << vt_idx << std::endl;
+                    return torch::Tensor();
+                }
+
+                poly_vt_indices.push_back(vt_idx);
+            }
+
+            if (poly_vt_indices.size() < 3)
+            {
+                continue;
+            }
+
+            for (size_t i = 1; i + 1 < poly_vt_indices.size(); ++i)
+            {
+                face_tex_indices.push_back({poly_vt_indices[0], poly_vt_indices[i], poly_vt_indices[i + 1]});
+            }
+        }
+    }
+
+    if (tex_coords.empty() || face_tex_indices.empty())
+    {
+        std::cerr << "LoadSmplUVsFromOBJ: no UV coordinates or face UV indices found in "
+                  << obj_path << std::endl;
+        return torch::Tensor();
+    }
+
+    const int64_t num_faces = static_cast<int64_t>(face_tex_indices.size());
+    auto uvs = torch::zeros({num_faces, 3, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    auto uvs_acc = uvs.accessor<float, 3>();
+
+    for (int64_t i = 0; i < num_faces; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            const int64_t vt_idx = face_tex_indices[static_cast<size_t>(i)][static_cast<size_t>(j)];
+            const auto &uv = tex_coords[static_cast<size_t>(vt_idx)];
+            uvs_acc[i][j][0] = uv[0];
+            uvs_acc[i][j][1] = uv[1];
+        }
+    }
+
+    std::cout << "LoadSmplUVsFromOBJ: loaded " << num_faces
+              << " face UVs from " << obj_path << std::endl;
+    return uvs;
+}
+
+bool ExtractSMPLTextureMap(const std::filesystem::path &output_path,
+                           const torch::Tensor &colors,
+                           const torch::Tensor &opacities,
+                           const torch::Tensor &scales,
+                           const torch::Tensor &rotations,
+                           const torch::Tensor &offsets,
+                           const torch::Tensor &face_indices,
+                           const torch::Tensor &bary_coords,
+                           const torch::Tensor &smpl_face_uvs,
+                           const torch::Tensor &v_template, // <-- NEW: 3D Vertices
+                           const torch::Tensor &mesh_faces, // <-- NEW: 3D Faces
+                           int resolution)
+{
+    if (!colors.defined() || !opacities.defined() || !scales.defined() || !rotations.defined() ||
+        !offsets.defined() || !face_indices.defined() || !bary_coords.defined() ||
+        !smpl_face_uvs.defined() || !v_template.defined() || !mesh_faces.defined())
+    {
+        std::cerr << "ExtractSMPLTextureMap: missing tensor inputs." << std::endl;
+        return false;
+    }
+
+    const int64_t count = colors.size(0);
+
+    // Transfer to CPU
+    auto col_cpu = colors.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto opa_cpu = opacities.detach().reshape({-1}).to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto sca_cpu = scales.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto rot_cpu = rotations.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto off_cpu = offsets.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto face_cpu = face_indices.detach().reshape({-1}).to(torch::kCPU).to(torch::kLong).contiguous();
+    auto bary_cpu = bary_coords.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto uvs_cpu = smpl_face_uvs.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+
+    // Transfer 3D Mesh Data to CPU
+    auto v_cpu = v_template.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto mesh_faces_cpu = mesh_faces.detach().reshape({-1}).to(torch::kCPU).to(torch::kLong).contiguous();
+
+    // Get Pointers
+    const float *col_ptr = col_cpu.data_ptr<float>();
+    const float *opa_ptr = opa_cpu.data_ptr<float>();
+    const float *sca_ptr = sca_cpu.data_ptr<float>();
+    const float *rot_ptr = rot_cpu.data_ptr<float>();
+    const float *off_ptr = off_cpu.data_ptr<float>();
+    const int64_t *face_ptr = face_cpu.data_ptr<int64_t>();
+    const float *bary_ptr = bary_cpu.data_ptr<float>();
+    const float *uvs_ptr = uvs_cpu.data_ptr<float>();
+
+    // Get Mesh Pointers
+    const float *v_ptr = v_cpu.data_ptr<float>();
+    const int64_t *mesh_faces_ptr = mesh_faces_cpu.data_ptr<int64_t>();
+
+    const int64_t num_faces = uvs_cpu.size(0);
+
+    // --- 1. Depth Sorting (Z-Buffer Faux Setup) ---
+    // The Z-component of the offset is the exact displacement along the face normal.
+    struct SplatData
+    {
+        int64_t index;
+        float depth;
+    };
+    std::vector<SplatData> splats(count);
+    for (int64_t i = 0; i < count; ++i)
+    {
+        splats[i] = {i, off_ptr[i * 3 + 2]};
+    }
+
+    // Sort Back-to-Front (Negative depth = deep inside body, Positive = outside body)
+    std::sort(splats.begin(), splats.end(), [](const SplatData &a, const SplatData &b)
+              { return a.depth < b.depth; });
+
+    // Image Buffers
+    cv::Mat accum_color = cv::Mat::zeros(resolution, resolution, CV_32FC3);
+    cv::Mat accum_disp = cv::Mat::zeros(resolution, resolution, CV_32FC1); // <-- ADDED: Displacement Accumulator
+    cv::Mat accum_alpha = cv::Mat::zeros(resolution, resolution, CV_32FC1);
+
+    // --- 2. Anisotropic Splatting Loop ---
+    // Iterate through the sorted splats (Back to Front)
+    for (const auto &splat : splats)
+    {
+        const int64_t i = splat.index;
+        const float opacity = opa_ptr[i];
+        if (opacity < 0.001f)
+            continue;
+
+        const int64_t face_idx = face_ptr[i]; // This is the triangle ID
+        if (face_idx < 0 || face_idx >= num_faces)
+            continue;
+
+        // --- Calculate Pixel Center via Barycentric Interpolation ---
+        const float u = bary_ptr[i * 3 + 0];
+        const float v = bary_ptr[i * 3 + 1];
+        const float w = bary_ptr[i * 3 + 2];
+
+        const float *uv0 = uvs_ptr + (face_idx * 3 * 2) + 0;
+        const float *uv1 = uvs_ptr + (face_idx * 3 * 2) + 2;
+        const float *uv2 = uvs_ptr + (face_idx * 3 * 2) + 4;
+
+        const float final_u = u * uv0[0] + v * uv1[0] + w * uv2[0];
+        const float final_v = u * uv0[1] + v * uv1[1] + w * uv2[1];
+
+        const int px = std::clamp(static_cast<int>(final_u * static_cast<float>(resolution)), 0, resolution - 1);
+        const int py = std::clamp(static_cast<int>((1.0f - final_v) * static_cast<float>(resolution)), 0, resolution - 1);
+
+        // --- Dynamic Local UV Scaling (Texel Density Fix) ---
+        const int64_t v0_idx = mesh_faces_ptr[face_idx * 3 + 0];
+        const int64_t v1_idx = mesh_faces_ptr[face_idx * 3 + 1];
+        const int64_t v2_idx = mesh_faces_ptr[face_idx * 3 + 2];
+
+        float v0x = v_ptr[v0_idx * 3 + 0], v0y = v_ptr[v0_idx * 3 + 1], v0z = v_ptr[v0_idx * 3 + 2];
+        float v1x = v_ptr[v1_idx * 3 + 0], v1y = v_ptr[v1_idx * 3 + 1], v1z = v_ptr[v1_idx * 3 + 2];
+        float v2x = v_ptr[v2_idx * 3 + 0], v2y = v_ptr[v2_idx * 3 + 1], v2z = v_ptr[v2_idx * 3 + 2];
+
+        float abx = v1x - v0x, aby = v1y - v0y, abz = v1z - v0z;
+        float acx = v2x - v0x, acy = v2y - v0y, acz = v2z - v0z;
+        float crossx = aby * acz - abz * acy;
+        float crossy = abz * acx - abx * acz;
+        float crossz = abx * acy - aby * acx;
+        float area_3d = 0.5f * std::sqrt(crossx * crossx + crossy * crossy + crossz * crossz);
+        area_3d = std::max(area_3d, 1e-12f);
+
+        float uv_abx = (uv1[0] - uv0[0]) * resolution;
+        float uv_aby = (uv1[1] - uv0[1]) * resolution;
+        float uv_acx = (uv2[0] - uv0[0]) * resolution;
+        float uv_acy = (uv2[1] - uv0[1]) * resolution;
+        float area_uv = 0.5f * std::abs(uv_abx * uv_acy - uv_acx * uv_aby);
+        area_uv = std::max(area_uv, 1.0f);
+
+        float local_uv_multiplier = std::sqrt(area_uv / area_3d);
+
+        float uv_scale_modifier = 1.25f;
+        float s_u = sca_ptr[i * 3 + 0] * local_uv_multiplier * uv_scale_modifier;
+        float s_v = sca_ptr[i * 3 + 1] * local_uv_multiplier * uv_scale_modifier;
+
+        // --- Compute 2D Ellipse from Scaled 3D Rotation ---
+        float qw = rot_ptr[i * 4 + 0];
+        float qx = rot_ptr[i * 4 + 1];
+        float qy = rot_ptr[i * 4 + 2];
+        float qz = rot_ptr[i * 4 + 3];
+        float angle = 2.0f * std::atan2(std::sqrt(qx * qx + qy * qy + qz * qz), qw);
+
+        float cos_a = std::cos(angle);
+        float sin_a = std::sin(angle);
+
+        float m00 = s_u * s_u * cos_a * cos_a + s_v * s_v * sin_a * sin_a;
+        float m01 = (s_u * s_u - s_v * s_v) * cos_a * sin_a;
+        float m11 = s_u * s_u * sin_a * sin_a + s_v * s_v * cos_a * cos_a;
+
+        float det = m00 * m11 - m01 * m01;
+        if (det < 1e-6f)
+            continue;
+        float inv_m00 = m11 / det;
+        float inv_m01 = -m01 / det;
+        float inv_m11 = m00 / det;
+
+        int radius = static_cast<int>(std::ceil(2.5f * std::sqrt(std::max(m00, m11))));
+        radius = std::clamp(radius, 1, resolution / 4);
+
+        cv::Vec3f src_color(col_ptr[i * 3 + 2], col_ptr[i * 3 + 1], col_ptr[i * 3 + 0]);
+        float src_disp = splat.depth; // <-- ADDED: Physical displacement in meters
+
+        // --- Splat and Composite ---
+        for (int dy = -radius; dy <= radius; ++dy)
+        {
+            for (int dx = -radius; dx <= radius; ++dx)
+            {
+                float power = -0.5f * (dx * dx * inv_m00 + 2.0f * dx * dy * inv_m01 + dy * dy * inv_m11);
+                if (power > 0.0f)
+                    continue; 
+
+                float current_alpha = opacity * std::exp(power);
+                if (current_alpha < 0.001f)
+                    continue; 
+
+                const int splat_x = std::clamp(px + dx, 0, resolution - 1);
+                const int splat_y = std::clamp(py + dy, 0, resolution - 1);
+
+                // Alpha Compositing
+                cv::Vec3f dst_color = accum_color.at<cv::Vec3f>(splat_y, splat_x);
+                float dst_disp = accum_disp.at<float>(splat_y, splat_x); // <-- Retrieve background depth
+                float dst_alpha = accum_alpha.at<float>(splat_y, splat_x);
+
+                accum_color.at<cv::Vec3f>(splat_y, splat_x) = src_color * current_alpha + dst_color * (1.0f - current_alpha);
+                
+                // <-- ADDED: Composite Displacement
+                accum_disp.at<float>(splat_y, splat_x) = src_disp * current_alpha + dst_disp * (1.0f - current_alpha);
+
+                accum_alpha.at<float>(splat_y, splat_x) = current_alpha + dst_alpha * (1.0f - current_alpha);
+            }
+        }
+    }
+
+    // --- 4. Final Color & Displacement Output ---
+    cv::Mat final_texture(resolution, resolution, CV_8UC3);
+    cv::Mat final_disp(resolution, resolution, CV_16UC1); // 16-bit to avoid staircase artifacts in 3D
+
+    // Physical bounds for displacement normalization (e.g., +/- 10cm)
+    const float max_phys_disp = 0.1f; 
+
+    for (int y = 0; y < resolution; ++y)
+    {
+        for (int x = 0; x < resolution; ++x)
+        {
+            if (accum_alpha.at<float>(y, x) > 0.0f)
+            {
+                // RGB
+                cv::Vec3f c = accum_color.at<cv::Vec3f>(y, x);
+                final_texture.at<cv::Vec3b>(y, x) = cv::Vec3b(
+                    (uint8_t)std::clamp(c[0] * 255.0f, 0.0f, 255.0f),
+                    (uint8_t)std::clamp(c[1] * 255.0f, 0.0f, 255.0f),
+                    (uint8_t)std::clamp(c[2] * 255.0f, 0.0f, 255.0f));
+
+                // Displacement
+                float d = accum_disp.at<float>(y, x);
+                // Map -0.1m -> 0, 0.0m -> 0.5, +0.1m -> 1.0
+                float norm_d = (d + max_phys_disp) / (2.0f * max_phys_disp);
+                final_disp.at<uint16_t>(y, x) = static_cast<uint16_t>(std::clamp(norm_d * 65535.0f, 0.0f, 65535.0f));
+            }
+            else
+            {
+                final_texture.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 0, 0);
+                final_disp.at<uint16_t>(y, x) = 32768; // 50% Gray = 0.0m Offset
+            }
+        }
+    }
+
+    // --- 5. Micro-Infill and UV Edge Padding ---
+    std::cout << "Filling microscopic gaps and padding UV edges..." << std::endl;
+    cv::Mat mask;
+    cv::threshold(accum_alpha, mask, 0.0f, 255.0f, cv::THRESH_BINARY);
+    mask.convertTo(mask, CV_8UC1);
+
+    cv::Mat filled_texture = final_texture.clone();
+    cv::Mat filled_disp = final_disp.clone(); // <-- ADDED: Clone displacement for padding
+    
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+
+    const int max_fill_iters = 15;
+    for (int iter = 0; iter < max_fill_iters; ++iter)
+    {
+        // Pad Color
+        cv::Mat dilated_color;
+        cv::dilate(filled_texture, dilated_color, kernel);
+        dilated_color.copyTo(filled_texture, ~mask);
+
+        // Pad Displacement
+        cv::Mat dilated_disp;
+        cv::dilate(filled_disp, dilated_disp, kernel);
+        dilated_disp.copyTo(filled_disp, ~mask);
+
+        cv::dilate(mask, mask, kernel);
+    }
+
+    final_texture = filled_texture;
+    final_disp = filled_disp;
+
+    // --- 6. Save Images ---
+    if (!cv::imwrite(output_path.string(), final_texture))
+    {
+        std::cerr << "ExtractSMPLTextureMap: failed to write texture to " << output_path.string() << std::endl;
+        return false;
+    }
+
+    // Derive displacement path (e.g., avatar_texture_4k_disp.png)
+    auto disp_path = output_path;
+    disp_path.replace_filename(output_path.stem().string() + "_disp.png");
+
+    if (!cv::imwrite(disp_path.string(), final_disp))
+    {
+        std::cerr << "ExtractSMPLTextureMap: failed to write displacement map to " << disp_path.string() << std::endl;
+        return false;
+    }
+
+    std::cout << "Saved SMPL UV texture map to " << output_path.string() << std::endl;
+    std::cout << "Saved Displacement map to " << disp_path.string() << std::endl;
+    
+    return true;
+}
+
 
 bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
                             const torch::Tensor &means3D,

@@ -222,12 +222,175 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
         std::cerr << "Invalid --psr-samples-per-gaussian (must be >= 0)." << std::endl;
         return false;
     }
-    if (options->mesh_method != "tsdf" && options->mesh_method != "poisson")
+    if (options->mesh_method != "tsdf" &&
+        options->mesh_method != "poisson" &&
+        options->mesh_method != "uv")
     {
-        std::cerr << "Invalid --mesh-method (supported: tsdf|poisson)." << std::endl;
+        std::cerr << "Invalid --mesh-method (supported: tsdf|poisson|uv)." << std::endl;
         return false;
     }
     return true;
+}
+
+torch::Tensor BakeSHToRGB(const torch::Tensor &sh,
+                          const torch::Tensor &rotations,
+                          int sh_degree)
+{
+    if (!sh.defined() || sh.dim() != 3 || sh.size(2) != 3)
+    {
+        return torch::Tensor();
+    }
+
+    // Ensure rotations tensor is valid so we can compute the normals
+    if (!rotations.defined() || rotations.dim() != 2 || rotations.size(1) != 4)
+    {
+        std::cerr << "BakeSHToRGB: missing or invalid rotations tensor." << std::endl;
+        return torch::Tensor();
+    }
+
+    const int64_t count = sh.size(0);
+    if (count <= 0)
+    {
+        return torch::Tensor();
+    }
+
+    auto sh_cpu = sh.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto rot_cpu = rotations.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto rgb = torch::zeros({count, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+
+    const float *sh_ptr = sh_cpu.data_ptr<float>();
+    const float *rot_ptr = rot_cpu.data_ptr<float>();
+    float *rgb_ptr = rgb.data_ptr<float>();
+    const int64_t coeffs = sh_cpu.size(1);
+
+    constexpr float SH_C0 = 0.28209479177387814f;
+    constexpr float SH_C1 = 0.4886025119029199f;
+    constexpr float SH_C2_0 = 1.0925484305920792f;
+    constexpr float SH_C2_1 = -1.0925484305920792f;
+    constexpr float SH_C2_2 = 0.31539156525252005f;
+    constexpr float SH_C2_3 = -1.0925484305920792f;
+    constexpr float SH_C2_4 = 0.5462742152960396f;
+    constexpr float SH_C3_0 = -0.5900435899266435f;
+    constexpr float SH_C3_1 = 2.890611442640554f;
+    constexpr float SH_C3_2 = -0.4570457994644658f;
+    constexpr float SH_C3_3 = 0.3731763325901154f;
+    constexpr float SH_C3_4 = -0.4570457994644658f;
+    constexpr float SH_C3_5 = 1.445305721320277f;
+    constexpr float SH_C3_6 = -0.5900435899266435f;
+
+    const int max_degree = std::max(0, std::min(3, sh_degree));
+
+    // Define our +- 10 degree sampling cone in local space
+    // 10 degrees = 0.1745 radians. sin(10) ~ 0.1736, cos(10) ~ 0.9848
+    const float sin10 = 0.173648f;
+    const float cos10 = 0.984808f;
+    const float local_dirs[5][3] = {
+        {0.0f, 0.0f, 1.0f},    // Center (Exact Normal)
+        {sin10, 0.0f, cos10},  // Right
+        {-sin10, 0.0f, cos10}, // Left
+        {0.0f, sin10, cos10},  // Up
+        {0.0f, -sin10, cos10}  // Down
+    };
+
+    for (int64_t i = 0; i < count; ++i)
+    {
+        // Extract quaternion for this Gaussian
+        float qw = rot_ptr[i * 4 + 0];
+        float qx = rot_ptr[i * 4 + 1];
+        float qy = rot_ptr[i * 4 + 2];
+        float qz = rot_ptr[i * 4 + 3];
+
+        // Precompute the 3x3 Rotation Matrix from the Quaternion
+        float x2 = qx + qx;
+        float y2 = qy + qy;
+        float z2 = qz + qz;
+        float xx = qx * x2;
+        float yy = qy * y2;
+        float zz = qz * z2;
+        float xy = qx * y2;
+        float xz = qx * z2;
+        float yz = qy * z2;
+        float wx = qw * x2;
+        float wy = qw * y2;
+        float wz = qw * z2;
+
+        float m00 = 1.0f - (yy + zz);
+        float m01 = xy - wz;
+        float m02 = xz + wy;
+        float m10 = xy + wz;
+        float m11 = 1.0f - (xx + zz);
+        float m12 = yz - wx;
+        float m20 = xz - wy;
+        float m21 = yz + wx;
+        float m22 = 1.0f - (xx + yy);
+
+        for (int c = 0; c < 3; ++c)
+        {
+            const size_t base = static_cast<size_t>(i) * static_cast<size_t>(coeffs) * 3u;
+            auto coeff = [&](int idx) -> float
+            {
+                if (idx < 0 || idx >= coeffs)
+                    return 0.0f;
+                return sh_ptr[base + static_cast<size_t>(idx) * 3u + static_cast<size_t>(c)];
+            };
+
+            auto eval_dir = [&](float x, float y, float z) -> float
+            {
+                const float xx = x * x;
+                const float yy = y * y;
+                const float zz = z * z;
+                const float xy = x * y;
+                const float yz = y * z;
+                const float xz = x * z;
+
+                float result = SH_C0 * coeff(0);
+                if (max_degree > 0)
+                {
+                    result += -SH_C1 * y * coeff(1) + SH_C1 * z * coeff(2) - SH_C1 * x * coeff(3);
+                }
+                if (max_degree > 1)
+                {
+                    result += SH_C2_0 * xy * coeff(4) + SH_C2_1 * yz * coeff(5) +
+                              SH_C2_2 * (2.0f * zz - xx - yy) * coeff(6) +
+                              SH_C2_3 * xz * coeff(7) + SH_C2_4 * (xx - yy) * coeff(8);
+                }
+                if (max_degree > 2)
+                {
+                    result += SH_C3_0 * y * (3.0f * xx - yy) * coeff(9) +
+                              SH_C3_1 * xy * z * coeff(10) +
+                              SH_C3_2 * y * (4.0f * zz - xx - yy) * coeff(11) +
+                              SH_C3_3 * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * coeff(12) +
+                              SH_C3_4 * x * (4.0f * zz - xx - yy) * coeff(13) +
+                              SH_C3_5 * z * (xx - yy) * coeff(14) +
+                              SH_C3_6 * x * (xx - 3.0f * yy) * coeff(15);
+                }
+                return result;
+            };
+
+            // Sample the 10-degree cone and average the results
+            float sum_val = 0.0f;
+            for (int d = 0; d < 5; ++d)
+            {
+                float vx = local_dirs[d][0];
+                float vy = local_dirs[d][1];
+                float vz = local_dirs[d][2];
+
+                // Rotate the local cone vector into the Gaussian's global orientation
+                float world_x = m00 * vx + m01 * vy + m02 * vz;
+                float world_y = m10 * vx + m11 * vy + m12 * vz;
+                float world_z = m20 * vx + m21 * vy + m22 * vz;
+
+                // Normalize just to be mathematically safe after matrix multiplication
+                float len = std::sqrt(world_x * world_x + world_y * world_y + world_z * world_z) + 1e-6f;
+                sum_val += eval_dir(world_x / len, world_y / len, world_z / len);
+            }
+
+            // Average the 5 cone samples
+            rgb_ptr[i * 3 + c] = (sum_val / 5.0f) + 0.5f;
+        }
+    }
+
+    return rgb.to(sh.device());
 }
 
 torch::Tensor CropRenderToTarget(const torch::Tensor &full_render, int crop_w, int crop_h,
@@ -552,12 +715,12 @@ struct GaussianAvatar : torch::nn::Module
         auto ab = face_b - face_a;
         auto ac = face_c - face_a;
         auto cross = torch::cross(ab, ac, 1);
-        auto face_area = 0.5f * torch::norm(cross, 2, 1); 
+        auto face_area = 0.5f * torch::norm(cross, 2, 1);
         auto area_prob = face_area / torch::clamp_min(face_area.sum(), 1e-8f);
- 
+
         auto uniform_prob = torch::ones_like(face_area);
         uniform_prob = uniform_prob / uniform_prob.sum();
- 
+
         auto face_prob = (area_prob * 0.5f) + (uniform_prob * 0.5f);
 
         g_face_indices = torch::multinomial(face_prob, num_gaussians, true);
@@ -1173,9 +1336,9 @@ public:
         auto b_valids = torch::cat(valids_list).to(b_images.options().dtype());
 
         const int64_t B = b_images.size(0);
-         
-        auto bg_color = torch::rand({B, 3, 1, 1}, b_images.options()); 
-        auto comp_images = b_images + bg_color * (1.0f - b_alphas); 
+
+        auto bg_color = torch::rand({B, 3, 1, 1}, b_images.options());
+        auto comp_images = b_images + bg_color * (1.0f - b_alphas);
         auto comp_targets = (b_targets * b_masks) + bg_color * (1.0f - b_masks);
 
         auto diff = torch::abs(comp_images - comp_targets);
@@ -1257,8 +1420,8 @@ public:
         using torch::indexing::Slice;
 
         // 1) Skin thinness: keep one axis small, but allow orientation freedom.
-        auto min_scale = std::get<0>(torch::min(current_scales, 1));
-        auto skin_thinness_loss = min_scale.pow(2).mean();
+        auto z_scale = current_scales.index({Slice(), 2});
+        auto skin_thinness_loss = z_scale.pow(2).mean();
 
         // 2) Offset and 3) normal smoothness over static KNN graph.
         auto skin_smoothness_loss = torch::zeros({1}, avatar_.g_offsets.options());
@@ -1293,7 +1456,7 @@ public:
             normal_smoothness_loss = (1.0f - dot_prod).mean();
         }
 
-        const float skin_weight = 0.5f;
+        const float skin_weight = 2.0f;
         auto knn_loss = skin_weight * skin_smoothness_loss +
                         skin_weight * normal_smoothness_loss;
         auto sugar_loss = skin_thinness_loss + knn_loss;
@@ -1313,7 +1476,6 @@ public:
             // Penalize only the "shimmer/sliding" components
             sh_reg_loss = higher_orders.pow(2).mean();
         }
- 
 
         const float sobel_weight = 0.05f;
         auto loss = (1.0f - lambda_dssim_) * final_recon +
@@ -1514,7 +1676,7 @@ int run_real_training(int argc, char *argv[])
                      " [--densify-prune-max <int>] [--densify-reset-opacity <float>]"
                      " [--densify-stop-epoch <int>]"
                      " [--verbose|--verbose-diagnostics] [--verbose-every <int>]"
-                     " [--mesh-method <tsdf|poisson>]"
+                     " [--mesh-method <tsdf|poisson|uv>]"
                      " [--viewer|--headless]"
                      " [--viewer-every <int>] [--viewer-shm <name>] [--viewer-pose-shm <name>]"
                      " [--viewer-bind-shm <name>] [--viewer-stream-poses]\n";
@@ -1794,7 +1956,7 @@ int run_real_training(int argc, char *argv[])
 
     auto apply_lr_multiplier = [&](float pose_multiplier)
     {
-        pose_lr_multiplier = pose_multiplier; 
+        pose_lr_multiplier = pose_multiplier;
         static_cast<torch::optim::AdamOptions &>(optimizer.param_groups()[5].options()).lr(pose_lr * pose_lr_multiplier);
     };
 
@@ -2245,8 +2407,8 @@ int run_real_training(int argc, char *argv[])
             }
 
             // 3. Save to Disk (Every epoch, Overwrite)
-            { 
-                std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path; 
+            {
+                std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path;
                 SaveViewerDataOverwrite(save_dir, positions, colors, opacities, scales, rotations,
                                         sh_to_send, sh_degree);
             }
@@ -2466,60 +2628,114 @@ int run_real_training(int argc, char *argv[])
             colors = avatar.g_colors;
         }
 
-        const auto oriented_ply_path = out_dir_path / "canonical_oriented_points.ply";
-        if (!ExportOrientedPointCloudPly(oriented_ply_path,
-                                         positions,
-                                         rotations,
-                                         scales,
-                                         avatar.g_opacities,
-                                         colors,
-                                         psr_opacity_threshold,
-                                         psr_samples_per_gaussian))
+        if (options.mesh_method == "poisson" || options.mesh_method == "tsdf")
         {
-            std::cerr << "Warning: failed to export oriented point cloud for PSR." << std::endl;
-        }
-
-        torch::Tensor tsdf_colors_or_sh;
-        int tsdf_sh_degree = 0;
-        if (use_sh && sh_degree > 0)
-        {
-            tsdf_colors_or_sh = RotateSH(avatar.g_sh, rotations);
-            tsdf_sh_degree = sh_degree;
-        }
-        else
-        {
-            tsdf_colors_or_sh = colors;
-        }
-
-        if (options.mesh_method == "poisson") 
-        {
-            const auto poisson_ply_path = out_dir_path / "avatar_poisson.ply";
-            if (!ExtractMeshPoisson_Open3D(poisson_ply_path,
-                                           positions,
-                                           tsdf_colors_or_sh,
-                                           avatar.g_opacities,
-                                           scales, // <-- ADDED SCALES
-                                           rotations,
-                                           tsdf_sh_degree,
-                                           psr_opacity_threshold,
-                                           options.psr_samples_per_gaussian, // <-- ADDED SAMPLES
-                                           11)) 
+            const auto oriented_ply_path = out_dir_path / "canonical_oriented_points.ply";
+            if (!ExportOrientedPointCloudPly(oriented_ply_path,
+                                             positions,
+                                             rotations,
+                                             scales,
+                                             avatar.g_opacities,
+                                             colors,
+                                             psr_opacity_threshold,
+                                             psr_samples_per_gaussian))
             {
-                std::cerr << "Warning: failed to extract Poisson mesh." << std::endl;
+                std::cerr << "Warning: failed to export oriented point cloud for PSR." << std::endl;
+            }
+
+            torch::Tensor tsdf_colors_or_sh;
+            int tsdf_sh_degree = 0;
+            if (use_sh && sh_degree > 0)
+            {
+                tsdf_colors_or_sh = RotateSH(avatar.g_sh, rotations);
+                tsdf_sh_degree = sh_degree;
+            }
+            else
+            {
+                tsdf_colors_or_sh = colors;
+            }
+
+            if (options.mesh_method == "poisson")
+            {
+                const auto poisson_ply_path = out_dir_path / "avatar_poisson.ply";
+                if (!ExtractMeshPoisson_Open3D(poisson_ply_path,
+                                               positions,
+                                               tsdf_colors_or_sh,
+                                               avatar.g_opacities,
+                                               scales,
+                                               rotations,
+                                               tsdf_sh_degree,
+                                               psr_opacity_threshold,
+                                               options.psr_samples_per_gaussian,
+                                               11))
+                {
+                    std::cerr << "Warning: failed to extract Poisson mesh." << std::endl;
+                }
+            }
+            else
+            {
+                const auto tsdf_obj_path = out_dir_path / "avatar_tsdf.obj";
+                if (!ExtractMeshTSDF_Open3D(tsdf_obj_path,
+                                            positions,
+                                            tsdf_colors_or_sh,
+                                            avatar.g_opacities,
+                                            scales,
+                                            rotations,
+                                            tsdf_sh_degree))
+                {
+                    std::cerr << "Warning: failed to extract TSDF mesh." << std::endl;
+                }
             }
         }
-        else
+        else if (options.mesh_method == "uv")
         {
-            const auto tsdf_obj_path = out_dir_path / "avatar_tsdf.obj";
-            if (!ExtractMeshTSDF_Open3D(tsdf_obj_path,
-                                        positions,
-                                        tsdf_colors_or_sh,
-                                        avatar.g_opacities,
-                                        scales,
-                                        rotations,
-                                        tsdf_sh_degree))
+            std::filesystem::path smpl_uv_obj_path =
+                std::filesystem::path(smpl_model_path).parent_path() / "smpl_uv.obj";
+            if (!std::filesystem::exists(smpl_uv_obj_path))
             {
-                std::cerr << "Warning: failed to extract TSDF mesh." << std::endl;
+                smpl_uv_obj_path = "smpl_uv.obj";
+            }
+
+            torch::Tensor smpl_face_uvs = LoadSmplUVsFromOBJ(smpl_uv_obj_path.string());
+            if (smpl_face_uvs.defined())
+            {
+                torch::Tensor base_colors;
+                if (use_sh)
+                {
+                    base_colors = BakeSHToRGB(avatar.g_sh, rotations, sh_degree);
+                    if (!base_colors.defined())
+                    {
+                        using torch::indexing::Slice;
+                        constexpr float kShC0 = 0.28209479177387814f;
+                        base_colors = (avatar.g_sh.index({Slice(), 0, Slice()}) * kShC0) + 0.5f;
+                    }
+                }
+                else
+                {
+                    base_colors = avatar.g_colors;
+                }
+
+                const auto texture_path = out_dir_path / "avatar_texture_4k.png";
+                if (!ExtractSMPLTextureMap(texture_path,
+                                           base_colors,
+                                           avatar.g_opacities,
+                                           scales,
+                                           avatar.g_rots,
+                                           avatar.g_offsets,
+                                           avatar.g_face_indices,
+                                           avatar.g_bary_coords,
+                                           smpl_face_uvs,
+                                           avatar.v_template_cached,
+                                           avatar.faces_cached,
+                                           4096))
+                {
+                    std::cerr << "Warning: failed to extract SMPL UV texture map." << std::endl;
+                }
+            }
+            else
+            {
+                std::cerr << "Warning: skipped SMPL UV texture export (failed to load "
+                          << smpl_uv_obj_path.string() << ")." << std::endl;
             }
         }
     }

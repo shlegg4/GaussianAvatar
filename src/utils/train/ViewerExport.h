@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 #include <torch/torch.h>
 
@@ -52,3 +53,18 @@ bool ExtractMeshPoisson_Open3D(const std::filesystem::path &output_path,
                                float opacity_threshold = 0.5f,
                                int samples_per_gaussian = 20, // <-- NEW
                                int depth = 11);
+
+torch::Tensor LoadSmplUVsFromOBJ(const std::string &obj_path);
+
+bool ExtractSMPLTextureMap(const std::filesystem::path &output_path,
+                           const torch::Tensor &colors,
+                           const torch::Tensor &opacities,
+                            const torch::Tensor &scales,
+                            const torch::Tensor &rotations,
+                            const torch::Tensor &offsets, 
+                           const torch::Tensor &face_indices,
+                           const torch::Tensor &bary_coords,
+                           const torch::Tensor &smpl_face_uvs,
+                           const torch::Tensor &v_template,
+                           const torch::Tensor &mesh_faces,
+                           int resolution = 4096);
