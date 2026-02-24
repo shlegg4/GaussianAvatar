@@ -41,3 +41,14 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
                             int H = 1024,
                             int W = 1024,
                             bool save_debug_frames = true);
+
+bool ExtractMeshPoisson_Open3D(const std::filesystem::path &output_path,
+                               const torch::Tensor &positions,
+                               const torch::Tensor &colors_or_sh,
+                               const torch::Tensor &opacities,
+                               const torch::Tensor &scales, // <-- NEW
+                               const torch::Tensor &rotations,
+                               int sh_degree,
+                               float opacity_threshold = 0.5f,
+                               int samples_per_gaussian = 20, // <-- NEW
+                               int depth = 11);

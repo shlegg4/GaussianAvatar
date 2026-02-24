@@ -103,7 +103,7 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->scale_reg_weight = std::stof(value);
             else if (key == "--sh-reg" || key == "--sh-reg-weight" || key == "--shregweight")
                 options->sh_reg_weight = std::stof(value);
-            else if (key == "--sugar-weight" || key == "--sugar-reg-weight" || key == "--sugarweight")
+            else if (key == "--sugar-reg" || key == "--sugar-weight" || key == "--sugar-reg-weight" || key == "--sugarweight")
                 options->sugar_weight = std::stof(value);
             else if (key == "--scale-lr")
                 options->scale_lr = std::stof(value);
@@ -177,6 +177,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->viewer_pose_shm_name = value;
             else if (key == "--viewer-bind-shm")
                 options->viewer_bind_shm_name = value;
+            else if (key == "--mesh-method")
+                options->mesh_method = value;
             else
             {
                 std::cerr << "Unknown argument: " << key << std::endl;
@@ -218,6 +220,11 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
     if (options->psr_samples_per_gaussian < 0)
     {
         std::cerr << "Invalid --psr-samples-per-gaussian (must be >= 0)." << std::endl;
+        return false;
+    }
+    if (options->mesh_method != "tsdf" && options->mesh_method != "poisson")
+    {
+        std::cerr << "Invalid --mesh-method (supported: tsdf|poisson)." << std::endl;
         return false;
     }
     return true;
@@ -512,7 +519,7 @@ struct GaussianAvatar : torch::nn::Module
 {
     std::shared_ptr<SMPLLayer> smpl;
     torch::Tensor g_scales, g_rots, g_opacities, g_colors, g_offsets, g_sh;
-    torch::Tensor g_bary_coords, g_face_indices, faces_buffer;
+    torch::Tensor g_bary_coords, g_face_indices, knn_indices, faces_buffer;
     torch::Tensor v_template_cached, faces_cached;
 
     GaussianAvatar(const std::string &model_path)
@@ -603,6 +610,63 @@ struct GaussianAvatar : torch::nn::Module
             g_sh = torch::zeros({0}, torch::TensorOptions().device(device));
         }
 
+        using torch::indexing::Slice;
+        const int64_t K = 64;
+        const int64_t num_pts = num_gaussians;
+        knn_indices = torch::zeros({num_pts, K}, torch::TensorOptions().dtype(torch::kLong).device(device));
+        if (num_pts > 0)
+        {
+            auto selected_faces = faces_buffer.index_select(0, g_face_indices);
+            auto face_i0 = selected_faces.index({Slice(), 0});
+            auto face_i1 = selected_faces.index({Slice(), 1});
+            auto face_i2 = selected_faces.index({Slice(), 2});
+
+            auto A_can = verts.index_select(0, face_i0);
+            auto B_can = verts.index_select(0, face_i1);
+            auto C_can = verts.index_select(0, face_i2);
+
+            auto u = g_bary_coords.index({Slice(), 0}).unsqueeze(1);
+            auto v = g_bary_coords.index({Slice(), 1}).unsqueeze(1);
+            auto w_bary = g_bary_coords.index({Slice(), 2}).unsqueeze(1);
+            auto init_pos = u * A_can + v * B_can + w_bary * C_can;
+
+            const int64_t query_chunk = 1024;
+            const int64_t ref_chunk = 4096;
+            const float inf_val = std::numeric_limits<float>::infinity();
+
+            for (int64_t q_start = 0; q_start < num_pts; q_start += query_chunk)
+            {
+                const int64_t q_end = std::min(q_start + query_chunk, num_pts);
+                auto query_pos = init_pos.index({Slice(q_start, q_end)});
+                auto query_ids = torch::arange(q_start, q_end, torch::TensorOptions().dtype(torch::kLong).device(device));
+                const int64_t q_len = q_end - q_start;
+
+                auto best_dists = torch::full({q_len, K}, inf_val, init_pos.options());
+                auto best_indices = query_ids.unsqueeze(1).expand({q_len, K}).clone();
+
+                for (int64_t r_start = 0; r_start < num_pts; r_start += ref_chunk)
+                {
+                    const int64_t r_end = std::min(r_start + ref_chunk, num_pts);
+                    auto ref_pos = init_pos.index({Slice(r_start, r_end)});
+                    auto ref_ids = torch::arange(r_start, r_end, torch::TensorOptions().dtype(torch::kLong).device(device));
+
+                    auto dists = torch::cdist(query_pos, ref_pos);
+                    auto self_mask = query_ids.unsqueeze(1).eq(ref_ids.unsqueeze(0));
+                    dists = dists.masked_fill(self_mask, inf_val);
+
+                    auto ref_idx_expanded = ref_ids.unsqueeze(0).expand({q_len, r_end - r_start});
+                    auto cand_dists = torch::cat({best_dists, dists}, 1);
+                    auto cand_indices = torch::cat({best_indices, ref_idx_expanded}, 1);
+                    auto topk = torch::topk(cand_dists, K, 1, false, true);
+                    auto topk_idx = std::get<1>(topk);
+                    best_dists = std::get<0>(topk);
+                    best_indices = cand_indices.gather(1, topk_idx);
+                }
+
+                knn_indices.index_put_({Slice(q_start, q_end)}, best_indices);
+            }
+        }
+
         register_parameter("g_scales", g_scales);
         register_parameter("g_rots", g_rots);
         register_parameter("g_opacities", g_opacities);
@@ -611,6 +675,7 @@ struct GaussianAvatar : torch::nn::Module
         register_parameter("g_sh", g_sh);
         register_buffer("v_template_cached", v_template_cached);
         register_buffer("faces_cached", faces_cached);
+        register_buffer("knn_indices", knn_indices);
     }
 
     std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor betas, torch::Tensor pose, torch::Tensor trans)
@@ -811,6 +876,7 @@ struct TrainStepResult
     torch::Tensor scale_reg;
     torch::Tensor sh_reg_loss;
     torch::Tensor sugar_reg;
+    torch::Tensor knn_reg;
     torch::Tensor opacity_reg;
     torch::Tensor grad_rot_norm;
     torch::Tensor grad_offset_norm;
@@ -1002,6 +1068,22 @@ public:
 
             auto means3D = batch_means3D.index({static_cast<int64_t>(k)});
             auto current_rots = batch_rots.index({static_cast<int64_t>(k)});
+            auto y_sign = batch.y_signs.index({static_cast<int64_t>(k)});
+
+            // Training-only backface transparency:
+            // mask opacity for Gaussians whose normal faces away from camera.
+            auto rot_mats = QuatToMat3(current_rots, means3D.device());
+            auto normals = rot_mats.select(2, 2);
+            auto mirror = torch::stack({torch::ones_like(y_sign), y_sign, torch::ones_like(y_sign)}).unsqueeze(0);
+            normals = normals * mirror;
+            normals = torch::nn::functional::normalize(normals, torch::nn::functional::NormalizeFuncOptions().dim(1));
+
+            auto cam_pos = cam_pos_.unsqueeze(0).expand_as(means3D);
+            auto view_dirs = torch::nn::functional::normalize(
+                cam_pos - means3D, torch::nn::functional::NormalizeFuncOptions().dim(1));
+            auto facing = (normals * view_dirs).sum(1, true);
+            auto front_mask = (facing > 0.0f).to(avatar_.g_opacities.options().dtype());
+            auto opacity_eff = avatar_.g_opacities * front_mask;
 
             torch::Tensor current_sh = use_sh_ ? avatar_.g_sh : torch::zeros({0}, avatar_.g_colors.options());
             if (use_sh_ && sh_degree_eff > 0)
@@ -1012,7 +1094,7 @@ public:
             auto outputs = GaussianRasterizer::apply(
                 means3D,
                 (use_sh_ ? torch::zeros({0}, avatar_.g_colors.options()) : avatar_.g_colors),
-                avatar_.g_opacities,
+                opacity_eff,
                 CappedScales(avatar_.g_scales),
                 current_rots,
                 render_scale_modifier_,
@@ -1174,12 +1256,47 @@ public:
 
         using torch::indexing::Slice;
 
-        // 1. Flattening Loss (Force the local Z-axis scale to be very thin) 
-        auto z_scales = current_scales.index({Slice(), 2});
-        auto flatten_loss = z_scales.pow(2).mean(); 
+        // 1) Skin thinness: keep one axis small, but allow orientation freedom.
+        auto min_scale = std::get<0>(torch::min(current_scales, 1));
+        auto skin_thinness_loss = min_scale.pow(2).mean();
 
-        // Combine for total SuGaR regularization
-        auto sugar_loss = flatten_loss;
+        // 2) Offset and 3) normal smoothness over static KNN graph.
+        auto skin_smoothness_loss = torch::zeros({1}, avatar_.g_offsets.options());
+        auto normal_smoothness_loss = torch::zeros({1}, avatar_.g_rots.options());
+        if (avatar_.knn_indices.defined() && avatar_.knn_indices.numel() > 0)
+        {
+            const int64_t k_neighbors = avatar_.knn_indices.size(1);
+            auto knn_flat = avatar_.knn_indices.reshape({-1});
+
+            auto neighbor_offsets = avatar_.g_offsets.index_select(0, knn_flat).view({-1, k_neighbors, 3});
+            auto offset_diff = avatar_.g_offsets.unsqueeze(1) - neighbor_offsets;
+            skin_smoothness_loss = offset_diff.pow(2).sum(-1).mean();
+
+            auto q = torch::nn::functional::normalize(
+                avatar_.g_rots,
+                torch::nn::functional::NormalizeFuncOptions().dim(1).eps(1e-8));
+            auto qw = q.index({Slice(), 0});
+            auto qx = q.index({Slice(), 1});
+            auto qy = q.index({Slice(), 2});
+            auto qz = q.index({Slice(), 3});
+
+            auto z_dir_x = 2.0f * (qx * qz + qw * qy);
+            auto z_dir_y = 2.0f * (qy * qz - qw * qx);
+            auto z_dir_z = 1.0f - 2.0f * (qx.pow(2) + qy.pow(2));
+            auto normals = torch::stack({z_dir_x, z_dir_y, z_dir_z}, 1);
+            normals = torch::nn::functional::normalize(
+                normals,
+                torch::nn::functional::NormalizeFuncOptions().dim(1).eps(1e-8));
+
+            auto neighbor_normals = normals.index_select(0, knn_flat).view({-1, k_neighbors, 3});
+            auto dot_prod = (normals.unsqueeze(1) * neighbor_normals).sum(-1).clamp(-1.0f, 1.0f);
+            normal_smoothness_loss = (1.0f - dot_prod).mean();
+        }
+
+        const float skin_weight = 0.5f;
+        auto knn_loss = skin_weight * skin_smoothness_loss +
+                        skin_weight * normal_smoothness_loss;
+        auto sugar_loss = skin_thinness_loss + knn_loss;
 
         auto clamped_opacities = torch::clamp(avatar_.g_opacities, 0.0f, 1.0f);
         auto opacity_binarization_loss = (clamped_opacities * (1.0f - clamped_opacities)).mean();
@@ -1196,6 +1313,7 @@ public:
             // Penalize only the "shimmer/sliding" components
             sh_reg_loss = higher_orders.pow(2).mean();
         }
+ 
 
         const float sobel_weight = 0.05f;
         auto loss = (1.0f - lambda_dssim_) * final_recon +
@@ -1208,7 +1326,7 @@ public:
                     sh_reg_weight_ * sh_reg_loss +
                     sugar_weight_ * sugar_loss +
                     opacity_reg_weight_ * opacity_reg_loss +
-                    10000.0f * cap_penalty;
+                    100.0f * cap_penalty;
 
         if (capture_verbose_metrics)
         {
@@ -1222,6 +1340,7 @@ public:
             result.scale_reg = scale_reg.detach();
             result.sh_reg_loss = sh_reg_loss.detach();
             result.sugar_reg = sugar_loss.detach();
+            result.knn_reg = knn_loss.detach();
             result.opacity_reg = opacity_reg_loss.detach();
             result.scale_mean = current_scales.mean().detach();
             result.scale_min = current_scales.min().detach();
@@ -1379,7 +1498,7 @@ int run_real_training(int argc, char *argv[])
                      " [--lr-decay-epoch <int>] [--lr-decay-multiplier <float>]"
                      " [--lr-min-multiplier <float>]"
                      " [--train-dir <path>] [--viewer-export-dir <path>]"
-                     " [--scale-reg <float>] [--sh-reg <float>] [--sugar-weight <float>] [--scale-max <float>]"
+                     " [--scale-reg <float>] [--sh-reg <float>] [--sugar-reg <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
                      " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>] [--opacity-reg <float>]"
                      " [--lambda-dssim <float>]"
@@ -1395,6 +1514,7 @@ int run_real_training(int argc, char *argv[])
                      " [--densify-prune-max <int>] [--densify-reset-opacity <float>]"
                      " [--densify-stop-epoch <int>]"
                      " [--verbose|--verbose-diagnostics] [--verbose-every <int>]"
+                     " [--mesh-method <tsdf|poisson>]"
                      " [--viewer|--headless]"
                      " [--viewer-every <int>] [--viewer-shm <name>] [--viewer-pose-shm <name>]"
                      " [--viewer-bind-shm <name>] [--viewer-stream-poses]\n";
@@ -1877,6 +1997,7 @@ int run_real_training(int argc, char *argv[])
                 const float scale_reg_val = tensor_to_float(step_result.scale_reg);
                 const float sh_reg_val = tensor_to_float(step_result.sh_reg_loss);
                 const float sugar_reg_val = tensor_to_float(step_result.sugar_reg);
+                const float knn_reg_val = tensor_to_float(step_result.knn_reg);
                 const float opacity_reg_val = tensor_to_float(step_result.opacity_reg);
 
                 const float grad_rot = tensor_to_float(step_result.grad_rot_norm);
@@ -1929,6 +2050,7 @@ int run_real_training(int argc, char *argv[])
                           << " scale_reg=" << scale_reg_val
                           << " sh_reg=" << sh_reg_val
                           << " sugar_reg=" << sugar_reg_val
+                          << " knn_reg=" << knn_reg_val
                           << " opacity_reg=" << opacity_reg_val;
                 metric_logger.Log(loss_line.str());
 
@@ -1998,6 +2120,7 @@ int run_real_training(int argc, char *argv[])
                                               avatar.g_sh,
                                               avatar.g_bary_coords,
                                               avatar.g_face_indices,
+                                              avatar.knn_indices,
                                               render_scale_modifier,
                                               densify_cfg,
                                               &densify_state);
@@ -2368,16 +2491,36 @@ int run_real_training(int argc, char *argv[])
             tsdf_colors_or_sh = colors;
         }
 
-        const auto tsdf_obj_path = out_dir_path / "avatar_tsdf.obj";
-        if (!ExtractMeshTSDF_Open3D(tsdf_obj_path,
-                                    positions,
-                                    tsdf_colors_or_sh,
-                                    avatar.g_opacities,
-                                    scales,
-                                    rotations,
-                                    tsdf_sh_degree))
+        if (options.mesh_method == "poisson") 
         {
-            std::cerr << "Warning: failed to extract TSDF mesh." << std::endl;
+            const auto poisson_ply_path = out_dir_path / "avatar_poisson.ply";
+            if (!ExtractMeshPoisson_Open3D(poisson_ply_path,
+                                           positions,
+                                           tsdf_colors_or_sh,
+                                           avatar.g_opacities,
+                                           scales, // <-- ADDED SCALES
+                                           rotations,
+                                           tsdf_sh_degree,
+                                           psr_opacity_threshold,
+                                           options.psr_samples_per_gaussian, // <-- ADDED SAMPLES
+                                           11)) 
+            {
+                std::cerr << "Warning: failed to extract Poisson mesh." << std::endl;
+            }
+        }
+        else
+        {
+            const auto tsdf_obj_path = out_dir_path / "avatar_tsdf.obj";
+            if (!ExtractMeshTSDF_Open3D(tsdf_obj_path,
+                                        positions,
+                                        tsdf_colors_or_sh,
+                                        avatar.g_opacities,
+                                        scales,
+                                        rotations,
+                                        tsdf_sh_degree))
+            {
+                std::cerr << "Warning: failed to extract TSDF mesh." << std::endl;
+            }
         }
     }
     return 0;

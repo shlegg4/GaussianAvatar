@@ -43,6 +43,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
                               torch::Tensor &g_sh,
                               torch::Tensor &g_bary_coords,
                               torch::Tensor &g_face_indices,
+                              torch::Tensor &g_knn_indices,
                               float render_scale_modifier,
                               const DensificationConfig &cfg,
                               DensificationState *state);

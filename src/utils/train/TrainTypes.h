@@ -47,12 +47,13 @@ struct TrainOptions
     float alpha_loss_weight = 0.1f;
     float opacity_reg_weight = 0.0f;
     float sh_reg_weight = 5e-5f;
-    float sugar_weight = 1e-3f;
+    float sugar_weight = 1e-2f;
     float lambda_dssim = 0.2f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;
     float psr_opacity_threshold = 0.3f;
     int psr_samples_per_gaussian = 8;
+    std::string mesh_method = "tsdf";
     int sh_degree = 3;
     int densify_every = 500;
     int densify_max_splits = 64;

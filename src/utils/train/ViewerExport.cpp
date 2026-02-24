@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -538,7 +539,7 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
     torch::NoGradGuard no_grad;
     std::cout << "Starting in-memory TSDF integration..." << std::endl;
 
-    constexpr int kNumCameras = 400;
+    constexpr int kNumCameras = 1000;
     constexpr float kPi = 3.14159265358979323846f;
     constexpr float kDepthScale = 1000.0f;
     constexpr float kDepthTruncMeters = 4.0f;
@@ -546,8 +547,8 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
     auto float_opts = means3D.options().dtype(torch::kFloat32);
 
     open3d::pipelines::integration::ScalableTSDFVolume volume(
-        0.005,
-        0.04,
+        0.002,
+        0.004,
         open3d::pipelines::integration::TSDFVolumeColorType::RGB8);
 
     std::filesystem::path debug_dir;
@@ -691,7 +692,7 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
             1.0f, // scale_modifier
             view_ten, proj_t, tan_fovx, tan_fovy, H, W,
             render_sh,
-            0, // sh_degree forced to 0
+            sh_degree, // sh_degree forced to 0
             campos, false);
 
         auto out_color = outputs[0];
@@ -822,4 +823,215 @@ bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
 
     std::cout << "Saved TSDF mesh to " << output_path.string() << std::endl;
     return true;
+}
+
+bool ExtractMeshPoisson_Open3D(const std::filesystem::path &output_path,
+                               const torch::Tensor &positions,
+                               const torch::Tensor &colors_or_sh,
+                               const torch::Tensor &opacities,
+                               const torch::Tensor &scales,
+                               const torch::Tensor &rotations,
+                               int sh_degree,
+                               float opacity_threshold,
+                               int samples_per_gaussian,
+                               int depth)
+{
+#if defined(GAUSS_HAS_OPEN3D) && GAUSS_HAS_OPEN3D
+    std::cout << "Starting High-Detail Poisson Surface Reconstruction..." << std::endl;
+
+    auto pos_cpu = positions.detach().to(torch::kCPU).contiguous();
+    auto rot_cpu = rotations.detach().to(torch::kCPU).contiguous();
+    auto opa_cpu = opacities.detach().to(torch::kCPU).contiguous();
+    auto col_cpu = colors_or_sh.detach().to(torch::kCPU).contiguous();
+    auto sca_cpu = scales.detach().to(torch::kCPU).contiguous(); // NEW
+
+    const int64_t count = pos_cpu.size(0);
+    const float *pos_ptr = pos_cpu.data_ptr<float>();
+    const float *rot_ptr = rot_cpu.data_ptr<float>();
+    const float *opa_ptr = opa_cpu.data_ptr<float>();
+    const float *col_ptr = col_cpu.data_ptr<float>();
+    const float *sca_ptr = sca_cpu.data_ptr<float>(); // NEW
+
+    open3d::geometry::PointCloud pcd;
+    // Pre-allocate memory for the mean + samples
+    pcd.points_.reserve(count * (samples_per_gaussian + 1));
+    pcd.normals_.reserve(count * (samples_per_gaussian + 1));
+    pcd.colors_.reserve(count * (samples_per_gaussian + 1));
+
+    const float SH_C0 = 0.28209479177387814f;
+    const bool is_sh = (sh_degree > 0 && col_cpu.dim() == 3);
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    const float radius_cutoff = 0.2f; // Stay slightly inside the Gaussian edge
+
+    int added_points = 0;
+    for (int64_t i = 0; i < count; ++i)
+    {
+        if (opa_ptr[i] < opacity_threshold)
+            continue;
+
+        float qw = rot_ptr[i * 4 + 0];
+        float qx = rot_ptr[i * 4 + 1];
+        float qy = rot_ptr[i * 4 + 2];
+        float qz = rot_ptr[i * 4 + 3];
+
+        // Normal (Z-axis)
+        float nz_x = 2.0f * (qx * qz + qw * qy);
+        float nz_y = 2.0f * (qy * qz - qw * qx);
+        float nz_z = 1.0f - 2.0f * (qx * qx + qy * qy);
+        float n_len = std::sqrt(nz_x * nz_x + nz_y * nz_y + nz_z * nz_z);
+        if (n_len > 1e-6f)
+        {
+            nz_x /= n_len;
+            nz_y /= n_len;
+            nz_z /= n_len;
+        }
+
+        // Outward Normal Check
+        float dir_x = pos_ptr[i * 3 + 0];
+        float dir_z = pos_ptr[i * 3 + 2];
+        if ((nz_x * dir_x + nz_z * dir_z) < 0)
+        {
+            nz_x = -nz_x;
+            nz_y = -nz_y;
+            nz_z = -nz_z;
+        }
+
+        // Color
+        float r, g, b;
+        if (is_sh)
+        {
+            const int sh_dim = col_cpu.size(1);
+            const size_t base_idx = i * (sh_dim * 3);
+
+            // Base Color (DC Component)
+            r = col_ptr[base_idx + 0] * SH_C0;
+            g = col_ptr[base_idx + 1] * SH_C0;
+            b = col_ptr[base_idx + 2] * SH_C0;
+
+            // Add Degree 1 Lighting (Ambient Occlusion & Directional Shadows)
+            if (sh_degree > 0 && sh_dim >= 4)
+            {
+                const float SH_C1 = 0.4886025119029199f;
+                // We use the outward normal (nz_x, nz_y, nz_z) as the viewing direction
+                // to bake the color as if looking directly at the surface
+                float x = nz_x;
+                float y = nz_y;
+                float z = nz_z;
+
+                r -= SH_C1 * y * col_ptr[base_idx + 3] + SH_C1 * z * col_ptr[base_idx + 6] - SH_C1 * x * col_ptr[base_idx + 9];
+                g -= SH_C1 * y * col_ptr[base_idx + 4] + SH_C1 * z * col_ptr[base_idx + 7] - SH_C1 * x * col_ptr[base_idx + 10];
+                b -= SH_C1 * y * col_ptr[base_idx + 5] + SH_C1 * z * col_ptr[base_idx + 8] - SH_C1 * x * col_ptr[base_idx + 11];
+            }
+            // Move from SH space (-0.5 to 0.5) to RGB space (0.0 to 1.0)
+            r += 0.5f;
+            g += 0.5f;
+            b += 0.5f;
+        }
+        else
+        {
+            r = col_ptr[i * 3 + 0];
+            g = col_ptr[i * 3 + 1];
+            b = col_ptr[i * 3 + 2];
+        }
+
+        r = std::clamp(r, 0.0f, 1.0f);
+        g = std::clamp(g, 0.0f, 1.0f);
+        b = std::clamp(b, 0.0f, 1.0f);
+
+        // Center position
+        float cx = pos_ptr[i * 3 + 0];
+        float cy = pos_ptr[i * 3 + 1];
+        float cz = pos_ptr[i * 3 + 2];
+
+        // 1. Add the mean point
+        pcd.points_.emplace_back(cx, cy, cz);
+        pcd.normals_.emplace_back(nz_x, nz_y, nz_z);
+        pcd.colors_.emplace_back(r, g, b);
+        added_points++;
+
+        // 2. Add the surface samples
+        if (samples_per_gaussian > 0)
+        {
+            // X and Y axes for the disk
+            float vx_x = 1.0f - 2.0f * (qy * qy + qz * qz);
+            float vx_y = 2.0f * (qx * qy + qw * qz);
+            float vx_z = 2.0f * (qx * qz - qw * qy);
+            float vy_x = 2.0f * (qx * qy - qw * qz);
+            float vy_y = 1.0f - 2.0f * (qx * qx + qz * qz);
+            float vy_z = 2.0f * (qy * qz + qw * qx);
+
+            float sx = std::max(0.0f, sca_ptr[i * 3 + 0]);
+            float sy = std::max(0.0f, sca_ptr[i * 3 + 1]);
+
+            for (int sample_idx = 0; sample_idx < samples_per_gaussian; ++sample_idx)
+            {
+                float r_samp = radius_cutoff * std::sqrt(dist(gen));
+                float theta = 2.0f * 3.1415926535f * dist(gen);
+
+                float u = r_samp * std::cos(theta) * sx;
+                float v = r_samp * std::sin(theta) * sy;
+
+                pcd.points_.emplace_back(
+                    cx + (u * vx_x) + (v * vy_x),
+                    cy + (u * vx_y) + (v * vy_y),
+                    cz + (u * vx_z) + (v * vy_z));
+                pcd.normals_.emplace_back(nz_x, nz_y, nz_z);
+                pcd.colors_.emplace_back(r, g, b);
+                added_points++;
+            }
+        }
+    }
+
+    std::cout << "Running Poisson on " << added_points << " oriented surface points (Depth: " << depth << ")..." << std::endl;
+
+    auto poisson_res = open3d::geometry::TriangleMesh::CreateFromPointCloudPoisson(pcd, depth);
+    auto mesh = std::get<0>(poisson_res);
+    auto densities = std::get<1>(poisson_res);
+
+    if (!densities.empty() && !mesh->vertices_.empty())
+    {
+        std::vector<double> sorted_densities = densities;
+        std::sort(sorted_densities.begin(), sorted_densities.end());
+        double density_thresh = sorted_densities[sorted_densities.size() / 100]; // 1% trim
+
+        std::vector<bool> remove_mask(mesh->vertices_.size(), false);
+        for (size_t i = 0; i < densities.size(); ++i)
+        {
+            if (densities[i] < density_thresh)
+            {
+                remove_mask[i] = true;
+            }
+        }
+        mesh->RemoveVerticesByMask(remove_mask);
+    }
+
+    std::cout << "Sanitizing degenerate geometry..." << std::endl;
+    mesh->RemoveDuplicatedVertices();
+    mesh->RemoveDuplicatedTriangles();
+    mesh->RemoveDegenerateTriangles();
+    mesh->RemoveUnreferencedVertices();
+
+    std::cout << "Applying Taubin smoothing to remove noise while preserving features..." << std::endl;
+    // 15-20 iterations is safe here because the 'mu' parameter prevents shrinking/melting.
+    mesh = mesh->FilterSmoothTaubin(15, 0.5, -0.53);
+
+    std::cout << "Decimating mesh to reduce triangle count..." << std::endl;
+    mesh = mesh->SimplifyQuadricDecimation(250000, std::numeric_limits<double>::infinity(), 1.0);
+
+    std::error_code ec;
+    std::filesystem::create_directories(output_path.parent_path(), ec);
+    mesh->ComputeVertexNormals();
+
+    if (!open3d::io::WriteTriangleMesh(output_path.string(), *mesh))
+    {
+        std::cerr << "ExtractMeshPoisson: Failed to write mesh." << std::endl;
+        return false;
+    }
+
+    return true;
+#else
+    return false;
+#endif
 }

@@ -52,6 +52,7 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
                               torch::Tensor &g_sh,
                               torch::Tensor &g_bary_coords,
                               torch::Tensor &g_face_indices,
+                              torch::Tensor &g_knn_indices,
                               float render_scale_modifier,
                               const DensificationConfig &cfg,
                               DensificationState *state)
@@ -112,10 +113,24 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
     auto kept_offsets = g_offsets.index_select(0, keep_indices);
     auto kept_bary = g_bary_coords.index_select(0, keep_indices);
     auto kept_faces = g_face_indices.index_select(0, keep_indices);
+    torch::Tensor kept_knn;
     torch::Tensor kept_sh;
     if (g_sh.defined() && g_sh.numel() > 0)
     {
         kept_sh = g_sh.index_select(0, keep_indices);
+    }
+    if (g_knn_indices.defined() && g_knn_indices.numel() > 0)
+    {
+        kept_knn = g_knn_indices.index_select(0, keep_indices);
+        auto old_to_new = torch::full({total}, -1, torch::TensorOptions().dtype(torch::kLong).device(g_scales.device()));
+        auto new_ids = torch::arange(keep_indices.size(0), torch::TensorOptions().dtype(torch::kLong).device(g_scales.device()));
+        old_to_new.index_put_({keep_indices}, new_ids);
+
+        auto remapped = old_to_new.index_select(0, kept_knn.reshape({-1})).view_as(kept_knn);
+        auto row_ids = torch::arange(keep_indices.size(0), torch::TensorOptions().dtype(torch::kLong).device(g_scales.device()))
+                           .unsqueeze(1)
+                           .expand_as(remapped);
+        kept_knn = torch::where(remapped >= 0, remapped, row_ids);
     }
 
     auto kept_grad_norm = grad_norm.index_select(0, keep_indices);
@@ -160,10 +175,15 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
         auto parent_opacities = kept_opacities.index_select(0, parent_local);
         auto parent_bary = kept_bary.index_select(0, parent_local);
         auto parent_faces = kept_faces.index_select(0, parent_local);
+        torch::Tensor parent_knn;
         torch::Tensor parent_sh;
         if (kept_sh.defined() && kept_sh.numel() > 0)
         {
             parent_sh = kept_sh.index_select(0, parent_local);
+        }
+        if (kept_knn.defined() && kept_knn.numel() > 0)
+        {
+            parent_knn = kept_knn.index_select(0, parent_local);
         }
 
         // Generate split direction
@@ -205,6 +225,10 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
         kept_opacities = torch::cat({kept_opacities, child_opacities}, 0);
         kept_bary = torch::cat({kept_bary, child_bary}, 0);
         kept_faces = torch::cat({kept_faces, child_faces}, 0);
+        if (kept_knn.defined() && kept_knn.numel() > 0)
+        {
+            kept_knn = torch::cat({kept_knn, parent_knn}, 0);
+        }
         if (kept_sh.defined() && kept_sh.numel() > 0)
         {
             kept_sh = torch::cat({kept_sh, parent_sh}, 0);
@@ -250,10 +274,15 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
                 auto child_opacities = kept_opacities.index_select(0, parent_local);
                 auto child_bary = kept_bary.index_select(0, parent_local);
                 auto child_faces = kept_faces.index_select(0, parent_local);
+                torch::Tensor child_knn;
                 torch::Tensor parent_sh;
                 if (kept_sh.defined() && kept_sh.numel() > 0)
                 {
                     parent_sh = kept_sh.index_select(0, parent_local);
+                }
+                if (kept_knn.defined() && kept_knn.numel() > 0)
+                {
+                    child_knn = kept_knn.index_select(0, parent_local);
                 }
 
                 kept_scales = torch::cat({kept_scales, child_scales}, 0);
@@ -263,6 +292,10 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
                 kept_opacities = torch::cat({kept_opacities, child_opacities}, 0);
                 kept_bary = torch::cat({kept_bary, child_bary}, 0);
                 kept_faces = torch::cat({kept_faces, child_faces}, 0);
+                if (kept_knn.defined() && kept_knn.numel() > 0)
+                {
+                    kept_knn = torch::cat({kept_knn, child_knn}, 0);
+                }
                 if (kept_sh.defined() && kept_sh.numel() > 0)
                 {
                     kept_sh = torch::cat({kept_sh, parent_sh}, 0);
@@ -278,6 +311,10 @@ DensifyStats DensifyGaussians(torch::Tensor &g_scales,
     g_opacities = kept_opacities.detach().clone().set_requires_grad(true);
     g_bary_coords = kept_bary;
     g_face_indices = kept_faces;
+    if (kept_knn.defined() && kept_knn.numel() > 0)
+    {
+        g_knn_indices = kept_knn;
+    }
     if (g_sh.defined() && g_sh.numel() > 0)
     {
         g_sh = kept_sh.detach().clone().set_requires_grad(true);

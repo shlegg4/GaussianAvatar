@@ -110,7 +110,7 @@ namespace
     torch::Tensor DepthToHeatmap(const torch::Tensor &out_depth, const torch::Tensor &out_alpha)
     {
         auto depth = torch::abs(out_depth / torch::clamp_min(out_alpha, 1e-6f));
-        auto valid = out_alpha > 1e-4f;
+        auto valid = out_alpha > 1e-1f;
         auto valid_depth_values = depth.masked_select(valid);
 
         auto depth_norm = torch::zeros_like(depth);
