@@ -48,6 +48,7 @@ struct TrainOptions
     float opacity_reg_weight = 0.0f;
     float sh_reg_weight = 5e-5f;
     float sugar_weight = 1e-2f;
+    float anisotropic_reg_weight = 0.0f;
     float lambda_dssim = 0.2f;
     float color_lr = -1.0f;
     float opacity_lr = -1.0f;

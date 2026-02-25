@@ -1277,7 +1277,7 @@ bool ExtractMeshPoisson_Open3D(const std::filesystem::path &output_path,
 
     std::mt19937 gen(42);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    const float radius_cutoff = 0.2f; // Stay slightly inside the Gaussian edge
+    const float radius_cutoff = 0.8f; // Stay slightly inside the Gaussian edge
 
     int added_points = 0;
     for (int64_t i = 0; i < count; ++i)
@@ -1301,17 +1301,7 @@ bool ExtractMeshPoisson_Open3D(const std::filesystem::path &output_path,
             nz_y /= n_len;
             nz_z /= n_len;
         }
-
-        // Outward Normal Check
-        float dir_x = pos_ptr[i * 3 + 0];
-        float dir_z = pos_ptr[i * 3 + 2];
-        if ((nz_x * dir_x + nz_z * dir_z) < 0)
-        {
-            nz_x = -nz_x;
-            nz_y = -nz_y;
-            nz_z = -nz_z;
-        }
-
+ 
         // Color
         float r, g, b;
         if (is_sh)
@@ -1408,7 +1398,7 @@ bool ExtractMeshPoisson_Open3D(const std::filesystem::path &output_path,
     {
         std::vector<double> sorted_densities = densities;
         std::sort(sorted_densities.begin(), sorted_densities.end());
-        double density_thresh = sorted_densities[sorted_densities.size() / 100]; // 1% trim
+        double density_thresh = sorted_densities[sorted_densities.size() / 500]; // 1% trim
 
         std::vector<bool> remove_mask(mesh->vertices_.size(), false);
         for (size_t i = 0; i < densities.size(); ++i)

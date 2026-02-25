@@ -105,6 +105,8 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
                 options->sh_reg_weight = std::stof(value);
             else if (key == "--sugar-reg" || key == "--sugar-weight" || key == "--sugar-reg-weight" || key == "--sugarweight")
                 options->sugar_weight = std::stof(value);
+            else if (key == "--anisotropic-reg")
+                options->anisotropic_reg_weight = std::stof(value);
             else if (key == "--scale-lr")
                 options->scale_lr = std::stof(value);
             else if (key == "--scale-max")
@@ -746,10 +748,16 @@ struct GaussianAvatar : torch::nn::Module
         auto face_quats = torch::cat({qw.unsqueeze(1), qxyz}, 1);
 
         // 1. Get the base scale from the face area
-        auto face_scale_sel = face_scale.index_select(0, g_face_indices) * 0.3f;
+        float density_ratio = static_cast<float>(num_faces) / static_cast<float>(num_gaussians);
+        
+        // Use the square root because scale is a 1D radius, but we are dividing 2D area
+        float density_multiplier = std::sqrt(density_ratio);
+        
+        // 0.6f is a safe base coverage overlap factor. 
+        auto face_scale_sel = face_scale.index_select(0, g_face_indices) * (0.6f * density_multiplier);
 
         // 2. Enforce a minimum physical radius (e.g., 3mm) so they don't start "dead"
-        float min_init_scale = 0.003f;
+        float min_init_scale = 0.0005f;
         face_scale_sel = torch::clamp_min(face_scale_sel, min_init_scale);
 
         // 3. Convert to log-space for the optimizer
@@ -760,7 +768,7 @@ struct GaussianAvatar : torch::nn::Module
 
         auto g_rots_init = face_quats.index_select(0, g_face_indices);
         g_rots = g_rots_init.detach().clone().set_requires_grad(true);
-        g_opacities = torch::full({num_gaussians, 1}, 0.1, torch::requires_grad().device(device));
+        g_opacities = torch::full({num_gaussians, 1}, 0.95, torch::requires_grad().device(device));
         g_colors = torch::full({num_gaussians, 3}, 0.5, torch::requires_grad().device(device));
         g_offsets = torch::zeros({num_gaussians, 3}, torch::requires_grad().device(device));
         if (sh_degree > 0)
@@ -1041,6 +1049,7 @@ struct TrainStepResult
     torch::Tensor sugar_reg;
     torch::Tensor knn_reg;
     torch::Tensor opacity_reg;
+    torch::Tensor anisotropic_reg;
     torch::Tensor grad_rot_norm;
     torch::Tensor grad_offset_norm;
     torch::Tensor grad_scale_norm;
@@ -1085,6 +1094,7 @@ public:
                     float sh_reg_weight,
                     float sugar_weight,
                     float opacity_reg_weight,
+                    float anisotropic_reg_weight,
                     int opacity_reg_start_epoch)
         : avatar_(avatar),
           pose_refiner_(pose_refiner),
@@ -1108,6 +1118,7 @@ public:
           sh_reg_weight_(sh_reg_weight),
           sugar_weight_(sugar_weight),
           opacity_reg_weight_(opacity_reg_weight),
+          anisotropic_reg_weight_(anisotropic_reg_weight),
           opacity_reg_start_epoch_(opacity_reg_start_epoch)
     {
     }
@@ -1407,6 +1418,11 @@ public:
         auto current_scales = CappedScales(avatar_.g_scales) * render_scale_modifier_;
         auto scale_reg = torch::mean(current_scales.pow(2).sum(1));
         auto offset_reg = torch::mean(torch::abs(avatar_.g_offsets));
+        auto x_scale = current_scales.index({torch::indexing::Slice(), 0});
+        auto y_scale = current_scales.index({torch::indexing::Slice(), 1});
+        auto xy_max = torch::max(x_scale, y_scale);
+        auto xy_min = torch::min(x_scale, y_scale);
+        auto anisotropic_loss = torch::mean(xy_max / torch::clamp_min(xy_min, 1e-5f));
 
         torch::Tensor cap_penalty = torch::zeros({1}, current_scales.options());
         if (scale_cap_ > 0.0f)
@@ -1488,6 +1504,7 @@ public:
                     sh_reg_weight_ * sh_reg_loss +
                     sugar_weight_ * sugar_loss +
                     opacity_reg_weight_ * opacity_reg_loss +
+                    anisotropic_reg_weight_ * anisotropic_loss +
                     100.0f * cap_penalty;
 
         if (capture_verbose_metrics)
@@ -1504,6 +1521,7 @@ public:
             result.sugar_reg = sugar_loss.detach();
             result.knn_reg = knn_loss.detach();
             result.opacity_reg = opacity_reg_loss.detach();
+            result.anisotropic_reg = anisotropic_loss.detach();
             result.scale_mean = current_scales.mean().detach();
             result.scale_min = current_scales.min().detach();
             result.scale_max = current_scales.max().detach();
@@ -1637,6 +1655,7 @@ private:
     float sh_reg_weight_ = 0.0f;
     float sugar_weight_ = 0.0f;
     float opacity_reg_weight_ = 0.0f;
+    float anisotropic_reg_weight_ = 0.0f;
     int opacity_reg_start_epoch_ = 0;
     bool graph_captured_ = false;
     int64_t captured_gaussians_ = -1;
@@ -1660,7 +1679,7 @@ int run_real_training(int argc, char *argv[])
                      " [--lr-decay-epoch <int>] [--lr-decay-multiplier <float>]"
                      " [--lr-min-multiplier <float>]"
                      " [--train-dir <path>] [--viewer-export-dir <path>]"
-                     " [--scale-reg <float>] [--sh-reg <float>] [--sugar-reg <float>] [--scale-max <float>]"
+                     " [--scale-reg <float>] [--sh-reg <float>] [--sugar-reg <float>] [--anisotropic-reg <float>] [--scale-max <float>]"
                      " [--rot-lr <float>] [--offset-lr <float>]"
                      " [--offset-reg <float>] [--pose-reg <float>] [--pose-lr <float>] [--alpha-loss <float>] [--opacity-reg <float>]"
                      " [--lambda-dssim <float>]"
@@ -1707,6 +1726,7 @@ int run_real_training(int argc, char *argv[])
     const float scale_reg_weight = options.scale_reg_weight;
     const float sh_reg_weight = options.sh_reg_weight;
     const float sugar_weight = options.sugar_weight;
+    const float anisotropic_reg_weight = options.anisotropic_reg_weight;
     const float scale_lr = (options.scale_lr < 0.0f) ? lr : options.scale_lr;
     const float scale_max_value = options.scale_max_value;
     const float rot_lr = (options.rot_lr < 0.0f) ? lr : options.rot_lr;
@@ -2032,6 +2052,7 @@ int run_real_training(int argc, char *argv[])
                             sh_reg_weight,
                             sugar_weight,
                             opacity_reg_weight,
+                            anisotropic_reg_weight,
                             warmup_epochs);
     GaussianDataLoader loader(samples,
                               cached,
@@ -2161,6 +2182,7 @@ int run_real_training(int argc, char *argv[])
                 const float sugar_reg_val = tensor_to_float(step_result.sugar_reg);
                 const float knn_reg_val = tensor_to_float(step_result.knn_reg);
                 const float opacity_reg_val = tensor_to_float(step_result.opacity_reg);
+                const float anisotropic_reg_val = tensor_to_float(step_result.anisotropic_reg);
 
                 const float grad_rot = tensor_to_float(step_result.grad_rot_norm);
                 const float grad_offset = tensor_to_float(step_result.grad_offset_norm);
@@ -2213,7 +2235,8 @@ int run_real_training(int argc, char *argv[])
                           << " sh_reg=" << sh_reg_val
                           << " sugar_reg=" << sugar_reg_val
                           << " knn_reg=" << knn_reg_val
-                          << " opacity_reg=" << opacity_reg_val;
+                          << " opacity_reg=" << opacity_reg_val
+                          << " anisotropic_reg=" << anisotropic_reg_val;
                 metric_logger.Log(loss_line.str());
 
                 std::ostringstream grad_line;
