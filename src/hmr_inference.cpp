@@ -16,6 +16,10 @@ void PrintUsage() {
         << "  --yolo-cuda                    Enable CUDA for YOLO (if available)\n"
         << "  --modnet <model.onnx>           MODNet matting model path\n"
         << "  --modnet-cuda                   Enable CUDA for MODNet (if available)\n"
+        << "  --depth <model.onnx>            Depth Anything model path\n"
+        << "  --depth-cuda                    Enable CUDA for Depth Anything\n"
+        << "  --dsine <model.onnx>            DSine normal estimation model path\n"
+        << "  --dsine-cuda                    Enable CUDA for DSine\n"
         << "  --modnet-input <int>            MODNet input size if model is dynamic\n"
         << "  --rtmpose-cuda                  Enable CUDA for RTMPose (if available)\n"
         << "  --focal-scale <float>           Focal length scale (default 1.2)\n"
@@ -81,6 +85,24 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--modnet-cuda") {
             options.modnet_use_cuda = true;
+            continue;
+        }
+        if (arg == "--depth" && i + 1 < argc) {
+            options.use_depth = true;
+            options.depth_model_path = argv[++i];
+            continue;
+        }
+        if (arg == "--depth-cuda") {
+            options.depth_use_cuda = true;
+            continue;
+        }
+        if (arg == "--dsine" && i + 1 < argc) {
+            options.use_dsine = true;
+            options.dsine_model_path = argv[++i];
+            continue;
+        }
+        if (arg == "--dsine-cuda") {
+            options.dsine_use_cuda = true;
             continue;
         }
         if (arg == "--rtmpose-cuda") {

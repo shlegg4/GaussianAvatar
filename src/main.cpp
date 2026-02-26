@@ -749,26 +749,28 @@ struct GaussianAvatar : torch::nn::Module
 
         // 1. Get the base scale from the face area
         float density_ratio = static_cast<float>(num_faces) / static_cast<float>(num_gaussians);
-        
+
         // Use the square root because scale is a 1D radius, but we are dividing 2D area
         float density_multiplier = std::sqrt(density_ratio);
-        
-        // 0.6f is a safe base coverage overlap factor. 
-        auto face_scale_sel = face_scale.index_select(0, g_face_indices) * (0.6f * density_multiplier);
 
-        // 2. Enforce a minimum physical radius (e.g., 3mm) so they don't start "dead"
+        auto face_scale_sel = face_scale.index_select(0, g_face_indices) * (0.6f * density_multiplier);
         float min_init_scale = 0.0005f;
         face_scale_sel = torch::clamp_min(face_scale_sel, min_init_scale);
 
-        // 3. Convert to log-space for the optimizer
+        // 1. Keep X and Y as the radius of the disc
         auto log_scale_base = torch::log(face_scale_sel / safe_scale_mod);
 
-        // Use the same log scale for X, Y, AND Z
+        // 2. Make the Z scale (thickness along the normal) much smaller, e.g., 10% of the radius
+        auto log_scale_z = torch::log((face_scale_sel * 0.1f) / safe_scale_mod);
+
+        // Apply the anisotropic scales
         g_scales = torch::stack({log_scale_base, log_scale_base, log_scale_base}, 1).clone().set_requires_grad(true);
 
         auto g_rots_init = face_quats.index_select(0, g_face_indices);
         g_rots = g_rots_init.detach().clone().set_requires_grad(true);
-        g_opacities = torch::full({num_gaussians, 1}, 0.95, torch::requires_grad().device(device));
+
+        // 3. Lower initial opacity so they blend instead of block
+        g_opacities = torch::full({num_gaussians, 1}, 0.1f, torch::requires_grad().device(device));
         g_colors = torch::full({num_gaussians, 3}, 0.5, torch::requires_grad().device(device));
         g_offsets = torch::zeros({num_gaussians, 3}, torch::requires_grad().device(device));
         if (sh_degree > 0)

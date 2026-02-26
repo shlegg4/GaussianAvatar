@@ -35,6 +35,12 @@ struct HmrOutputOptions {
     std::string modnet_model_path = "modnet.onnx";
     bool modnet_use_cuda = false;
     int modnet_input_size = 512;
+    bool use_depth = false;
+    std::string depth_model_path;
+    bool depth_use_cuda = false;
+    bool use_dsine = false;
+    std::string dsine_model_path;
+    bool dsine_use_cuda = false;
 };
 
 bool RunHmrInferenceOnVideo(const std::string& model_path,

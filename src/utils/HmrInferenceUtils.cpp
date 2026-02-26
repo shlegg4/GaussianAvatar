@@ -15,6 +15,8 @@
 #include "HmrInferenceConstants.h"
 #include "HmrMathHelpers.h"
 #include "HmrOverlayHelpers.h"
+#include "DepthAnything.h"
+#include "DsineNormalEstimator.h"
 #include "ModNetMatte.h"
 #include "SmplifyLite.h"
 #include "SmplLBS.h"
@@ -257,6 +259,18 @@ std::string MakeMatteCropName(int frame_idx) {
     return oss.str();
 }
 
+std::string MakeDepthName(int frame_idx) {
+    std::ostringstream oss;
+    oss << "depths/depth_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
+std::string MakeNormalName(int frame_idx) {
+    std::ostringstream oss;
+    oss << "normals/normal_" << std::setw(6) << std::setfill('0') << frame_idx << ".png";
+    return oss.str();
+}
+
 std::string MakeObjName(int frame_idx) {
     std::ostringstream oss;
     oss << "smpl_" << std::setw(6) << std::setfill('0') << frame_idx << ".obj";
@@ -463,6 +477,32 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
         if (!modnet.Load(options.modnet_model_path)) {
             std::cerr << "Failed to load MODNet model: " << options.modnet_model_path << std::endl;
             use_modnet = false;
+        }
+    }
+
+    bool use_depth = options.use_depth && !options.depth_model_path.empty();
+    DepthAnythingOptions depth_opts;
+    depth_opts.use_cuda = options.depth_use_cuda;
+    DepthAnything depth_estimator(depth_opts);
+    if (use_depth) {
+        if (!depth_estimator.Load(options.depth_model_path)) {
+            std::cerr << "Failed to load Depth Anything model: " << options.depth_model_path << std::endl;
+            use_depth = false;
+        } else if (save_outputs) {
+            EnsureOutputDir((std::filesystem::path(options.output_dir) / "depths").string());
+        }
+    }
+
+    bool use_dsine = options.use_dsine && !options.dsine_model_path.empty();
+    DsineOptions dsine_opts;
+    dsine_opts.use_cuda = options.dsine_use_cuda;
+    DsineNormalEstimator dsine_estimator(dsine_opts);
+    if (use_dsine) {
+        if (!dsine_estimator.Load(options.dsine_model_path)) {
+            std::cerr << "Failed to load DSine model: " << options.dsine_model_path << std::endl;
+            use_dsine = false;
+        } else if (save_outputs) {
+            EnsureOutputDir((std::filesystem::path(options.output_dir) / "normals").string());
         }
     }
 
@@ -728,6 +768,7 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                     cv::Mat matte;
                     cv::Mat matted_frame;
                     bool has_matte = false;
+                    cv::Mat padded_matte;
 
                     if (use_modnet) {
                         if (modnet.ComputeMatte(crop_img, &matte)) {
@@ -786,19 +827,75 @@ bool RunHmrInferenceOnVideo(const std::string& model_path,
                     crop_h = static_cast<float>(target_h);
 
                     if (has_matte) {
-                        cv::Mat matte_u8;
-                        matte.convertTo(matte_u8, CV_8U, 255.0);
-
-                        cv::Mat padded_matte_u8;
-                        cv::copyMakeBorder(matte_u8, padded_matte_u8,
+                        cv::copyMakeBorder(matte, padded_matte,
                                            pad_top, pad_bottom, pad_left, pad_right,
-                                           cv::BORDER_CONSTANT, cv::Scalar(0));
-                        matte_u8 = padded_matte_u8;
+                                           cv::BORDER_CONSTANT, cv::Scalar(0.0f));
+                        cv::threshold(padded_matte, padded_matte, 0.0, 0.0, cv::THRESH_TOZERO);
+                        cv::threshold(padded_matte, padded_matte, 1.0, 1.0, cv::THRESH_TRUNC);
+
+                        cv::Mat matte_u8;
+                        padded_matte.convertTo(matte_u8, CV_8U, 255.0);
 
                         const auto matte_path = std::filesystem::path(options.output_dir) / MakeMatteName(frame_idx);
                         cv::imwrite(matte_path.string(), matte_u8);
                         const auto matte_crop_path = std::filesystem::path(options.output_dir) / MakeMatteCropName(frame_idx);
                         cv::imwrite(matte_crop_path.string(), matte_u8);
+                    }
+
+                    if (use_depth) {
+                        cv::Mat depth_map;
+                        if (depth_estimator.ComputeDepth(crop_img, &depth_map)) {
+                            if (has_matte && !padded_matte.empty()) {
+                                cv::Mat matte_for_depth = padded_matte;
+                                if (matte_for_depth.size() != depth_map.size()) {
+                                    cv::resize(matte_for_depth, matte_for_depth, depth_map.size(), 0, 0, cv::INTER_LINEAR);
+                                }
+
+                                cv::Mat depth_float;
+                                depth_map.convertTo(depth_float, CV_32F);
+                                cv::multiply(depth_float, matte_for_depth, depth_float);
+                                depth_float.convertTo(depth_map, CV_8U);
+                            }
+
+                            const auto depth_path = std::filesystem::path(options.output_dir) / MakeDepthName(frame_idx);
+                            cv::imwrite(depth_path.string(), depth_map);
+                        }
+                    }
+
+                    if (use_dsine) {
+                        cv::Mat normal_map;
+                        const float dsine_focal = std::max(1.0f, train_focal);
+                        const float dsine_cx = static_cast<float>(crop_img.cols) * 0.5f;
+                        const float dsine_cy = static_cast<float>(crop_img.rows) * 0.5f;
+                        if (dsine_estimator.ComputeNormals(crop_img, dsine_focal, dsine_cx, dsine_cy, &normal_map)) {
+                            if (has_matte && !padded_matte.empty()) {
+                                cv::Mat matte_for_normals = padded_matte;
+                                if (matte_for_normals.size() != normal_map.size()) {
+                                    cv::resize(matte_for_normals, matte_for_normals, normal_map.size(), 0, 0, cv::INTER_LINEAR);
+                                }
+
+                                cv::Mat matte_3c;
+                                cv::cvtColor(matte_for_normals, matte_3c, cv::COLOR_GRAY2BGR);
+
+                                cv::Mat normal_float;
+                                normal_map.convertTo(normal_float, CV_32FC3);
+
+                                cv::Mat matted_normals;
+                                cv::multiply(normal_float, matte_3c, matted_normals);
+
+                                // Neutral normal in BGR for background: [255, 128, 128].
+                                cv::Mat background(normal_map.size(), CV_32FC3, cv::Scalar(255.0f, 128.0f, 128.0f));
+                                cv::Mat inv_matte_3c = cv::Scalar(1.0f, 1.0f, 1.0f) - matte_3c;
+                                cv::Mat bg_weighted;
+                                cv::multiply(background, inv_matte_3c, bg_weighted);
+                                cv::add(matted_normals, bg_weighted, normal_float);
+
+                                normal_float.convertTo(normal_map, CV_8UC3);
+                            }
+
+                            const auto normal_path = std::filesystem::path(options.output_dir) / MakeNormalName(frame_idx);
+                            cv::imwrite(normal_path.string(), normal_map);
+                        }
                     }
 
                     cv::imwrite(crop_path.string(), crop_img);
