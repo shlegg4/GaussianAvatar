@@ -16,28 +16,28 @@ endif()
 
 # --- CONFIGURATION START ---
 # SET THIS: Path to your TensorRT install folder
-set(TENSORRT_ROOT "D:/TensorRT-8.6.1.6")
+set(TENSORRT_ROOT "C:/TensorRT-8.6.1.6")
 # SET THIS: Path to your CUDA install folder
-set(CUDA_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6")
-# SET THIS: Name of your ONNX model file (must be in the same folder as main.cpp)
+set(CUDA_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8")
+# SET THIS: Name of your ONNX model file
 set(ONNX_MODEL_FILE "D:/Dissertation/Compiled_GaussianAvatar/cliff_hr48_static.onnx")
 # SET THIS: Path to your ONNX Runtime install folder
-set(ONNXRUNTIME_ROOT "D:/onnxruntime-win-x64-gpu-1.23.2" )
+set(ONNXRUNTIME_ROOT "C:/onnxruntime-win-x64-gpu-1.23.2" )
 
-set(Open3D_DIR "D:/open3d/CMake")
+set(Open3D_DIR "C:/open3d/CMake")
 # --- CONFIGURATION END ---
 
 # ==========================================
 # DEPENDENCY 1: LibTorch
 # ==========================================
-list(APPEND CMAKE_PREFIX_PATH "D:/libtorch")
+list(APPEND CMAKE_PREFIX_PATH "C:/libtorch")
 find_package(Torch REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 # ==========================================
 # DEPENDENCY 2: OpenCV & TensorRT
 # ==========================================
-set(OpenCV_DIR "D:/opencv/build")
+set(OpenCV_DIR "C:/opencv/build")
 find_package(OpenCV REQUIRED)
 
 option(ENABLE_OPEN3D_TSDF "Enable Open3D-based TSDF mesh extraction" ON)
@@ -169,6 +169,8 @@ add_executable(hmr_inference
     utils/RtmPoseDetector.cpp
     utils/YoloPersonDetector.cpp
     utils/ModNetMatte.cpp
+    utils/DepthAnything.cpp
+    utils/DsineNormalEstimator.cpp
 )
 target_include_directories(hmr_inference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -247,7 +249,7 @@ endif()
 if(ENABLE_OPEN3D_TSDF AND Open3D_FOUND)
     add_custom_command(TARGET smpl_test POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "D:/open3d/bin/Open3D.dll"  # Update this if your path is different
+        "C:/open3d/bin/Open3D.dll"  # Update this if your path is different
         $<TARGET_FILE_DIR:smpl_test>
     )
 endif()
