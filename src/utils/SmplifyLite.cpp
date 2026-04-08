@@ -650,3 +650,400 @@ bool SmplifyLiteMultiView(SMPLLayer& smpl_layer,
     std::cout << "[SmplifyLiteMultiView] Done." << std::endl;
     return true;
 }
+
+namespace
+{
+
+struct MocapJointMap
+{
+    int mocap_idx;
+    int smpl_idx;
+};
+
+constexpr int kMocapJointCount3D = 26;
+constexpr int kSmplJointCount3D = 24;
+constexpr int kSmplPoseParamCount3D = 72;
+constexpr int kSmplShapeParamCount3D = 10;
+
+const MocapJointMap kMocapToSmplTargetMap[] = {
+    {11, 1},  {12, 2},  {13, 4},  {14, 5},  {15, 7},  {16, 8},  {18, 12},
+    {17, 15}, {5, 16},  {6, 17},  {7, 18},  {8, 19},  {9, 20},  {10, 21},
+    {20, 10}, {22, 10}, {24, 10}, {21, 11}, {23, 11}, {25, 11},
+};
+
+bool IsFinitePoint(const cv::Point3f& point)
+{
+    return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
+}
+
+bool NormalizeQuaternion(cv::Vec4f* quaternion)
+{
+    if (quaternion == nullptr)
+    {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+        if (!std::isfinite((*quaternion)[i]))
+        {
+            return false;
+        }
+    }
+
+    const float norm = std::sqrt(quaternion->dot(*quaternion));
+    if (norm <= 1e-8f)
+    {
+        return false;
+    }
+
+    *quaternion *= (1.0f / norm);
+    if ((*quaternion)[0] < 0.0f)
+    {
+        *quaternion *= -1.0f;
+    }
+    return true;
+}
+
+cv::Vec3f QuaternionToAxisAngle(cv::Vec4f quaternion)
+{
+    if (!NormalizeQuaternion(&quaternion))
+    {
+        return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+
+    const cv::Vec3f axis_part(quaternion[1], quaternion[2], quaternion[3]);
+    const float sin_half_angle = static_cast<float>(cv::norm(axis_part));
+    if (sin_half_angle <= 1e-8f)
+    {
+        return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+
+    const float angle = 2.0f * std::atan2(sin_half_angle, quaternion[0]);
+    return axis_part * (angle / sin_half_angle);
+}
+
+float JointConfidenceAt(const std::vector<float>& joint_confidences, int index)
+{
+    if (index < 0 || index >= static_cast<int>(joint_confidences.size()))
+    {
+        return 1.0f;
+    }
+    return joint_confidences[index];
+}
+
+bool TryGetNormalizedQuaternion(const std::vector<cv::Vec4f>& joint_rotations,
+                                int index,
+                                cv::Vec4f* out_quaternion)
+{
+    if (out_quaternion == nullptr || index < 0 || index >= static_cast<int>(joint_rotations.size()))
+    {
+        return false;
+    }
+
+    *out_quaternion = joint_rotations[index];
+    return NormalizeQuaternion(out_quaternion);
+}
+
+bool AverageQuaternions(const std::vector<cv::Vec4f>& joint_rotations,
+                        const std::vector<int>& joint_indices,
+                        cv::Vec4f* out_quaternion)
+{
+    if (out_quaternion == nullptr)
+    {
+        return false;
+    }
+
+    cv::Vec4f accumulated(0.0f, 0.0f, 0.0f, 0.0f);
+    bool has_value = false;
+    for (const int index : joint_indices)
+    {
+        cv::Vec4f quaternion;
+        if (!TryGetNormalizedQuaternion(joint_rotations, index, &quaternion))
+        {
+            continue;
+        }
+
+        if (has_value && accumulated.dot(quaternion) < 0.0f)
+        {
+            quaternion *= -1.0f;
+        }
+        accumulated += quaternion;
+        has_value = true;
+    }
+
+    if (!has_value)
+    {
+        return false;
+    }
+
+    *out_quaternion = accumulated;
+    return NormalizeQuaternion(out_quaternion);
+}
+
+void SetPoseJointFromQuaternion(int smpl_joint_index,
+                                const cv::Vec4f& quaternion,
+                                std::vector<float>* pose_values)
+{
+    if (pose_values == nullptr || smpl_joint_index < 0 || smpl_joint_index >= kSmplJointCount3D)
+    {
+        return;
+    }
+
+    const cv::Vec3f axis_angle = QuaternionToAxisAngle(quaternion);
+    const size_t base_index = static_cast<size_t>(smpl_joint_index) * 3u;
+    (*pose_values)[base_index + 0u] = axis_angle[0];
+    (*pose_values)[base_index + 1u] = axis_angle[1];
+    (*pose_values)[base_index + 2u] = axis_angle[2];
+}
+
+void InitializePoseFromMocap(const std::vector<cv::Vec4f>& joint_rotations,
+                             std::vector<float>* pose_values)
+{
+    if (pose_values == nullptr)
+    {
+        return;
+    }
+
+    pose_values->assign(kSmplPoseParamCount3D, 0.0f);
+
+    const auto set_single = [&](int mocap_index, int smpl_index) {
+        cv::Vec4f quaternion;
+        if (TryGetNormalizedQuaternion(joint_rotations, mocap_index, &quaternion))
+        {
+            SetPoseJointFromQuaternion(smpl_index, quaternion, pose_values);
+        }
+    };
+
+    set_single(19, 0);
+    set_single(11, 1);
+    set_single(12, 2);
+    set_single(13, 4);
+    set_single(14, 5);
+    set_single(15, 7);
+    set_single(16, 8);
+    set_single(18, 12);
+    set_single(17, 15);
+    set_single(5, 16);
+    set_single(6, 17);
+    set_single(7, 18);
+    set_single(8, 19);
+    set_single(9, 20);
+    set_single(10, 21);
+
+    cv::Vec4f quaternion;
+    if (AverageQuaternions(joint_rotations, {20, 22, 24}, &quaternion))
+    {
+        SetPoseJointFromQuaternion(10, quaternion, pose_values);
+    }
+    if (AverageQuaternions(joint_rotations, {21, 23, 25}, &quaternion))
+    {
+        SetPoseJointFromQuaternion(11, quaternion, pose_values);
+    }
+}
+
+void AddTargetJoint(int mocap_index,
+                    int smpl_index,
+                    const std::vector<cv::Point3f>& joint_centers,
+                    const std::vector<float>& joint_confidences,
+                    float min_joint_confidence,
+                    std::vector<int>* out_smpl_indices,
+                    std::vector<float>* out_positions,
+                    std::vector<float>* out_weights)
+{
+    if (out_smpl_indices == nullptr || out_positions == nullptr || out_weights == nullptr ||
+        mocap_index < 0 || mocap_index >= static_cast<int>(joint_centers.size()))
+    {
+        return;
+    }
+
+    const float confidence = JointConfidenceAt(joint_confidences, mocap_index);
+    if (confidence < min_joint_confidence || !IsFinitePoint(joint_centers[mocap_index]))
+    {
+        return;
+    }
+
+    out_smpl_indices->push_back(smpl_index);
+    out_positions->push_back(joint_centers[mocap_index].x);
+    out_positions->push_back(joint_centers[mocap_index].y);
+    out_positions->push_back(joint_centers[mocap_index].z);
+    out_weights->push_back(std::max(confidence, min_joint_confidence));
+}
+
+void BuildTargets(const std::vector<cv::Point3f>& joint_centers,
+                  const std::vector<float>& joint_confidences,
+                  float min_joint_confidence,
+                  std::vector<int>* out_smpl_indices,
+                  std::vector<float>* out_positions,
+                  std::vector<float>* out_weights)
+{
+    if (out_smpl_indices == nullptr || out_positions == nullptr || out_weights == nullptr)
+    {
+        return;
+    }
+
+    out_smpl_indices->clear();
+    out_positions->clear();
+    out_weights->clear();
+
+    if (joint_centers.size() < kMocapJointCount3D)
+    {
+        return;
+    }
+
+    AddTargetJoint(19, 0, joint_centers, joint_confidences, min_joint_confidence,
+                   out_smpl_indices, out_positions, out_weights);
+
+    if (out_smpl_indices->empty() || out_smpl_indices->front() != 0)
+    {
+        const bool has_left_hip =
+            JointConfidenceAt(joint_confidences, 11) >= min_joint_confidence && IsFinitePoint(joint_centers[11]);
+        const bool has_right_hip =
+            JointConfidenceAt(joint_confidences, 12) >= min_joint_confidence && IsFinitePoint(joint_centers[12]);
+        if (has_left_hip && has_right_hip)
+        {
+            const cv::Point3f pelvis = (joint_centers[11] + joint_centers[12]) * 0.5f;
+            out_smpl_indices->push_back(0);
+            out_positions->push_back(pelvis.x);
+            out_positions->push_back(pelvis.y);
+            out_positions->push_back(pelvis.z);
+            out_weights->push_back(std::max(
+                0.5f * (JointConfidenceAt(joint_confidences, 11) + JointConfidenceAt(joint_confidences, 12)),
+                min_joint_confidence));
+        }
+    }
+
+    for (const auto& mapping : kMocapToSmplTargetMap)
+    {
+        AddTargetJoint(mapping.mocap_idx, mapping.smpl_idx, joint_centers, joint_confidences,
+                       min_joint_confidence, out_smpl_indices, out_positions, out_weights);
+    }
+}
+
+}  // namespace
+
+SmplifyLiteMocapSolver::SmplifyLiteMocapSolver(const std::string& model_path,
+                                               const SmplMocapFitOptions& options)
+    : options_(options)
+{
+    try
+    {
+        smpl_layer_ = std::make_shared<SMPLLayer>(model_path);
+        torch::Device device(torch::kCPU);
+        if (options_.use_cuda && torch::cuda::is_available())
+        {
+            device = torch::Device(torch::kCUDA);
+        }
+        smpl_layer_->to(device);
+        smpl_layer_->eval();
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "SmplifyLiteMocapSolver: failed to load " << model_path
+                  << ": " << e.what() << std::endl;
+        smpl_layer_.reset();
+    }
+}
+
+bool SmplifyLiteMocapSolver::IsReady() const
+{
+    return smpl_layer_ != nullptr;
+}
+
+bool SmplifyLiteMocapSolver::FitToMocap(const std::vector<cv::Point3f>& joint_centers,
+                                        const std::vector<cv::Vec4f>& joint_rotations,
+                                        const std::vector<float>& joint_confidences,
+                                        SmplParameters* out_parameters)
+{
+    if (!IsReady() || out_parameters == nullptr || joint_centers.size() < kMocapJointCount3D)
+    {
+        return false;
+    }
+
+    std::vector<cv::Vec4f> normalized_rotations = joint_rotations;
+    normalized_rotations.resize(kMocapJointCount3D, cv::Vec4f(1.0f, 0.0f, 0.0f, 0.0f));
+
+    std::vector<float> pose_init_values;
+    InitializePoseFromMocap(normalized_rotations, &pose_init_values);
+
+    out_parameters->thetas = pose_init_values;
+    out_parameters->betas.assign(kSmplShapeParamCount3D, 0.0f);
+
+    std::vector<int> smpl_indices;
+    std::vector<float> target_positions;
+    std::vector<float> target_weights;
+    BuildTargets(joint_centers, joint_confidences, options_.min_joint_confidence,
+                 &smpl_indices, &target_positions, &target_weights);
+    if (smpl_indices.empty() || target_positions.empty() || target_weights.empty())
+    {
+        return false;
+    }
+
+    const auto device = smpl_layer_->v_template.device();
+    const auto tensor_options = torch::TensorOptions().dtype(torch::kFloat).device(device);
+
+    auto pose_init = torch::from_blob(pose_init_values.data(),
+                                      {1, kSmplJointCount3D, 3},
+                                      torch::kFloat)
+                         .clone()
+                         .to(device);
+    auto betas_init = torch::zeros({1, kSmplShapeParamCount3D}, tensor_options);
+    auto trans_zeros = torch::zeros({1, 3}, tensor_options);
+
+    auto idx_tensor = torch::from_blob(smpl_indices.data(),
+                                       {static_cast<int64_t>(smpl_indices.size())},
+                                       torch::kLong)
+                          .clone()
+                          .to(device);
+    auto target_tensor = torch::from_blob(target_positions.data(),
+                                          {static_cast<int64_t>(smpl_indices.size()), 3},
+                                          torch::kFloat)
+                             .clone()
+                             .to(device);
+    auto weight_tensor = torch::from_blob(target_weights.data(),
+                                          {static_cast<int64_t>(target_weights.size())},
+                                          torch::kFloat)
+                             .clone()
+                             .to(device);
+    weight_tensor = weight_tensor / (weight_tensor.mean() + 1e-8f);
+
+    auto trans_init = torch::zeros({1, 3}, tensor_options);
+    {
+        torch::NoGradGuard no_grad;
+        auto smpl_out = smpl_layer_->forward(betas_init, pose_init, trans_zeros);
+        auto selected = smpl_out.joints.squeeze(0).index_select(0, idx_tensor);
+        trans_init = (target_tensor.mean(0) - selected.mean(0)).reshape({1, 3}).clone();
+    }
+
+    auto pose = pose_init.clone().detach().set_requires_grad(true);
+    auto betas = betas_init.clone().detach().set_requires_grad(true);
+    auto trans = trans_init.clone().detach().set_requires_grad(true);
+
+    torch::optim::Adam optimizer({pose, betas, trans}, torch::optim::AdamOptions(options_.lr));
+
+    for (int iter = 0; iter < options_.num_iters; ++iter)
+    {
+        optimizer.zero_grad();
+
+        auto smpl_out = smpl_layer_->forward(betas, pose, trans_zeros);
+        auto selected = smpl_out.joints.squeeze(0).index_select(0, idx_tensor) + trans.squeeze(0);
+        auto diff = selected - target_tensor;
+
+        auto data_loss = ((diff * diff).sum(1) * weight_tensor).mean() * options_.position_weight;
+        auto pose_reg = (pose - pose_init).pow(2).mean() * options_.pose_reg;
+        auto betas_reg = betas.pow(2).mean() * options_.betas_reg;
+        auto trans_reg = (trans - trans_init).pow(2).mean() * options_.translation_reg;
+
+        auto total_loss = data_loss + pose_reg + betas_reg + trans_reg;
+        total_loss.backward();
+        optimizer.step();
+    }
+
+    auto pose_cpu = pose.detach().cpu().contiguous().reshape({-1});
+    auto betas_cpu = betas.detach().cpu().contiguous().reshape({-1});
+
+    out_parameters->thetas.assign(pose_cpu.data_ptr<float>(),
+                                  pose_cpu.data_ptr<float>() + pose_cpu.numel());
+    out_parameters->betas.assign(betas_cpu.data_ptr<float>(),
+                                 betas_cpu.data_ptr<float>() + betas_cpu.numel());
+    return true;
+}

@@ -1,0 +1,15 @@
+{
+  "name": "dataset-prep",
+  "version": "1.0.0",
+  "dependencies": [
+    "onnxruntime",
+    {
+      "name": "opencv4",
+      "features": [
+        "ffmpeg",
+        "png",
+        "jpeg"
+      ]
+    }
+  ]
+}

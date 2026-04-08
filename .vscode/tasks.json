@@ -53,6 +53,60 @@
                 "isDefault": true
             },
             "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "Configure Dataset Prep (Ninja)",
+            "type": "shell",
+            "options": {
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": [
+                        "/C",
+                        // This initializes the VS environment variables (headers, libs, PATH)
+                        "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\" &&"
+                    ]
+                }
+            },
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}/dataset_prep",
+                "-B",
+                "${workspaceFolder}/build_dataset_prep",
+                "-G",
+                "Ninja",
+                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                "-DBUILD_WITH_TENSORRT=ON",
+                "-DIRIS_BUILD_CLI=ON",
+                "-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+            ],
+            "group": "build",
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Build Dataset Prep (Ninja)",
+            "type": "shell",
+            "options": {
+                "shell": {
+                    "executable": "cmd.exe",
+                    "args": [
+                        "/C",
+                        // We must re-initialize the environment for the build step too
+                        "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat\" &&"
+                    ]
+                }
+            },
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build_dataset_prep",
+                "--parallel"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
         }
     ]
 }

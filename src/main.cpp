@@ -514,6 +514,8 @@ bool BuildSharedGaussianBuffer(const torch::Tensor &positions, const torch::Tens
     return true;
 }
 
+ 
+
 // --- SSIM Implementation Start ---
 std::pair<torch::Tensor, torch::Tensor> create_separable_windows(int window_size, torch::Device device)
 {
@@ -848,6 +850,42 @@ struct GaussianAvatar : torch::nn::Module
         register_buffer("faces_cached", faces_cached);
         register_buffer("knn_indices", knn_indices);
     }
+
+    std::tuple<torch::Tensor, torch::Tensor> get_bone_data()
+    {
+        auto device = g_bary_coords.device();
+         
+        auto v_weights = smpl->weights.to(device); 
+        
+        auto selected_faces = faces_buffer.index_select(0, g_face_indices);
+        
+        auto v0 = selected_faces.select(1, 0);
+        auto v1 = selected_faces.select(1, 1);
+        auto v2 = selected_faces.select(1, 2);
+        
+        auto w0 = v_weights.index_select(0, v0);
+        auto w1 = v_weights.index_select(0, v1);
+        auto w2 = v_weights.index_select(0, v2);
+        
+        auto u = g_bary_coords.select(1, 0).unsqueeze(1);
+        auto v = g_bary_coords.select(1, 1).unsqueeze(1);
+        auto w = g_bary_coords.select(1, 2).unsqueeze(1);
+        
+        // Interpolate the bone weights for the splat's exact position on the face
+        auto splat_weights = u * w0 + v * w1 + w * w2;
+        
+        // Extract the Top 4 most influential bones
+        auto topk = torch::topk(splat_weights, 4, 1);
+        auto top_weights = std::get<0>(topk);
+        auto top_indices = std::get<1>(topk).to(torch::kFloat32); // Must be float for the .bin buffer
+        
+        // Normalize so the 4 weights always sum exactly to 1.0
+        auto sum_weights = top_weights.sum(1, true);
+        top_weights = top_weights / torch::clamp_min(sum_weights, 1e-6f);
+        
+        return {top_indices, top_weights};
+    }
+
 
     std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor betas, torch::Tensor pose, torch::Tensor trans)
     {
@@ -2432,8 +2470,11 @@ int run_real_training(int argc, char *argv[])
             // 3. Save to Disk (Every epoch, Overwrite)
             {
                 std::filesystem::path save_dir = viewer_export_dir.empty() ? out_dir_path : viewer_out_path;
+                torch::Tensor bone_indices, bone_weights;
+                std::tie(bone_indices, bone_weights) = avatar.get_bone_data();
+                
                 SaveViewerDataOverwrite(save_dir, positions, colors, opacities, scales, rotations,
-                                        sh_to_send, sh_degree);
+                                        sh_to_send, sh_degree, bone_indices, bone_weights);
             }
 
             // --- MODIFIED SECTION END ---

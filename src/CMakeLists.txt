@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
-# 1. Enable C++ and CUDA support
 project(smpl_lbs_test LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -168,9 +167,7 @@ add_executable(hmr_inference
     utils/TrtBuilder.cpp
     utils/RtmPoseDetector.cpp
     utils/YoloPersonDetector.cpp
-    utils/ModNetMatte.cpp
-    utils/DepthAnything.cpp
-    utils/DsineNormalEstimator.cpp
+    utils/ModNetMatte.cpp 
 )
 target_include_directories(hmr_inference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -259,14 +256,18 @@ endif()
 # ==========================================
 
 # 1. Copy smpl_data.pt (for smpl_test)
-if(EXISTS "${CMAKE_SOURCE_DIR}/smpl_data.pt")
-    file(COPY ${CMAKE_SOURCE_DIR}/smpl_data.pt DESTINATION ${CMAKE_BINARY_DIR})
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/smpl_data.pt")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/smpl_data.pt" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 # 2. Copy the ONNX model (for hmr_inference)
-if(EXISTS "${CMAKE_SOURCE_DIR}/${ONNX_MODEL_FILE}")
-    message(STATUS "Copying ${ONNX_MODEL_FILE} to build directory...")
-    file(COPY ${CMAKE_SOURCE_DIR}/${ONNX_MODEL_FILE} DESTINATION ${CMAKE_BINARY_DIR})
+set(ONNX_MODEL_PATH "${ONNX_MODEL_FILE}")
+if(NOT IS_ABSOLUTE "${ONNX_MODEL_PATH}")
+    set(ONNX_MODEL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/${ONNX_MODEL_FILE}")
+endif()
+if(EXISTS "${ONNX_MODEL_PATH}")
+    message(STATUS "Copying ${ONNX_MODEL_PATH} to build directory...")
+    file(COPY "${ONNX_MODEL_PATH}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
 else()
     message(WARNING "Could not find ${ONNX_MODEL_FILE} in source directory. You will need to copy it manually.")
 endif()

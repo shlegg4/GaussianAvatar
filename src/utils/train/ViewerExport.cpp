@@ -39,11 +39,13 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
                     const torch::Tensor &scales,
                     const torch::Tensor &rotations,
                     const torch::Tensor &sh,
-                    int sh_degree)
+                    int sh_degree, 
+                    const torch::Tensor &bone_indices,
+                    const torch::Tensor &bone_weights)
 {
     // --- Validation Checks ---
     if (!positions.defined() || !colors.defined() || !opacities.defined() || !scales.defined() ||
-        !rotations.defined())
+        !rotations.defined() || !bone_indices.defined() || !bone_weights.defined())
     {
         std::cerr << "SaveViewerData: missing tensor inputs." << std::endl;
         return false;
@@ -88,7 +90,10 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
     auto opa_cpu = opacities.to(torch::kCPU).contiguous();
     auto sca_cpu = scales.to(torch::kCPU).contiguous();
     auto rot_cpu = rotations.to(torch::kCPU).contiguous();
+    auto idx_cpu = bone_indices.to(torch::kCPU).contiguous();
+    auto wgt_cpu = bone_weights.to(torch::kCPU).contiguous();
     torch::Tensor sh_cpu;
+
     const int sh_coeffs = (sh_degree > 0) ? (sh_degree + 1) * (sh_degree + 1) : 0;
     if (sh_coeffs > 0)
     {
@@ -106,12 +111,14 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
     const float *opa_ptr = opa_cpu.data_ptr<float>();
     const float *sca_ptr = sca_cpu.data_ptr<float>();
     const float *rot_ptr = rot_cpu.data_ptr<float>();
+    const float *idx_ptr = idx_cpu.data_ptr<float>();
+    const float *wgt_ptr = wgt_cpu.data_ptr<float>();
     const float *sh_ptr = (sh_coeffs > 0) ? sh_cpu.data_ptr<float>() : nullptr;
 
     // --- Data Layout Configuration ---
     // Stride 15 aligns with the Desktop Viewer and robust Web Viewers.
     // Layout: [0-2 Pos] [3-5 Col] [6 Op] [7 Pad] [8-10 Scale] [11-14 Rot]
-    const size_t stride = 15u + static_cast<size_t>(sh_coeffs) * 3u;
+    const size_t stride = 15u + static_cast<size_t>(sh_coeffs) * 3u + 8u;  
     std::vector<float> buffer;
     buffer.resize(static_cast<size_t>(count) * stride);
 
@@ -120,6 +127,7 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
         const size_t base = static_cast<size_t>(i) * stride;
         const size_t pos_base = static_cast<size_t>(i) * 3u;
         const size_t rot_base = static_cast<size_t>(i) * 4u;
+        const size_t bone_src_base = static_cast<size_t>(i) * 4u; // 4 indices + 4 weights
 
         // Position
         buffer[base + 0] = pos_ptr[pos_base + 0];
@@ -134,32 +142,46 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
         // Opacity
         buffer[base + 6] = std::clamp(opa_ptr[i], 0.0f, 1.0f);
 
-        // --- FIXED: PADDING at Index 7 ---
-        // Some viewers use this for average scale, others skip it.
-        // Filling it with avg scale is safer than 0.0 if a viewer tries to use it.
+        // Padding
         buffer[base + 7] = (sca_ptr[pos_base + 0] + sca_ptr[pos_base + 1] + sca_ptr[pos_base + 2]) / 3.0f;
 
-        // Scale (Shifted to 8, 9, 10)
+        // Scale 
         buffer[base + 8] = sca_ptr[pos_base + 0];
         buffer[base + 9] = sca_ptr[pos_base + 1];
         buffer[base + 10] = sca_ptr[pos_base + 2];
 
-        // Rotation (Shifted to 11, 12, 13, 14)
+        // Rotation
         buffer[base + 11] = rot_ptr[rot_base + 0];
         buffer[base + 12] = rot_ptr[rot_base + 1];
         buffer[base + 13] = rot_ptr[rot_base + 2];
         buffer[base + 14] = rot_ptr[rot_base + 3];
 
-        // Spherical Harmonics (Shifted to 15+)
+        // Spherical Harmonics
+        // DECLARE THIS HERE so the bone data below can use it!
+        const size_t sh_offset = base + 15u; 
+        
         if (sh_coeffs > 0)
         {
-            const size_t sh_base = base + 15u;
             const size_t sh_src_base = static_cast<size_t>(i) * static_cast<size_t>(sh_coeffs) * 3u;
-            std::memcpy(buffer.data() + sh_base, sh_ptr + sh_src_base,
+            std::memcpy(buffer.data() + sh_offset, sh_ptr + sh_src_base,
                         static_cast<size_t>(sh_coeffs) * 3u * sizeof(float));
         }
+
+        // --- NEW: Bone Indices & Weights ---
+        const size_t bone_out_base = sh_offset + (static_cast<size_t>(sh_coeffs) * 3u);
+        
+        buffer[bone_out_base + 0] = idx_ptr[bone_src_base + 0];
+        buffer[bone_out_base + 1] = idx_ptr[bone_src_base + 1];
+        buffer[bone_out_base + 2] = idx_ptr[bone_src_base + 2];
+        buffer[bone_out_base + 3] = idx_ptr[bone_src_base + 3];
+
+        buffer[bone_out_base + 4] = wgt_ptr[bone_src_base + 0];
+        buffer[bone_out_base + 5] = wgt_ptr[bone_src_base + 1];
+        buffer[bone_out_base + 6] = wgt_ptr[bone_src_base + 2];
+        buffer[bone_out_base + 7] = wgt_ptr[bone_src_base + 3];
     }
 
+     
     // --- File Writing ---
     std::error_code ec;
     auto epoch_dir = MakeEpochDir(output_dir, epoch);
@@ -204,7 +226,9 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
     json_file << "    \"opacity\",\n";
     json_file << "    \"padding_avg_scale\",\n"; // Documenting the gap
     json_file << "    \"scale_x\", \"scale_y\", \"scale_z\",\n";
-    json_file << "    \"rot_w\", \"rot_x\", \"rot_y\", \"rot_z\"";
+    json_file << "    \"rot_w\", \"rot_x\", \"rot_y\", \"rot_z\",\n";
+    json_file << "    \"bone_idx_0\", \"bone_idx_1\", \"bone_idx_2\", \"bone_idx_3\",\n";
+    json_file << "    \"bone_wgt_0\", \"bone_wgt_1\", \"bone_wgt_2\", \"bone_wgt_3\"";
     if (sh_coeffs > 0)
     {
         json_file << ",\n";
@@ -232,9 +256,11 @@ bool SaveViewerDataOverwrite(const std::filesystem::path &output_dir,
                              const torch::Tensor &scales,
                              const torch::Tensor &rotations,
                              const torch::Tensor &sh,
-                             int sh_degree)
+                             int sh_degree,
+                            const torch::Tensor &bone_indices,
+                            const torch::Tensor &bone_weights)
 {
-    return SaveViewerData(output_dir, 0, positions, colors, opacities, scales, rotations, sh, sh_degree);
+    return SaveViewerData(output_dir, 0, positions, colors, opacities, scales, rotations, sh, sh_degree, bone_indices, bone_weights);
 }
 
 bool ExportOrientedPointCloudPly(const std::filesystem::path &path,

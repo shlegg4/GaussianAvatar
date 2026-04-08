@@ -12,7 +12,9 @@ bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
                     const torch::Tensor &scales,
                     const torch::Tensor &rotations,
                     const torch::Tensor &sh,
-                    int sh_degree);
+                    int sh_degree,
+                    const torch::Tensor &bone_indices,
+                    const torch::Tensor &bone_weights);
 
 bool SaveViewerDataOverwrite(const std::filesystem::path &output_dir,
                              const torch::Tensor &positions,
@@ -21,7 +23,9 @@ bool SaveViewerDataOverwrite(const std::filesystem::path &output_dir,
                              const torch::Tensor &scales,
                              const torch::Tensor &rotations,
                              const torch::Tensor &sh,
-                             int sh_degree);
+                             int sh_degree, 
+                             const torch::Tensor &bone_indices,
+                             const torch::Tensor &bone_weights);
 
 bool ExportOrientedPointCloudPly(const std::filesystem::path &path,
                                  const torch::Tensor &positions,

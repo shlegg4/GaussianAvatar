@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -54,3 +56,35 @@ bool SmplifyLiteMultiView(SMPLLayer& smpl_layer,
                           SmplResult* io_res,
                           const SmplifyLiteOptions& options = {},
                           float* out_y_sign = nullptr);
+
+struct SmplParameters {
+    std::vector<float> thetas;
+    std::vector<float> betas;
+};
+
+struct SmplMocapFitOptions {
+    int num_iters = 20;
+    float lr = 5e-2f;
+    float min_joint_confidence = 1e-5f;
+    float position_weight = 1.0f;
+    float pose_reg = 25.0f;
+    float betas_reg = 1e-3f;
+    float translation_reg = 1e-3f;
+    bool use_cuda = false;
+};
+
+class SmplifyLiteMocapSolver {
+public:
+    explicit SmplifyLiteMocapSolver(const std::string& model_path,
+                                    const SmplMocapFitOptions& options = {});
+
+    bool IsReady() const;
+    bool FitToMocap(const std::vector<cv::Point3f>& joint_centers,
+                    const std::vector<cv::Vec4f>& joint_rotations,
+                    const std::vector<float>& joint_confidences,
+                    SmplParameters* out_parameters);
+
+private:
+    SmplMocapFitOptions options_;
+    std::shared_ptr<SMPLLayer> smpl_layer_;
+};
