@@ -991,9 +991,10 @@ bool SmplifyLiteMocapSolver::FitToMocap(const std::vector<cv::Point3f>& joint_ce
 
     auto idx_tensor = torch::from_blob(smpl_indices.data(),
                                        {static_cast<int64_t>(smpl_indices.size())},
-                                       torch::kLong)
+                                       torch::kInt)
                           .clone()
-                          .to(device);
+                          .to(device)
+                          .to(torch::kLong);
     auto target_tensor = torch::from_blob(target_positions.data(),
                                           {static_cast<int64_t>(smpl_indices.size()), 3},
                                           torch::kFloat)
@@ -1010,7 +1011,19 @@ bool SmplifyLiteMocapSolver::FitToMocap(const std::vector<cv::Point3f>& joint_ce
     {
         torch::NoGradGuard no_grad;
         auto smpl_out = smpl_layer_->forward(betas_init, pose_init, trans_zeros);
-        auto selected = smpl_out.joints.squeeze(0).index_select(0, idx_tensor);
+        const auto joints = smpl_out.joints.squeeze(0);
+        const int64_t joint_count = joints.size(0);
+        const int64_t min_index = idx_tensor.min().item<int64_t>();
+        const int64_t max_index = idx_tensor.max().item<int64_t>();
+        if (min_index < 0 || max_index >= joint_count)
+        {
+            throw std::runtime_error(
+                "SmplifyLiteMocapSolver: joint index out of range. "
+                "Valid joint range is [0, " + std::to_string(joint_count - 1) +
+                "], requested [" + std::to_string(min_index) + ", " +
+                std::to_string(max_index) + "].");
+        }
+        auto selected = joints.index_select(0, idx_tensor);
         trans_init = (target_tensor.mean(0) - selected.mean(0)).reshape({1, 3}).clone();
     }
 
