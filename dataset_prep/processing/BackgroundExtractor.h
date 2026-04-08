@@ -23,6 +23,7 @@ public:
     bool Initialize();
     bool Process(const SyncedFrameCollection& synced_frames,
                  std::vector<BackgroundExtractorResult>* out_results);
+    bool ProcessImage(const cv::Mat& image, cv::Mat* out_matte);
 
 private:
     Options options_;

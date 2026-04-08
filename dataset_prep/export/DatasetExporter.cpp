@@ -74,7 +74,7 @@ bool DatasetExporter::SaveFrame(const ExportFrameArtifacts& artifacts) {
     }
 
     const std::vector<int> png_params = {cv::IMWRITE_PNG_COMPRESSION, options_.png_compression};
-    if (HasTrainingSamples(artifacts)) {
+    if (UseTrainingExport(artifacts)) {
         if (options_.save_images) {
             for (const auto& sample : artifacts.training_samples) {
                 const auto crop_path = MakeTrainingCropPath(artifacts, sample);
@@ -139,7 +139,7 @@ bool DatasetExporter::SaveFrame(const ExportFrameArtifacts& artifacts) {
 
 bool DatasetExporter::EnsureCameraDirectories(const ExportFrameArtifacts& artifacts) const {
     std::error_code error;
-    if (HasTrainingSamples(artifacts)) {
+    if (UseTrainingExport(artifacts)) {
         for (const auto& sample : artifacts.training_samples) {
             if (options_.save_images) {
                 std::filesystem::create_directories(
@@ -260,7 +260,7 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
     output.setf(std::ios::fixed);
     output << std::setprecision(6);
 
-    if (HasTrainingSamples(artifacts)) {
+    if (UseTrainingExport(artifacts)) {
         for (const auto& sample : artifacts.training_samples) {
             const auto crop_path = std::filesystem::absolute(
                 MakeTrainingCropPath(artifacts, sample)).lexically_normal();
@@ -331,8 +331,8 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
     return true;
 }
 
-bool DatasetExporter::HasTrainingSamples(const ExportFrameArtifacts& artifacts) const {
-    return !artifacts.training_samples.empty();
+bool DatasetExporter::UseTrainingExport(const ExportFrameArtifacts& artifacts) const {
+    return artifacts.training_export_requested || !artifacts.training_samples.empty();
 }
 
 std::filesystem::path DatasetExporter::MakeTrainingCropPath(

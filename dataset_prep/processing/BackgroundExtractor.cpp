@@ -57,14 +57,32 @@ bool BackgroundExtractor::Process(const SyncedFrameCollection& synced_frames,
         if (options_.binary_threshold >= 0.0f) {
             cv::threshold(matte_f32, matte_f32, options_.binary_threshold, 1.0, cv::THRESH_BINARY);
         }
-
         matte_f32.convertTo(result.matte, CV_8U, 255.0);
+        if (result.matte.empty()) {
+            return false;
+        }
         result.foreground = impl_->matte.ApplyMatte(view.image, matte_f32);
 
         out_results->push_back(std::move(result));
     }
 
     return true;
+}
+
+bool BackgroundExtractor::ProcessImage(const cv::Mat& image, cv::Mat* out_matte) {
+    if (!ready_ || out_matte == nullptr || image.empty()) {
+        return false;
+    }
+
+    cv::Mat matte_f32;
+    if (!impl_->matte.ComputeMatte(image, &matte_f32)) {
+        return false;
+    }
+    if (options_.binary_threshold >= 0.0f) {
+        cv::threshold(matte_f32, matte_f32, options_.binary_threshold, 1.0, cv::THRESH_BINARY);
+    }
+    matte_f32.convertTo(*out_matte, CV_8U, 255.0);
+    return !out_matte->empty();
 }
 
 }  // namespace dataset_prep

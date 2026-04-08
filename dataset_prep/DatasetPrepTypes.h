@@ -237,6 +237,7 @@ struct ExportFrameArtifacts {
     std::vector<BackgroundExtractorResult> masks;
     MocapFrame3D pose3d;
     std::vector<ExportTrainingSample> training_samples;
+    bool training_export_requested = false;
 };
 
 }  // namespace dataset_prep

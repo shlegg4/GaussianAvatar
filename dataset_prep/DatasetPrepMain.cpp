@@ -336,17 +336,6 @@ const CameraCalibration* FindCalibrationBySourceIndex(
     return nullptr;
 }
 
-const BackgroundExtractorResult* FindMaskBySourceIndex(
-    const std::vector<BackgroundExtractorResult>& masks,
-    int source_camera_index) {
-    for (const auto& mask : masks) {
-        if (mask.source_camera_index == source_camera_index) {
-            return &mask;
-        }
-    }
-    return nullptr;
-}
-
 cv::Mat CropSquareWithPaddingAndResize(const cv::Mat& src,
                                        int x,
                                        int y,
@@ -385,14 +374,14 @@ cv::Mat CropSquareWithPaddingAndResize(const cv::Mat& src,
 }
 
 bool BuildTrainingSample(const SyncedView& view,
-                         const BackgroundExtractorResult& mask,
+                         BackgroundExtractor& background_extractor,
                          const MocapPerson3D& person,
                          int person_index,
                          const CameraCalibration& calibration,
                          int crop_resolution,
                          float crop_margin,
                          ExportTrainingSample* out_sample) {
-    if (out_sample == nullptr || view.image.empty() || mask.matte.empty() ||
+    if (out_sample == nullptr || view.image.empty() ||
         !person.smpl_valid || person.smpl_pose.size() < 3u) {
         return false;
     }
@@ -482,13 +471,18 @@ bool BuildTrainingSample(const SyncedView& view,
     const int roi_y = static_cast<int>(std::floor(raw_crop_cy - raw_crop_size * 0.5f));
 
     const int image_interpolation = roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
-    const int matte_interpolation = roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_LINEAR;
 
     cv::Mat crop_image = CropSquareWithPaddingAndResize(
         view.image, roi_x, roi_y, roi_size, crop_resolution, image_interpolation);
-    cv::Mat crop_matte = CropSquareWithPaddingAndResize(
-        mask.matte, roi_x, roi_y, roi_size, crop_resolution, matte_interpolation);
-    if (crop_image.empty() || crop_matte.empty()) {
+    if (crop_image.empty()) {
+        return false;
+    }
+
+    cv::Mat crop_matte;
+    if (!background_extractor.ProcessImage(crop_image, &crop_matte)) {
+        return false;
+    }
+    if (crop_matte.empty()) {
         return false;
     }
 
@@ -697,23 +691,22 @@ int main(int argc, char* argv[]) {
         }
 #endif
 
-        std::vector<BackgroundExtractorResult> masks;
-        if (!background_extractor.Process(synced_frames, &masks)) {
-            return 1;
-        }
-
         ExportFrameArtifacts artifacts;
         artifacts.synced_frames = synced_frames;
         artifacts.pose_lookup = pose_lookup;
-        artifacts.masks = std::move(masks);
         artifacts.pose3d = pose3d;
-        if (!calibrations.empty()) {
+        artifacts.training_export_requested = !calibrations.empty();
+        if (!artifacts.training_export_requested) {
+            if (!background_extractor.Process(synced_frames, &artifacts.masks)) {
+                return 1;
+            }
+        }
+
+        if (artifacts.training_export_requested) {
             for (const auto& view : artifacts.synced_frames.views) {
                 const auto* calibration =
                     FindCalibrationBySourceIndex(calibrations, view.source_camera_index);
-                const auto* mask =
-                    FindMaskBySourceIndex(artifacts.masks, view.source_camera_index);
-                if (calibration == nullptr || mask == nullptr) {
+                if (calibration == nullptr) {
                     continue;
                 }
 
@@ -721,7 +714,7 @@ int main(int argc, char* argv[]) {
                     const auto& person = artifacts.pose3d.people[person_index];
                     ExportTrainingSample sample;
                     if (BuildTrainingSample(view,
-                                            *mask,
+                                            background_extractor,
                                             person,
                                             static_cast<int>(person_index),
                                             *calibration,

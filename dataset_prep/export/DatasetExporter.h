@@ -28,7 +28,7 @@ private:
                        const std::filesystem::path& pose_path) const;
     bool AppendManifestLine(const ExportFrameArtifacts& artifacts,
                             const std::filesystem::path& pose_path) const;
-    bool HasTrainingSamples(const ExportFrameArtifacts& artifacts) const;
+    bool UseTrainingExport(const ExportFrameArtifacts& artifacts) const;
     std::filesystem::path MakeTrainingCropPath(const ExportFrameArtifacts& artifacts,
                                                const ExportTrainingSample& sample) const;
     std::filesystem::path MakeTrainingMattePath(const ExportFrameArtifacts& artifacts,
