@@ -161,8 +161,14 @@ bool CameraCalibrationLoader::Load(const std::filesystem::path& calibration_dir,
 
         calibration.source_camera_index = source.source_camera_index;
         calibration.camera_id = source.camera_id;
-        calibration.R = extrinsics_it->second.first;
-        calibration.t = extrinsics_it->second.second;
+
+        // The calibration export stores camera pose in world space
+        // (camera-to-world rotation plus camera center). Convert once here so
+        // downstream projection code can always use world-to-camera matrices.
+        const cv::Matx33f camera_to_world_rotation = extrinsics_it->second.first;
+        const cv::Vec3f camera_center_world = extrinsics_it->second.second;
+        calibration.R = camera_to_world_rotation.t();
+        calibration.t = -(calibration.R * camera_center_world);
         calibration.valid = true;
         calibrations.push_back(std::move(calibration));
     }

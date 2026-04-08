@@ -9,7 +9,7 @@
             "program": "${workspaceFolder}/src/build/smpl_test.exe",
             "args": [
                 "--jsonl",
-                "C:/Users/Sam/Documents/GaussianAvatar/outputs_sobel/gaussian_train.jsonl",
+                "C:/Users/Sam/Documents/GaussianAvatar/dataset_outputs/frames.jsonl",
                 "--smpl",
                 "${workspaceFolder}/src/smpl_data.pt",
                 "--epochs",
