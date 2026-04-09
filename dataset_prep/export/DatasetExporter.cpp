@@ -118,6 +118,31 @@ bool DatasetExporter::SaveFrame(const ExportFrameArtifacts& artifacts) {
             }
         }
 
+        if (options_.save_training_debug && !artifacts.full_overlays.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(options_.output_dir / "overlays_full", ec);
+
+            const std::string frame_stem = MakeFrameStem(artifacts.synced_frames.sync_index);
+            for (size_t i = 0; i < artifacts.full_overlays.size(); ++i) {
+                if (i >= artifacts.synced_frames.views.size()) {
+                    break;
+                }
+                const auto& view = artifacts.synced_frames.views[i];
+                const auto& overlay = artifacts.full_overlays[i];
+                if (overlay.empty()) {
+                    continue;
+                }
+                const auto path = options_.output_dir / "overlays_full" / view.camera_id /
+                    (frame_stem + ".jpg");
+                std::filesystem::create_directories(path.parent_path(), ec);
+                if (!cv::imwrite(path.string(), overlay)) {
+                    std::cerr << "DatasetExporter: failed to write "
+                              << path.string() << std::endl;
+                    return false;
+                }
+            }
+        }
+
         if (options_.save_masks) {
             for (const auto& sample : artifacts.training_samples) {
                 const auto matte_path = MakeTrainingMattePath(artifacts, sample);

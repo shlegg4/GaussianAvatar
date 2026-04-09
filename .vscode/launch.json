@@ -160,8 +160,6 @@
             "args": [
                 "--videos",
                 "${workspaceFolder}/data/recording_cam0.mp4,${workspaceFolder}/data/recording_cam1.mp4,${workspaceFolder}/data/recording_cam2.mp4,${workspaceFolder}/data/recording_cam3.mp4",
-                "--pose-3d",
-                "${workspaceFolder}/data/poses.jsonl",
                 "--camera-ids",
                 "cam0,cam1,cam2,cam3",
                 "--calibration-dir",
@@ -169,11 +167,18 @@
                 "--output",
                 "${workspaceFolder}/dataset_outputs",
                 "--modnet",
-                "${workspaceFolder}/modnet.onnx", 
-                "--cliff-model",
-                "${workspaceFolder}/cliff_hr48_static.onnx",
+                "${workspaceFolder}/modnet.onnx",
+                "--modnet-cuda",
+                "--pear-model",
+                "${workspaceFolder}/pear_ehm.onnx",
+                "--pear-cuda",
+                "--yolo-model",
+                "${workspaceFolder}/yolov8n.onnx",
+                "--yolo-cuda",
                 "--rtmpose-model",
                 "${workspaceFolder}/rtmpose26.onnx",
+                "--rtmpose-cuda",
+                "--smpl-cuda",
                 "--prefer-frame-seq",
                 "--pose-frame-delta",
                 "2",
@@ -185,7 +190,7 @@
             "environment": [
                 {
                     "name": "PATH",
-                    "value": "${workspaceFolder}/build_dataset_prep;${env:PATH}"
+                    "value": "C:/Program Files/NVIDIA/CUDNN/v9.18/bin;C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin;C:/opencv/build/x64/vc16/bin;C:/libtorch/lib;${workspaceFolder}/build_dataset_prep;${env:PATH}"
                 }
             ],
             "console": "integratedTerminal"

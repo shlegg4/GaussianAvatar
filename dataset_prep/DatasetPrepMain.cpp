@@ -182,7 +182,7 @@ void PrintUsage() {
         << "  --pear-cuda                  Request CUDA provider for PEAR inference\n"
         << "  --cliff-model path           Deprecated alias for --pear-model\n"
         << "  --cliff-cuda                 Deprecated alias for --pear-cuda\n"
-        << "  --rtmpose-model path         Path to the RTMPose ONNX model used for multi-view merge\n"
+        << "  --rtmpose-model path         Path to the RTMPose ONNX model used to score PEAR views\n"
         << "  --rtmpose-cuda               Request CUDA provider for RTMPose inference\n"
         << "  --yolo-model path            Path to the YOLO ONNX model used for person crops\n"
         << "  --yolo-cuda                  Request CUDA provider for YOLO inference\n"
@@ -411,7 +411,7 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
         return false;
     }
 
-    if (options.video_paths.empty() || options.pose_3d_path.empty() || options.output_dir.empty()) {
+    if (options.video_paths.empty() || options.output_dir.empty()) {
         PrintUsage();
         return false;
     }
@@ -462,7 +462,7 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
         if (!options.rtmpose_model_path.empty() &&
             !std::filesystem::exists(options.rtmpose_model_path)) {
             std::cerr << "Warning: RTMPose model file not found, falling back to projected mocap "
-                         "keypoints for the multi-view merge: "
+                         "keypoints for PEAR view scoring: "
                       << options.rtmpose_model_path << std::endl;
             options.rtmpose_model_path.clear();
         }
@@ -684,6 +684,50 @@ std::vector<YoloDetection> DetectPeopleInView(YoloPersonDetector& yolo_detector,
     }
 }
 
+bool BuildCropFromYoloOnly(const SyncedView& view,
+                           const YoloDetection& detection,
+                           const CameraCalibration& calibration,
+                           float crop_margin,
+                           ProjectedPersonCrop* out_crop) {
+    if (out_crop == nullptr || view.image.empty() ||
+        !(detection.bbox.width > 1.0f) || !(detection.bbox.height > 1.0f)) {
+        return false;
+    }
+
+    ProjectedPersonCrop crop;
+    crop.img_w = static_cast<float>(view.image.cols);
+    crop.img_h = static_cast<float>(view.image.rows);
+
+    const float scale_x = calibration.image_width > 0
+        ? crop.img_w / static_cast<float>(calibration.image_width)
+        : 1.0f;
+    const float scale_y = calibration.image_height > 0
+        ? crop.img_h / static_cast<float>(calibration.image_height)
+        : 1.0f;
+    crop.fx = calibration.K(0, 0) * scale_x;
+    crop.fy = calibration.K(1, 1) * scale_y;
+    crop.cx = calibration.K(0, 2) * scale_x;
+    crop.cy = calibration.K(1, 2) * scale_y;
+    crop.K = cv::Matx33f(crop.fx, 0.0f, crop.cx,
+                         0.0f, crop.fy, crop.cy,
+                         0.0f, 0.0f, 1.0f);
+
+    crop.bbox_x = detection.bbox.x;
+    crop.bbox_y = detection.bbox.y;
+    crop.bbox_w = detection.bbox.width;
+    crop.bbox_h = detection.bbox.height;
+    crop.crop_size = std::max(1.0f, std::max(crop.bbox_w, crop.bbox_h) * crop_margin);
+    crop.crop_cx = crop.bbox_x + crop.bbox_w * 0.5f;
+    crop.crop_cy = crop.bbox_y + crop.bbox_h * 0.5f;
+    crop.roi_size = std::max(1, static_cast<int>(std::ceil(crop.crop_size)));
+    crop.roi_x = static_cast<int>(std::floor(crop.crop_cx - crop.crop_size * 0.5f));
+    crop.roi_y = static_cast<int>(std::floor(crop.crop_cy - crop.crop_size * 0.5f));
+    crop.detection_score = detection.score;
+
+    *out_crop = crop;
+    return true;
+}
+
 std::vector<std::vector<ProjectedPersonCrop>> BuildMatchedYoloCrops(
     const SyncedFrameCollection& synced_frames,
     const MocapFrame3D& pose3d,
@@ -881,19 +925,83 @@ int CountScoresAbove(const std::vector<float>& scores, float threshold) {
     return count;
 }
 
-std::vector<float> PoseToAxisAngleVector(const std::vector<float>& pose_values) {
-    if (pose_values.size() == kSmplPoseParamCount) {
-        return pose_values;
-    }
-    if (pose_values.size() == 144u) {
-        return ConvertPose6dToAxisAngle(pose_values);
-    }
-    return {};
-}
-
 cv::Vec3f CameraTranslationToWorld(const cv::Vec3f& translation_camera,
                                    const CameraCalibration& calibration) {
     return calibration.R.t() * (translation_camera - calibration.t);
+}
+
+bool EstimatePersonRootWorldTranslation(const MocapPerson3D& person,
+                                        cv::Vec3f* out_translation_world) {
+    if (out_translation_world == nullptr) {
+        return false;
+    }
+
+    if (person.joints[19].IsValid()) {
+        *out_translation_world = cv::Vec3f(person.joints[19].xyz.x,
+                                           person.joints[19].xyz.y,
+                                           person.joints[19].xyz.z);
+        return true;
+    }
+    if (person.joints[11].IsValid() && person.joints[12].IsValid()) {
+        *out_translation_world = cv::Vec3f(
+            0.5f * (person.joints[11].xyz.x + person.joints[12].xyz.x),
+            0.5f * (person.joints[11].xyz.y + person.joints[12].xyz.y),
+            0.5f * (person.joints[11].xyz.z + person.joints[12].xyz.z));
+        return true;
+    }
+
+    cv::Vec3f sum(0.0f, 0.0f, 0.0f);
+    int count = 0;
+    for (const auto& joint : person.joints) {
+        if (!joint.IsValid(0.01f)) {
+            continue;
+        }
+        sum += cv::Vec3f(joint.xyz.x, joint.xyz.y, joint.xyz.z);
+        ++count;
+    }
+    if (count <= 0) {
+        return false;
+    }
+
+    *out_translation_world = sum * (1.0f / static_cast<float>(count));
+    return true;
+}
+
+bool ConvertPearTranslationToWorld(const SmplxResult& pear_result,
+                                   const ProjectedPersonCrop& matched_crop,
+                                   const CameraCalibration& calibration,
+                                   cv::Vec3f* out_translation_world) {
+    if (out_translation_world == nullptr || pear_result.camera_translation.size() < 3u) {
+        return false;
+    }
+
+    // 1. Map PyTorch3D to OpenCV: Invert X and Y components
+    cv::Vec3f translation_camera(
+        -pear_result.camera_translation[0], 
+        -pear_result.camera_translation[1], 
+        pear_result.camera_translation[2]);
+
+    // 2. Scale virtual Z depth to real camera metric depth
+    const float f_virtual = 5000.0f;
+    const float virtual_crop_size = 256.0f;
+    const float focal_length = (matched_crop.fx + matched_crop.fy) * 0.5f;
+    
+    if (matched_crop.crop_size > 0.0f) {
+        translation_camera[2] = translation_camera[2] * (focal_length / f_virtual) * (virtual_crop_size / matched_crop.crop_size);
+    }
+
+    if (!std::isfinite(translation_camera[0]) || !std::isfinite(translation_camera[1]) || 
+        !std::isfinite(translation_camera[2]) || !(translation_camera[2] > 0.0f)) {
+        return false;
+    }
+
+    // Note: We intentionally skip the Principal Point Shift here. 
+    // This keeps the mesh centered in the crop for perfect "Warp Back" alignment.
+    *out_translation_world = CameraTranslationToWorld(translation_camera, calibration);
+    
+    return std::isfinite((*out_translation_world)[0]) &&
+           std::isfinite((*out_translation_world)[1]) &&
+           std::isfinite((*out_translation_world)[2]);
 }
 
 std::vector<float> ConvertPearPoseToSmplAxisAngle(const SmplxResult& pear_result) {
@@ -901,6 +1009,8 @@ std::vector<float> ConvertPearPoseToSmplAxisAngle(const SmplxResult& pear_result
         return {};
     }
 
+    // dataset_prep still optimizes against the legacy SMPL layer, so PEAR's extra
+    // SMPL-X hand and face outputs are intentionally dropped here for now.
     std::vector<float> pose_values(kSmplPoseParamCount, 0.0f);
     std::copy_n(pear_result.global_orient.begin(), 3u, pose_values.begin());
     std::copy_n(pear_result.body_pose.begin(), 63u, pose_values.begin() + 3);
@@ -922,6 +1032,14 @@ bool ConvertPearPoseToWorld(const SmplxResult& pear_result,
     cv::Vec3f root_local(pose_world[0], pose_world[1], pose_world[2]);
     cv::Matx33f root_local_rotation;
     cv::Rodrigues(root_local, root_local_rotation);
+
+    // FLIP ORIENTATION: 180-degree rotation around Z-axis
+    cv::Matx33f Rz_180(
+        -1.0f,  0.0f,  0.0f,
+         0.0f, -1.0f,  0.0f,
+         0.0f,  0.0f,  1.0f
+    );
+    root_local_rotation = Rz_180 * root_local_rotation;
 
     const cv::Matx33f root_world_rotation = calibration.R.t() * root_local_rotation;
     cv::Vec3f root_world;
@@ -962,9 +1080,7 @@ bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
                                 const std::vector<CameraCalibration>& calibrations,
                                 PearEstimator& pear_estimator,
                                 RtmPoseDetector* rtmpose_detector,
-                                SMPLLayer& smpl_layer,
                                 int crop_resolution,
-                                int smpl_iters,
                                 int person_index,
                                 MocapPerson3D* person) {
     if (person == nullptr) {
@@ -973,6 +1089,14 @@ bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
 
     std::vector<PearViewEstimate> views;
     views.reserve(synced_frames.views.size());
+    int matched_view_count = 0;
+    int pear_failure_count = 0;
+    int pose_failure_count = 0;
+    int translation_failure_count = 0;
+
+    cv::Vec3f fallback_translation_world(0.0f, 0.0f, 0.0f);
+    const bool have_fallback_translation =
+        EstimatePersonRootWorldTranslation(*person, &fallback_translation_world);
 
     for (size_t view_index = 0; view_index < synced_frames.views.size(); ++view_index) {
         const auto& view = synced_frames.views[view_index];
@@ -990,6 +1114,7 @@ bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
         if (!IsValidCrop(matched_crop)) {
             continue;
         }
+        ++matched_view_count;
 
         const int interpolation =
             matched_crop.roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
@@ -1006,13 +1131,14 @@ bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
 
         SmplxResult pear_result;
         if (!pear_estimator.Estimate(crop_image, &pear_result) ||
-            pear_result.betas.size() < kSmplShapeParamCount ||
-            pear_result.camera_translation.size() < 3u) {
+            pear_result.betas.size() < kSmplShapeParamCount) {
+            ++pear_failure_count;
             continue;
         }
 
         std::vector<float> pose_world;
         if (!ConvertPearPoseToWorld(pear_result, *calibration, &pose_world)) {
+            ++pose_failure_count;
             continue;
         }
 
@@ -1045,19 +1171,33 @@ bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
             }
         }
 
+        bool use_detection_score = false;
         if (!have_rtmpose_observation) {
-            observation_keypoints.assign(matched_crop.projected_joints.begin(),
-                                         matched_crop.projected_joints.end());
-            observation_scores.assign(matched_crop.joint_scores.begin(),
-                                      matched_crop.joint_scores.end());
+            bool has_mocap = false;
+            for (float score : matched_crop.joint_scores) {
+                if (score > 0.0f) {
+                    has_mocap = true;
+                    break;
+                }
+            }
+            if (has_mocap) {
+                observation_keypoints.assign(matched_crop.projected_joints.begin(),
+                                             matched_crop.projected_joints.end());
+                observation_scores.assign(matched_crop.joint_scores.begin(),
+                                          matched_crop.joint_scores.end());
+            } else {
+                use_detection_score = true;
+            }
         }
 
-        const cv::Vec3f translation_camera(
-            pear_result.camera_translation[0],
-            pear_result.camera_translation[1],
-            pear_result.camera_translation[2]);
-        const cv::Vec3f translation_world =
-            CameraTranslationToWorld(translation_camera, *calibration);
+        cv::Vec3f translation_world(0.0f, 0.0f, 0.0f);
+        if (!ConvertPearTranslationToWorld(pear_result, matched_crop, *calibration, &translation_world)) {
+            if (!have_fallback_translation) {
+                ++translation_failure_count;
+                continue;
+            }
+            translation_world = fallback_translation_world;
+        }
 
         PearViewEstimate estimate;
         estimate.observation.keypoints = std::move(observation_keypoints);
@@ -1071,13 +1211,23 @@ bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
         estimate.betas.assign(pear_result.betas.begin(),
                               pear_result.betas.begin() + kSmplShapeParamCount);
         estimate.translation_world = translation_world;
-        estimate.score =
-            static_cast<float>(CountScoresAbove(estimate.observation.keypoint_scores, 0.01f)) +
-            MeanPositiveScore(estimate.observation.keypoint_scores);
+        estimate.score = use_detection_score
+            ? matched_crop.detection_score
+            : static_cast<float>(CountScoresAbove(estimate.observation.keypoint_scores, 0.01f)) +
+                MeanPositiveScore(estimate.observation.keypoint_scores);
         views.push_back(std::move(estimate));
     }
 
     if (views.empty()) {
+        if (matched_view_count > 0) {
+            std::cerr << "DatasetPrep: PEAR produced no usable view seed for person "
+                      << person_index
+                      << " (matched_views=" << matched_view_count
+                      << ", pear_failures=" << pear_failure_count
+                      << ", pose_failures=" << pose_failure_count
+                      << ", translation_failures=" << translation_failure_count
+                      << ")" << std::endl;
+        }
         return false;
     }
 
@@ -1091,67 +1241,18 @@ bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
         return false;
     }
 
-    SmplResult merged_seed;
-    merged_seed.pose = best_view_it->pose_world;
-    merged_seed.shape.assign(kSmplShapeParamCount, 0.0f);
-    cv::Vec3f translation_world(0.0f, 0.0f, 0.0f);
-    float weight_sum = 0.0f;
-    for (const auto& view : views) {
-        const float weight = std::max(view.score, 1e-3f);
-        weight_sum += weight;
-        for (size_t beta_index = 0; beta_index < merged_seed.shape.size(); ++beta_index) {
-            merged_seed.shape[beta_index] += view.betas[beta_index] * weight;
-        }
-        translation_world += view.translation_world * weight;
-    }
-    if (weight_sum > 0.0f) {
-        for (float& beta : merged_seed.shape) {
-            beta /= weight_sum;
-        }
-        translation_world *= (1.0f / weight_sum);
-    } else {
-        merged_seed.shape = best_view_it->betas;
-        translation_world = best_view_it->translation_world;
-    }
-    merged_seed.camera = {translation_world[0], translation_world[1], translation_world[2]};
-
-    SmplifyLiteOptions multiview_options;
-    multiview_options.num_iters = std::max(10, smpl_iters);
-    multiview_options.min_iters = std::min(10, multiview_options.num_iters);
-    multiview_options.pose_reg = 5.0f;
-    multiview_options.betas_reg = 5e-4f;
-    multiview_options.reproj_robust_sigma = 25.0f;
-
-    std::vector<SmplifyMultiViewObservation> observations;
-    observations.reserve(views.size());
-    for (const auto& view : views) {
-        observations.push_back(view.observation);
-    }
-
-    SmplResult refined_result = merged_seed;
-    if (!SmplifyLiteMultiView(
-            smpl_layer,
-            observations,
-            &refined_result,
-            multiview_options,
-            nullptr)) {
-        refined_result = merged_seed;
-    }
-
-    std::vector<float> final_pose = PoseToAxisAngleVector(refined_result.pose);
-    if (final_pose.size() != kSmplPoseParamCount ||
-        refined_result.shape.size() < kSmplShapeParamCount ||
-        refined_result.camera.size() < 3u) {
+    if (best_view_it->pose_world.size() != kSmplPoseParamCount ||
+        best_view_it->betas.size() < kSmplShapeParamCount) {
         return false;
     }
 
-    person->smpl_pose = std::move(final_pose);
-    person->smpl_shape.assign(refined_result.shape.begin(),
-                              refined_result.shape.begin() + kSmplShapeParamCount);
+    person->smpl_pose = best_view_it->pose_world;
+    person->smpl_shape.assign(best_view_it->betas.begin(),
+                              best_view_it->betas.begin() + kSmplShapeParamCount);
     person->smpl_translation = cv::Point3f(
-        refined_result.camera[0],
-        refined_result.camera[1],
-        refined_result.camera[2]);
+        best_view_it->translation_world[0],
+        best_view_it->translation_world[1],
+        best_view_it->translation_world[2]);
     person->smpl_scale = 1.0f;
     person->smpl_valid = true;
     return true;
@@ -1184,7 +1285,12 @@ bool BuildTrainingDebugOverlay(SMPLLayer& smpl_layer,
         auto trans_zeros = torch::zeros({1, 3}, tensor_options);
 
         const auto smpl_out = smpl_layer.forward(betas_tensor, pose_tensor, trans_zeros);
-        const auto verts_cpu = smpl_out.vertices.squeeze(0).to(torch::kCPU).contiguous();
+        const auto verts_cpu = smpl_out.vertices.squeeze(0)
+                                   .detach()
+                                   .to(torch::kCPU)
+                                   .to(torch::kFloat32)
+                                   .contiguous()
+                                   .clone();
         const auto trans = EstimateTranslation(
             sample->cam,
             sample->crop_cx,
@@ -1222,30 +1328,50 @@ bool BuildTrainingDebugOverlay(SMPLLayer& smpl_layer,
         camera_vertices.resize(static_cast<size_t>(verts_acc.size(0)));
         projected_vertices.resize(static_cast<size_t>(verts_acc.size(0)));
         vertex_valid.assign(static_cast<size_t>(verts_acc.size(0)), 0u);
-
+ 
         for (int vertex_index = 0; vertex_index < verts_acc.size(0); ++vertex_index) {
-            const float X = verts_acc[vertex_index][0] + trans[0];
-            const float Y = verts_acc[vertex_index][1] * sample->y_sign + trans[1];
-            const float Z = verts_acc[vertex_index][2] + trans[2];
-            camera_vertices[static_cast<size_t>(vertex_index)] = cv::Vec3f(X, Y, Z);
-            if (!(Z > 1e-6f)) {
-                continue;
-            }
+            const float f_virt = 5000.0f;
+            const float c_virt = 128.0f; // Center of 256x256 model space
+            
+            // Reconstruct the model-space translation using inverse scaling
+            const float Z_virt = trans[2] * (f_virt / sample->focal_length) * (sample->crop_size / 256.0f);
+            const float X_virt = trans[0] * (f_virt / sample->focal_length);
+            const float Y_virt = trans[1] * (f_virt / sample->focal_length);
 
-            const float u = (sample->focal_length * X / Z) + cx_crop;
-            const float v = (sample->focal_length * Y / Z) + cy_crop;
+            // X, Y, Z are now in the model's native camera space
+            const float X = verts_acc[vertex_index][0] + X_virt;
+            const float Y = verts_acc[vertex_index][1] + Y_virt; 
+            const float Z = verts_acc[vertex_index][2] + Z_virt;
+            
+            camera_vertices[static_cast<size_t>(vertex_index)] = cv::Vec3f(X, Y, Z);
+            if (!(Z > 1e-6f)) continue;
+
+            // Project into 256x256 Model Space
+            const float u_model = (f_virt * X / Z) + c_virt;
+            const float v_model = (f_virt * Y / Z) + c_virt;
+            
+            // Map 256x256 back to output crop resolution (e.g., 512x512)
+            const float scale_to_output = sample->crop_w / 256.0f;
+            const float u_crop = u_model * scale_to_output;
+            const float v_crop = v_model * scale_to_output;
+
             projected_vertices[static_cast<size_t>(vertex_index)] = cv::Point(
-                static_cast<int>(std::lround(u)),
-                static_cast<int>(std::lround(v)));
-            vertex_valid[static_cast<size_t>(vertex_index)] =
-                (u >= 0.0f && v >= 0.0f &&
-                 u < static_cast<float>(overlay.cols) &&
-                 v < static_cast<float>(overlay.rows))
-                    ? 1u
-                    : 0u;
+                static_cast<int>(std::lround(u_crop)),
+                static_cast<int>(std::lround(v_crop)));
+            
+            vertex_valid[static_cast<size_t>(vertex_index)] = 
+                (u_crop >= 0 && v_crop >= 0 && u_crop < overlay.cols && v_crop < overlay.rows);
         }
 
-        if (smpl_layer.faces_cpu.defined() && smpl_layer.faces_cpu.numel() > 0) {
+        const auto faces_cpu = smpl_layer.faces.detach()
+                                   .to(torch::kCPU)
+                                   .to(torch::kLong)
+                                   .contiguous()
+                                   .clone();
+        if (faces_cpu.defined() &&
+            faces_cpu.dim() == 2 &&
+            faces_cpu.size(1) >= 3 &&
+            faces_cpu.numel() > 0) {
             struct ProjectedTriangle {
                 float depth = 0.0f;
                 cv::Point points[3];
@@ -1253,13 +1379,14 @@ bool BuildTrainingDebugOverlay(SMPLLayer& smpl_layer,
             };
 
             std::vector<ProjectedTriangle> triangles;
-            auto faces_acc = smpl_layer.faces_cpu.accessor<int64_t, 2>();
-            triangles.reserve(static_cast<size_t>(faces_acc.size(0)));
+            const int64_t* faces_ptr = faces_cpu.data_ptr<int64_t>();
+            const int64_t face_count = faces_cpu.size(0);
+            triangles.reserve(static_cast<size_t>(face_count));
 
-            for (int face_index = 0; face_index < faces_acc.size(0); ++face_index) {
-                const int i0 = static_cast<int>(faces_acc[face_index][0]);
-                const int i1 = static_cast<int>(faces_acc[face_index][1]);
-                const int i2 = static_cast<int>(faces_acc[face_index][2]);
+            for (int64_t face_index = 0; face_index < face_count; ++face_index) {
+                const int i0 = static_cast<int>(faces_ptr[face_index * 3 + 0]);
+                const int i1 = static_cast<int>(faces_ptr[face_index * 3 + 1]);
+                const int i2 = static_cast<int>(faces_ptr[face_index * 3 + 2]);
                 if (i0 < 0 || i1 < 0 || i2 < 0 ||
                     i0 >= verts_acc.size(0) ||
                     i1 >= verts_acc.size(0) ||
@@ -1453,6 +1580,7 @@ bool BuildTrainingSample(const SyncedView& view,
     const float img_h = matched_crop.img_h;
     const float fx = matched_crop.fx;
 
+    // 1. Calculate global orientation relative to camera
     cv::Vec3f global_orient(person.smpl_pose[0], person.smpl_pose[1], person.smpl_pose[2]);
     cv::Matx33f smpl_global_rotation;
     cv::Rodrigues(global_orient, smpl_global_rotation);
@@ -1461,40 +1589,12 @@ bool BuildTrainingSample(const SyncedView& view,
     cv::Vec3f local_orient;
     cv::Rodrigues(smpl_local_rotation, local_orient);
 
-    const float mocap_scale =
-        (std::isfinite(person.smpl_scale) && person.smpl_scale > 0.0f)
-            ? person.smpl_scale
-            : 1.0f;
-    const cv::Vec3f calibration_t_metric(
-        calibration.t[0] * mocap_scale,
-        calibration.t[1] * mocap_scale,
-        calibration.t[2] * mocap_scale);
-    cv::Vec3f root_global(0.0f, 0.0f, 0.0f);
-    bool has_root_global = false;
-    if (std::isfinite(person.smpl_translation.x) &&
-        std::isfinite(person.smpl_translation.y) &&
-        std::isfinite(person.smpl_translation.z)) {
-        root_global = cv::Vec3f(person.smpl_translation.x,
-                                person.smpl_translation.y,
-                                person.smpl_translation.z);
-        has_root_global = true;
-    } else {
-        if (person.joints[19].IsValid()) {
-            root_global = cv::Vec3f(person.joints[19].xyz.x * mocap_scale,
-                                    person.joints[19].xyz.y * mocap_scale,
-                                    person.joints[19].xyz.z * mocap_scale);
-            has_root_global = true;
-        } else if (person.joints[11].IsValid() && person.joints[12].IsValid()) {
-            root_global = cv::Vec3f(
-                0.5f * (person.joints[11].xyz.x + person.joints[12].xyz.x) * mocap_scale,
-                0.5f * (person.joints[11].xyz.y + person.joints[12].xyz.y) * mocap_scale,
-                0.5f * (person.joints[11].xyz.z + person.joints[12].xyz.z) * mocap_scale);
-            has_root_global = true;
-        }
-    }
-    if (!has_root_global) {
-        return false;
-    }
+    // 2. Calculate camera-space translation
+    const float mocap_scale = (std::isfinite(person.smpl_scale) && person.smpl_scale > 0.0f) ? person.smpl_scale : 1.0f;
+    const cv::Vec3f root_global(person.smpl_translation.x, person.smpl_translation.y, person.smpl_translation.z);
+    
+    // Scale extrinsics for metric parity
+    const cv::Vec3f calibration_t_metric = calibration.t * mocap_scale;
     const cv::Vec3f root_local = calibration.R * root_global + calibration_t_metric;
     const float X = root_local[0];
     const float Y = root_local[1];
@@ -1508,6 +1608,11 @@ bool BuildTrainingSample(const SyncedView& view,
     const int roi_size = matched_crop.roi_size;
     const int roi_x = matched_crop.roi_x;
     const int roi_y = matched_crop.roi_y;
+    const float virtual_size = 256.0f;
+    const float scale_back = static_cast<float>(roi_size) / virtual_size;
+    const cv::Matx23f model_to_full(
+        scale_back, 0.0f, static_cast<float>(roi_x),
+        0.0f, scale_back, static_cast<float>(roi_y));
     const int image_interpolation =
         roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
 
@@ -1563,6 +1668,7 @@ bool BuildTrainingSample(const SyncedView& view,
     sample.crop_w = static_cast<float>(crop_resolution);
     sample.crop_h = static_cast<float>(crop_resolution);
     sample.focal_length = train_focal;
+    sample.model_to_full = model_to_full;
     sample.y_sign = 1.0f;
     sample.smpl_scale = mocap_scale;
     sample.cam = {s, tx, ty};
@@ -1603,8 +1709,11 @@ int main(int argc, char* argv[]) {
     parse_options.timestamp_scale = options.pose_timestamp_scale;
 
     MocapSequence3D global_mocap;
-    if (!parser.Parse(options.pose_3d_path, &global_mocap, parse_options)) {
-        return 1;
+    const bool use_mocap = !options.pose_3d_path.empty();
+    if (use_mocap) {
+        if (!parser.Parse(options.pose_3d_path, &global_mocap, parse_options)) {
+            return 1;
+        }
     }
 
     std::vector<VideoSourceConfig> video_sources;
@@ -1698,7 +1807,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (options.save_training_debug || options.smpl_use_pear) {
+        if (options.save_training_debug) {
             try {
                 debug_smpl_layer = std::make_unique<SMPLLayer>(options.smpl_model_path);
                 torch::Device device(torch::kCPU);
@@ -1708,12 +1817,6 @@ int main(int argc, char* argv[]) {
                 debug_smpl_layer->to(device);
                 debug_smpl_layer->eval();
             } catch (const std::exception& e) {
-                if (options.smpl_use_pear) {
-                    std::cerr << "DatasetPrep: failed to initialize SMPL layer for PEAR "
-                                 "multi-view fitting: "
-                              << e.what() << std::endl;
-                    return 1;
-                }
                 std::cerr << "DatasetPrep: failed to initialize training debug SMPL layer: "
                           << e.what() << std::endl;
                 debug_smpl_layer.reset();
@@ -1770,12 +1873,15 @@ int main(int argc, char* argv[]) {
         const int reference_frame_seq = synced_frames.views.empty()
             ? -1
             : synced_frames.views.front().video_frame_index;
-        const MocapFrame3D* matched_pose = global_mocap.FindClosestFrame(
-            synced_frames.sync_timestamp_ms,
-            reference_frame_seq,
-            options.pose_timestamp_delta_ms,
-            options.pose_frame_delta,
-            options.prefer_pose_timestamps);
+        const MocapFrame3D* matched_pose = nullptr;
+        if (use_mocap) {
+            matched_pose = global_mocap.FindClosestFrame(
+                synced_frames.sync_timestamp_ms,
+                reference_frame_seq,
+                options.pose_timestamp_delta_ms,
+                options.pose_frame_delta,
+                options.prefer_pose_timestamps);
+        }
 
         PoseLookupResult pose_lookup;
         pose_lookup.sync_index = synced_frames.sync_index;
@@ -1791,6 +1897,12 @@ int main(int argc, char* argv[]) {
             }
             pose3d = *matched_pose;
         }
+        if (!use_mocap) {
+            pose3d.frame_seq = synced_frames.sync_index;
+            pose3d.timestamp_ms = synced_frames.sync_timestamp_ms;
+            pose3d.people.resize(1);
+            pose3d.people[0].person_id = 0;
+        }
 
         {
             std::ostringstream message;
@@ -1805,12 +1917,49 @@ int main(int argc, char* argv[]) {
 
         const SteadyClock::time_point yolo_start_time = SteadyClock::now();
         LogProgress("DatasetPrep: matching YOLO crops...");
-        const auto matched_yolo_crops = BuildMatchedYoloCrops(
-            synced_frames,
-            pose3d,
-            calibrations,
-            yolo_detector.get(),
-            options.crop_margin);
+        std::vector<std::vector<ProjectedPersonCrop>> matched_yolo_crops;
+        if (!use_mocap) {
+            matched_yolo_crops.resize(synced_frames.views.size(),
+                                      std::vector<ProjectedPersonCrop>(pose3d.people.size()));
+            if (yolo_detector != nullptr) {
+                for (size_t view_index = 0; view_index < synced_frames.views.size(); ++view_index) {
+                    const auto& view = synced_frames.views[view_index];
+                    const auto* calibration =
+                        FindCalibrationBySourceIndex(calibrations, view.source_camera_index);
+                    if (calibration == nullptr) {
+                        continue;
+                    }
+
+                    const auto detections = DetectPeopleInView(*yolo_detector, view.image);
+                    if (detections.empty()) {
+                        continue;
+                    }
+
+                    const auto best_detection = *std::max_element(
+                        detections.begin(),
+                        detections.end(),
+                        [](const YoloDetection& left, const YoloDetection& right) {
+                            return left.score < right.score;
+                        });
+
+                    ProjectedPersonCrop crop;
+                    if (BuildCropFromYoloOnly(view,
+                                              best_detection,
+                                              *calibration,
+                                              options.crop_margin,
+                                              &crop)) {
+                        matched_yolo_crops[view_index][0] = crop;
+                    }
+                }
+            }
+        } else {
+            matched_yolo_crops = BuildMatchedYoloCrops(
+                synced_frames,
+                pose3d,
+                calibrations,
+                yolo_detector.get(),
+                options.crop_margin);
+        }
         {
             std::ostringstream message;
             message << "DatasetPrep: YOLO crop matching finished with "
@@ -1829,15 +1978,13 @@ int main(int argc, char* argv[]) {
                 auto& person = pose3d.people[person_index];
                 ResetSmplFit(&person);
 
-                if (options.smpl_use_pear && pear_estimator && debug_smpl_layer) {
+                if (options.smpl_use_pear && pear_estimator) {
                     if (EstimatePersonSmplWithPear(synced_frames,
                                                    matched_yolo_crops,
                                                    calibrations,
                                                    *pear_estimator,
                                                    rtmpose_detector.get(),
-                                                   *debug_smpl_layer,
                                                    options.crop_resolution,
-                                                   options.smpl_iters,
                                                    static_cast<int>(person_index),
                                                    &person)) {
                         continue;
@@ -1918,6 +2065,9 @@ int main(int argc, char* argv[]) {
         if (artifacts.training_export_requested) {
             const SteadyClock::time_point training_start_time = SteadyClock::now();
             LogProgress("DatasetPrep: building training samples...");
+            if (options.save_training_debug) {
+                artifacts.full_overlays.resize(artifacts.synced_frames.views.size());
+            }
             for (size_t view_index = 0; view_index < artifacts.synced_frames.views.size(); ++view_index) {
                 const auto& view = artifacts.synced_frames.views[view_index];
                 const auto* calibration =
@@ -1944,6 +2094,29 @@ int main(int argc, char* argv[]) {
                                             matched_yolo_crops[view_index][person_index],
                                             options.crop_resolution,
                                             &sample)) {
+                        if (options.save_training_debug && !sample.crop_overlay.empty()) {
+                            cv::Mat full_overlay = view.image.clone();
+                            const float scale_to_output = sample.crop_w / 256.0f;
+                            const float scale_back = sample.model_to_full(0, 0);
+                            if (scale_to_output > 0.0f && scale_back > 0.0f) {
+                                const float crop_to_full_scale = scale_back / scale_to_output;
+                                const cv::Matx23f crop_to_full(
+                                    crop_to_full_scale, 0.0f, sample.model_to_full(0, 2),
+                                    0.0f, crop_to_full_scale, sample.model_to_full(1, 2));
+                                cv::Mat warped(full_overlay.size(), full_overlay.type(), cv::Scalar::all(0));
+                                cv::warpAffine(sample.crop_overlay,
+                                               warped,
+                                               crop_to_full,
+                                               full_overlay.size(),
+                                               cv::INTER_LINEAR,
+                                               cv::BORDER_CONSTANT,
+                                               cv::Scalar::all(0));
+                                cv::Mat mask;
+                                cv::cvtColor(warped, mask, cv::COLOR_BGR2GRAY);
+                                warped.copyTo(full_overlay, mask);
+                            }
+                            artifacts.full_overlays[view_index] = std::move(full_overlay);
+                        }
                         artifacts.training_samples.push_back(std::move(sample));
                     }
                 }

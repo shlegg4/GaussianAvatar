@@ -231,6 +231,7 @@ struct ExportTrainingSample {
     float crop_w = 0.0f;
     float crop_h = 0.0f;
     float focal_length = 0.0f;
+    cv::Matx23f model_to_full = cv::Matx23f::eye();
     float y_sign = 1.0f;
     float smpl_scale = std::numeric_limits<float>::quiet_NaN();
     std::vector<float> cam = std::vector<float>(3u, 0.0f);
@@ -244,6 +245,7 @@ struct ExportFrameArtifacts {
     std::vector<BackgroundExtractorResult> masks;
     MocapFrame3D pose3d;
     std::vector<ExportTrainingSample> training_samples;
+    std::vector<cv::Mat> full_overlays;
     bool training_export_requested = false;
 };
 

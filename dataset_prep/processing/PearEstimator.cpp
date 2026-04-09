@@ -293,23 +293,13 @@ bool PearEstimator::Estimate(const cv::Mat& crop_image, SmplxResult* out_result)
     std::vector<float> image_input = PreprocessPearImage(crop_image);
     std::vector<int64_t> image_shape = {1, 3, kPearInputSize, kPearInputSize};
 
-    std::vector<const char*> input_names;
-    input_names.reserve(impl_->input_names.size());
-    std::vector<Ort::Value> input_tensors;
-    input_tensors.reserve(impl_->input_names.size());
-    for (size_t index = 0; index < impl_->input_names.size(); ++index) {
-        input_names.push_back(impl_->input_names[index].c_str());
-        if (static_cast<int>(index) == impl_->image_input_index) {
-            input_tensors.push_back(Ort::Value::CreateTensor<float>(
-                impl_->memory_info,
-                image_input.data(),
-                image_input.size(),
-                image_shape.data(),
-                image_shape.size()));
-        } else {
-            return false;
-        }
-    }
+    const char* image_input_name = impl_->input_names[static_cast<size_t>(impl_->image_input_index)].c_str();
+    Ort::Value image_tensor = Ort::Value::CreateTensor<float>(
+        impl_->memory_info,
+        image_input.data(),
+        image_input.size(),
+        image_shape.data(),
+        image_shape.size());
 
     std::vector<const char*> output_names;
     output_names.reserve(impl_->output_names.size());
@@ -320,9 +310,9 @@ bool PearEstimator::Estimate(const cv::Mat& crop_image, SmplxResult* out_result)
     std::vector<Ort::Value> outputs;
     try {
         outputs = impl_->session->Run(Ort::RunOptions{nullptr},
-                                      input_names.data(),
-                                      input_tensors.data(),
-                                      input_tensors.size(),
+                                      &image_input_name,
+                                      &image_tensor,
+                                      1u,
                                       output_names.data(),
                                       output_names.size());
     } catch (const Ort::Exception&) {
