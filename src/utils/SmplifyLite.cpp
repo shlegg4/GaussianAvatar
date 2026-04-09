@@ -520,8 +520,9 @@ bool SmplifyLiteMultiView(SMPLLayer& smpl_layer,
 
         auto idx_tensor = torch::from_blob(smpl_indices.data(),
                                            {static_cast<int64_t>(smpl_indices.size())},
-                                           torch::kLong)
-                              .clone();
+                                           torch::kInt)
+                              .clone()
+                              .to(torch::kLong);
 
         ViewData vd;
         vd.target_xy = target_xy.to(device);

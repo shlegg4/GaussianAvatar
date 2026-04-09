@@ -20,6 +20,7 @@ set(DATASET_PREP_SOURCES
     ingestion/MocapPoseParser.cpp
     ingestion/VideoSynchronizer.cpp
     processing/BackgroundExtractor.cpp
+    processing/CliffEstimator.cpp
     export/DatasetExporter.cpp
 )
 
@@ -88,6 +89,7 @@ if(DATASET_PREP_ENABLE_SMPL)
 
     target_sources(dataset_prep PRIVATE
         ../src/utils/HmrMathHelpers.cpp
+        ../src/utils/RtmPoseDetector.cpp
         ../src/utils/SmplifyLite.cpp
     )
     target_link_libraries(dataset_prep PRIVATE "${TORCH_LIBRARIES}")

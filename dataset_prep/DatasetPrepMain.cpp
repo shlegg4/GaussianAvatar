@@ -17,8 +17,11 @@
 #include "dataset_prep/ingestion/MocapPoseParser.h"
 #include "dataset_prep/ingestion/VideoSynchronizer.h"
 #include "dataset_prep/processing/BackgroundExtractor.h"
+#include "dataset_prep/processing/CliffEstimator.h"
 #if DATASET_PREP_HAS_SMPL
+#include "utils/HmrInferenceUtils.h"
 #include "utils/HmrMathHelpers.h"
+#include "utils/RtmPoseDetector.h"
 #include "utils/SmplLBS.h"
 #include "utils/SmplifyLite.h"
 #endif
@@ -54,9 +57,14 @@ struct CliOptions {
 #else
     bool smpl_enabled = false;
 #endif
+    bool smpl_use_cliff = true;
     std::string smpl_model_path = "smpl_data.pt";
     bool smpl_use_cuda = false;
     int smpl_iters = 60;
+    std::string cliff_model_path = "cliff_hr48_static.onnx";
+    bool cliff_use_cuda = false;
+    std::string rtmpose_model_path = "rtmpose26.onnx";
+    bool rtmpose_use_cuda = false;
 };
 
 std::vector<std::string> SplitList(const std::string& value) {
@@ -96,6 +104,31 @@ void AppendStrings(const std::string& csv_value, std::vector<std::string>* out_v
     }
 }
 
+std::filesystem::path ResolveExistingPath(const std::filesystem::path& input_path) {
+    if (input_path.empty()) {
+        return input_path;
+    }
+
+    std::error_code ec;
+    if (input_path.is_absolute()) {
+        return input_path;
+    }
+    if (std::filesystem::exists(input_path, ec)) {
+        return std::filesystem::absolute(input_path, ec);
+    }
+
+    std::filesystem::path probe = std::filesystem::current_path(ec);
+    for (int depth = 0; !probe.empty() && depth <= 4; ++depth) {
+        const std::filesystem::path candidate = probe / input_path;
+        if (std::filesystem::exists(candidate, ec)) {
+            return std::filesystem::absolute(candidate, ec);
+        }
+        probe = probe.parent_path();
+    }
+
+    return input_path;
+}
+
 void PrintUsage() {
     std::cout
         << "Usage:\n"
@@ -123,9 +156,14 @@ void PrintUsage() {
         << "  --modnet-threshold value     Binarize matte at the provided threshold [0,1]\n"
 #if DATASET_PREP_HAS_SMPL
         << "  --no-smpl                    Skip SMPL parameter fitting\n"
+        << "  --smpl-from-mocap           Use the old mocap-only SMPL solver instead of CLIFF\n"
         << "  --smpl-model path            Path to the SMPL model archive (.pt)\n"
         << "  --smpl-cuda                  Request CUDA for SMPL fitting when available\n"
         << "  --smpl-iters value           Number of optimization steps per person\n"
+        << "  --cliff-model path           Path to the CLIFF ONNX model\n"
+        << "  --cliff-cuda                 Request CUDA provider for CLIFF inference\n"
+        << "  --rtmpose-model path         Path to the RTMPose ONNX model used for multi-view merge\n"
+        << "  --rtmpose-cuda               Request CUDA provider for RTMPose inference\n"
 #endif
         << "  --help                       Show this message\n";
 }
@@ -274,6 +312,10 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
             options.smpl_enabled = false;
             continue;
         }
+        if (arg == "--smpl-from-mocap") {
+            options.smpl_use_cliff = false;
+            continue;
+        }
         if (arg == "--smpl-model") {
             const char* value = require_value("--smpl-model");
             if (!value) return false;
@@ -288,6 +330,26 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
             const char* value = require_value("--smpl-iters");
             if (!value) return false;
             options.smpl_iters = std::stoi(value);
+            continue;
+        }
+        if (arg == "--cliff-model") {
+            const char* value = require_value("--cliff-model");
+            if (!value) return false;
+            options.cliff_model_path = value;
+            continue;
+        }
+        if (arg == "--cliff-cuda") {
+            options.cliff_use_cuda = true;
+            continue;
+        }
+        if (arg == "--rtmpose-model") {
+            const char* value = require_value("--rtmpose-model");
+            if (!value) return false;
+            options.rtmpose_model_path = value;
+            continue;
+        }
+        if (arg == "--rtmpose-cuda") {
+            options.rtmpose_use_cuda = true;
             continue;
         }
 
@@ -308,6 +370,10 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
             options.camera_ids.push_back("cam" + std::to_string(index + 1u));
         }
     }
+    options.modnet_model_path = ResolveExistingPath(options.modnet_model_path).string();
+    options.smpl_model_path = ResolveExistingPath(options.smpl_model_path).string();
+    options.cliff_model_path = ResolveExistingPath(options.cliff_model_path).string();
+    options.rtmpose_model_path = ResolveExistingPath(options.rtmpose_model_path).string();
     if (options.modnet_model_path.empty()) {
         std::cerr << "Error: --modnet <model.onnx> is strictly required for background extraction." << std::endl;
         PrintUsage();
@@ -329,6 +395,21 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
     if (!(options.crop_margin > 0.0f)) {
         std::cerr << "Error: --crop-margin must be positive." << std::endl;
         return false;
+    }
+    if (options.smpl_enabled && options.smpl_use_cliff) {
+        if (options.cliff_model_path.empty() ||
+            !std::filesystem::exists(options.cliff_model_path)) {
+            std::cerr << "Error: CLIFF model file not found: "
+                      << options.cliff_model_path << std::endl;
+            return false;
+        }
+        if (!options.rtmpose_model_path.empty() &&
+            !std::filesystem::exists(options.rtmpose_model_path)) {
+            std::cerr << "Warning: RTMPose model file not found, falling back to projected mocap "
+                         "keypoints for the multi-view merge: "
+                      << options.rtmpose_model_path << std::endl;
+            options.rtmpose_model_path.clear();
+        }
     }
 
     *out_options = std::move(options);
@@ -383,7 +464,403 @@ cv::Mat CropSquareWithPaddingAndResize(const cv::Mat& src,
     return resized;
 }
 
+constexpr float kMinProjectedDepth = 0.1f;
+
+struct ProjectedPersonCrop {
+    cv::Matx33f K = cv::Matx33f::eye();
+    float img_w = 0.0f;
+    float img_h = 0.0f;
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float crop_cx = 0.0f;
+    float crop_cy = 0.0f;
+    float crop_size = 0.0f;
+    int roi_x = 0;
+    int roi_y = 0;
+    int roi_size = 0;
+    std::array<cv::Point2f, kMocapJointCount> projected_joints{};
+    std::array<float, kMocapJointCount> joint_scores{};
+};
+
+bool BuildProjectedPersonCrop(const SyncedView& view,
+                              const MocapPerson3D& person,
+                              const CameraCalibration& calibration,
+                              float crop_margin,
+                              ProjectedPersonCrop* out_crop) {
+    if (out_crop == nullptr || view.image.empty()) {
+        return false;
+    }
+
+    ProjectedPersonCrop crop;
+    crop.img_w = static_cast<float>(view.image.cols);
+    crop.img_h = static_cast<float>(view.image.rows);
+    if (!(crop.img_w > 0.0f) || !(crop.img_h > 0.0f)) {
+        return false;
+    }
+
+    const float scale_x =
+        calibration.image_width > 0 ? crop.img_w / static_cast<float>(calibration.image_width) : 1.0f;
+    const float scale_y =
+        calibration.image_height > 0 ? crop.img_h / static_cast<float>(calibration.image_height) : 1.0f;
+    crop.fx = calibration.K(0, 0) * scale_x;
+    crop.fy = calibration.K(1, 1) * scale_y;
+    crop.cx = calibration.K(0, 2) * scale_x;
+    crop.cy = calibration.K(1, 2) * scale_y;
+    crop.K = cv::Matx33f(
+        crop.fx, 0.0f, crop.cx,
+        0.0f, crop.fy, crop.cy,
+        0.0f, 0.0f, 1.0f);
+    if (!(crop.fx > 0.0f) || !(crop.fy > 0.0f)) {
+        return false;
+    }
+
+    float min_x = std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float max_x = -std::numeric_limits<float>::max();
+    float max_y = -std::numeric_limits<float>::max();
+    bool has_projected_joint = false;
+
+    for (size_t joint_index = 0; joint_index < person.joints.size(); ++joint_index) {
+        const auto& joint = person.joints[joint_index];
+        if (!joint.IsValid()) {
+            continue;
+        }
+
+        const cv::Vec3f joint_global(joint.xyz.x, joint.xyz.y, joint.xyz.z);
+        const cv::Vec3f joint_local = calibration.R * joint_global + calibration.t;
+        if (!(joint_local[2] > kMinProjectedDepth)) {
+            continue;
+        }
+
+        const float u = (joint_local[0] * crop.fx / joint_local[2]) + crop.cx;
+        const float v = (joint_local[1] * crop.fy / joint_local[2]) + crop.cy;
+        crop.projected_joints[joint_index] = cv::Point2f(u, v);
+        crop.joint_scores[joint_index] = joint.confidence;
+
+        min_x = std::min(min_x, u);
+        min_y = std::min(min_y, v);
+        max_x = std::max(max_x, u);
+        max_y = std::max(max_y, v);
+        has_projected_joint = true;
+    }
+
+    if (!has_projected_joint) {
+        return false;
+    }
+
+    const float bbox_w = max_x - min_x;
+    const float bbox_h = max_y - min_y;
+    if (!(bbox_w > 1.0f) || !(bbox_h > 1.0f)) {
+        return false;
+    }
+
+    crop.crop_size = std::max(1.0f, std::max(bbox_w, bbox_h) * crop_margin);
+    crop.crop_cx = (min_x + max_x) * 0.5f;
+    crop.crop_cy = (min_y + max_y) * 0.5f;
+    crop.roi_size = std::max(1, static_cast<int>(std::ceil(crop.crop_size)));
+    crop.roi_x = static_cast<int>(std::floor(crop.crop_cx - crop.crop_size * 0.5f));
+    crop.roi_y = static_cast<int>(std::floor(crop.crop_cy - crop.crop_size * 0.5f));
+
+    *out_crop = crop;
+    return true;
+}
+
 #if DATASET_PREP_HAS_SMPL
+float MeanPositiveScore(const std::vector<float>& scores) {
+    float sum = 0.0f;
+    int count = 0;
+    for (float score : scores) {
+        if (score > 0.0f && std::isfinite(score)) {
+            sum += score;
+            ++count;
+        }
+    }
+    return count > 0 ? (sum / static_cast<float>(count)) : 0.0f;
+}
+
+int CountScoresAbove(const std::vector<float>& scores, float threshold) {
+    int count = 0;
+    for (float score : scores) {
+        if (std::isfinite(score) && score >= threshold) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::vector<float> PoseToAxisAngleVector(const std::vector<float>& pose_values) {
+    if (pose_values.size() == kSmplPoseParamCount) {
+        return pose_values;
+    }
+    if (pose_values.size() == 144u) {
+        return ConvertPose6dToAxisAngle(pose_values);
+    }
+    return {};
+}
+
+bool ConvertCliffPoseToWorld(const SmplResult& cliff_result,
+                             const CameraCalibration& calibration,
+                             std::vector<float>* out_pose_world) {
+    if (out_pose_world == nullptr) {
+        return false;
+    }
+
+    std::vector<float> pose_world = PoseToAxisAngleVector(cliff_result.pose);
+    if (pose_world.size() != kSmplPoseParamCount) {
+        return false;
+    }
+
+    cv::Vec3f root_local(pose_world[0], pose_world[1], pose_world[2]);
+    cv::Matx33f root_local_rotation;
+    cv::Rodrigues(root_local, root_local_rotation);
+
+    const cv::Matx33f root_world_rotation = calibration.R.t() * root_local_rotation;
+    cv::Vec3f root_world;
+    cv::Rodrigues(root_world_rotation, root_world);
+    pose_world[0] = root_world[0];
+    pose_world[1] = root_world[1];
+    pose_world[2] = root_world[2];
+
+    *out_pose_world = std::move(pose_world);
+    return true;
+}
+
+cv::Vec3f CameraTranslationToWorld(const cv::Vec3f& translation_camera,
+                                   const CameraCalibration& calibration) {
+    return calibration.R.t() * (translation_camera - calibration.t);
+}
+
+void ResetSmplFit(MocapPerson3D* person) {
+    if (person == nullptr) {
+        return;
+    }
+
+    person->smpl_valid = false;
+    person->smpl_pose.assign(kSmplPoseParamCount, 0.0f);
+    person->smpl_shape.assign(kSmplShapeParamCount, 0.0f);
+    person->smpl_scale = std::numeric_limits<float>::quiet_NaN();
+    person->smpl_translation = cv::Point3f(
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN());
+}
+
+struct CliffViewEstimate {
+    SmplifyMultiViewObservation observation;
+    std::vector<float> pose_world;
+    std::vector<float> betas;
+    cv::Vec3f translation_world{0.0f, 0.0f, 0.0f};
+    float score = 0.0f;
+};
+
+bool EstimatePersonSmplWithCliff(const SyncedFrameCollection& synced_frames,
+                                 const std::vector<CameraCalibration>& calibrations,
+                                 CliffEstimator& cliff_estimator,
+                                 RtmPoseDetector* rtmpose_detector,
+                                 SMPLLayer& smpl_layer,
+                                 int crop_resolution,
+                                 float crop_margin,
+                                 int smpl_iters,
+                                 MocapPerson3D* person) {
+    if (person == nullptr) {
+        return false;
+    }
+
+    std::vector<CliffViewEstimate> views;
+    views.reserve(synced_frames.views.size());
+
+    for (const auto& view : synced_frames.views) {
+        const auto* calibration =
+            FindCalibrationBySourceIndex(calibrations, view.source_camera_index);
+        if (calibration == nullptr) {
+            continue;
+        }
+
+        ProjectedPersonCrop projected_crop;
+        if (!BuildProjectedPersonCrop(view, *person, *calibration, crop_margin, &projected_crop)) {
+            continue;
+        }
+
+        const int interpolation =
+            projected_crop.roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
+        cv::Mat crop_image = CropSquareWithPaddingAndResize(
+            view.image,
+            projected_crop.roi_x,
+            projected_crop.roi_y,
+            projected_crop.roi_size,
+            crop_resolution,
+            interpolation);
+        if (crop_image.empty()) {
+            continue;
+        }
+
+        SmplResult cliff_result;
+        if (!cliff_estimator.Estimate(
+                crop_image,
+                projected_crop.crop_cx,
+                projected_crop.crop_cy,
+                projected_crop.crop_size,
+                projected_crop.fx,
+                static_cast<int>(projected_crop.img_w),
+                static_cast<int>(projected_crop.img_h),
+                &cliff_result) ||
+            cliff_result.shape.size() < kSmplShapeParamCount ||
+            cliff_result.camera.size() < 3u) {
+            continue;
+        }
+
+        std::vector<float> pose_world;
+        if (!ConvertCliffPoseToWorld(cliff_result, *calibration, &pose_world)) {
+            continue;
+        }
+
+        std::vector<cv::Point2f> observation_keypoints;
+        std::vector<float> observation_scores;
+        bool have_rtmpose_observation = false;
+        if (rtmpose_detector != nullptr) {
+            std::vector<cv::Point2f> crop_keypoints;
+            std::vector<float> crop_scores;
+            if (rtmpose_detector->DetectPose(
+                    crop_image,
+                    &crop_keypoints,
+                    &crop_scores,
+                    view.video_frame_index) &&
+                crop_keypoints.size() == crop_scores.size()) {
+                observation_keypoints.reserve(crop_keypoints.size());
+                observation_scores.reserve(crop_scores.size());
+                const float crop_to_full_scale =
+                    static_cast<float>(projected_crop.roi_size) /
+                    static_cast<float>(crop_resolution);
+                for (size_t index = 0; index < crop_keypoints.size(); ++index) {
+                    observation_keypoints.emplace_back(
+                        static_cast<float>(projected_crop.roi_x) +
+                            crop_keypoints[index].x * crop_to_full_scale,
+                        static_cast<float>(projected_crop.roi_y) +
+                            crop_keypoints[index].y * crop_to_full_scale);
+                    observation_scores.push_back(crop_scores[index]);
+                }
+                have_rtmpose_observation = CountScoresAbove(observation_scores, 0.01f) >= 6;
+            }
+        }
+
+        if (!have_rtmpose_observation) {
+            observation_keypoints.assign(projected_crop.projected_joints.begin(),
+                                         projected_crop.projected_joints.end());
+            observation_scores.assign(projected_crop.joint_scores.begin(),
+                                      projected_crop.joint_scores.end());
+        }
+
+        const cv::Vec3f translation_camera = EstimateTranslation(
+            cliff_result.camera,
+            projected_crop.crop_cx,
+            projected_crop.crop_cy,
+            projected_crop.crop_size,
+            projected_crop.fx,
+            projected_crop.img_w,
+            projected_crop.img_h);
+        const cv::Vec3f translation_world =
+            CameraTranslationToWorld(translation_camera, *calibration);
+
+        CliffViewEstimate estimate;
+        estimate.observation.keypoints = std::move(observation_keypoints);
+        estimate.observation.keypoint_scores = std::move(observation_scores);
+        estimate.observation.K = projected_crop.K;
+        estimate.observation.R = calibration->R;
+        estimate.observation.t = calibration->t;
+        estimate.observation.img_w = projected_crop.img_w;
+        estimate.observation.img_h = projected_crop.img_h;
+        estimate.pose_world = std::move(pose_world);
+        estimate.betas.assign(cliff_result.shape.begin(),
+                              cliff_result.shape.begin() + kSmplShapeParamCount);
+        estimate.translation_world = translation_world;
+        estimate.score =
+            static_cast<float>(CountScoresAbove(estimate.observation.keypoint_scores, 0.01f)) +
+            MeanPositiveScore(estimate.observation.keypoint_scores);
+        views.push_back(std::move(estimate));
+    }
+
+    if (views.empty()) {
+        return false;
+    }
+
+    const auto best_view_it = std::max_element(
+        views.begin(),
+        views.end(),
+        [](const CliffViewEstimate& left, const CliffViewEstimate& right) {
+            return left.score < right.score;
+        });
+    if (best_view_it == views.end()) {
+        return false;
+    }
+
+    SmplResult merged_seed;
+    merged_seed.pose = best_view_it->pose_world;
+    merged_seed.shape.assign(kSmplShapeParamCount, 0.0f);
+    cv::Vec3f translation_world(0.0f, 0.0f, 0.0f);
+    float weight_sum = 0.0f;
+    for (const auto& view : views) {
+        const float weight = std::max(view.score, 1e-3f);
+        weight_sum += weight;
+        for (size_t beta_index = 0; beta_index < merged_seed.shape.size(); ++beta_index) {
+            merged_seed.shape[beta_index] += view.betas[beta_index] * weight;
+        }
+        translation_world += view.translation_world * weight;
+    }
+    if (weight_sum > 0.0f) {
+        for (float& beta : merged_seed.shape) {
+            beta /= weight_sum;
+        }
+        translation_world *= (1.0f / weight_sum);
+    } else {
+        merged_seed.shape = best_view_it->betas;
+        translation_world = best_view_it->translation_world;
+    }
+    merged_seed.camera = {translation_world[0], translation_world[1], translation_world[2]};
+
+    SmplifyLiteOptions multiview_options;
+    multiview_options.num_iters = std::max(10, smpl_iters);
+    multiview_options.min_iters = std::min(10, multiview_options.num_iters);
+    multiview_options.pose_reg = 5.0f;
+    multiview_options.betas_reg = 5e-4f;
+    multiview_options.reproj_robust_sigma = 25.0f;
+
+    std::vector<SmplifyMultiViewObservation> observations;
+    observations.reserve(views.size());
+    for (const auto& view : views) {
+        observations.push_back(view.observation);
+    }
+
+    SmplResult refined_result = merged_seed;
+    if (!SmplifyLiteMultiView(
+            smpl_layer,
+            observations,
+            &refined_result,
+            multiview_options,
+            nullptr)) {
+        refined_result = merged_seed;
+    }
+
+    std::vector<float> final_pose = PoseToAxisAngleVector(refined_result.pose);
+    if (final_pose.size() != kSmplPoseParamCount ||
+        refined_result.shape.size() < kSmplShapeParamCount ||
+        refined_result.camera.size() < 3u) {
+        return false;
+    }
+
+    person->smpl_pose = std::move(final_pose);
+    person->smpl_shape.assign(refined_result.shape.begin(),
+                              refined_result.shape.begin() + kSmplShapeParamCount);
+    person->smpl_translation = cv::Point3f(
+        refined_result.camera[0],
+        refined_result.camera[1],
+        refined_result.camera[2]);
+    person->smpl_scale = 1.0f;
+    person->smpl_valid = true;
+    return true;
+}
+
 bool BuildTrainingDebugOverlay(SMPLLayer& smpl_layer,
                                const MocapPerson3D& person,
                                const CameraCalibration& calibration,
@@ -676,24 +1153,13 @@ bool BuildTrainingSample(const SyncedView& view,
         return false;
     }
 
-    const float img_w = static_cast<float>(view.image.cols);
-    const float img_h = static_cast<float>(view.image.rows);
-    if (img_w <= 0.0f || img_h <= 0.0f) {
+    ProjectedPersonCrop projected_crop;
+    if (!BuildProjectedPersonCrop(view, person, calibration, crop_margin, &projected_crop)) {
         return false;
     }
-
-    const float scale_x =
-        calibration.image_width > 0 ? img_w / static_cast<float>(calibration.image_width) : 1.0f;
-    const float scale_y =
-        calibration.image_height > 0 ? img_h / static_cast<float>(calibration.image_height) : 1.0f;
-
-    const float fx = calibration.K(0, 0) * scale_x;
-    const float fy = calibration.K(1, 1) * scale_y;
-    const float cx = calibration.K(0, 2) * scale_x;
-    const float cy = calibration.K(1, 2) * scale_y;
-    if (!(fx > 0.0f) || !(fy > 0.0f)) {
-        return false;
-    }
+    const float img_w = projected_crop.img_w;
+    const float img_h = projected_crop.img_h;
+    const float fx = projected_crop.fx;
 
     cv::Vec3f global_orient(person.smpl_pose[0], person.smpl_pose[1], person.smpl_pose[2]);
     cv::Matx33f smpl_global_rotation;
@@ -741,54 +1207,17 @@ bool BuildTrainingSample(const SyncedView& view,
     const float X = root_local[0];
     const float Y = root_local[1];
     const float Z = root_local[2];
-    if (!(Z > 0.1f)) {
+    if (!(Z > kMinProjectedDepth)) {
         return false;
     }
-
-    float min_x = std::numeric_limits<float>::max();
-    float min_y = std::numeric_limits<float>::max();
-    float max_x = -std::numeric_limits<float>::max();
-    float max_y = -std::numeric_limits<float>::max();
-    bool has_projected_joint = false;
-
-    for (const auto& joint : person.joints) {
-        if (!joint.IsValid()) {
-            continue;
-        }
-
-        const cv::Vec3f joint_global(joint.xyz.x, joint.xyz.y, joint.xyz.z);
-        const cv::Vec3f joint_local = calibration.R * joint_global + calibration.t;
-        if (!(joint_local[2] > 0.1f)) {
-            continue;
-        }
-
-        const float u = (joint_local[0] * fx / joint_local[2]) + cx;
-        const float v = (joint_local[1] * fy / joint_local[2]) + cy;
-        min_x = std::min(min_x, u);
-        min_y = std::min(min_y, v);
-        max_x = std::max(max_x, u);
-        max_y = std::max(max_y, v);
-        has_projected_joint = true;
-    }
-
-    if (!has_projected_joint) {
-        return false;
-    }
-
-    const float bbox_w = max_x - min_x;
-    const float bbox_h = max_y - min_y;
-    if (!(bbox_w > 1.0f) || !(bbox_h > 1.0f)) {
-        return false;
-    }
-
-    const float raw_crop_size = std::max(1.0f, std::max(bbox_w, bbox_h) * crop_margin);
-    const float raw_crop_cx = (min_x + max_x) * 0.5f;
-    const float raw_crop_cy = (min_y + max_y) * 0.5f;
-    const int roi_size = std::max(1, static_cast<int>(std::ceil(raw_crop_size)));
-    const int roi_x = static_cast<int>(std::floor(raw_crop_cx - raw_crop_size * 0.5f));
-    const int roi_y = static_cast<int>(std::floor(raw_crop_cy - raw_crop_size * 0.5f));
-
-    const int image_interpolation = roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
+    const float raw_crop_size = projected_crop.crop_size;
+    const float raw_crop_cx = projected_crop.crop_cx;
+    const float raw_crop_cy = projected_crop.crop_cy;
+    const int roi_size = projected_crop.roi_size;
+    const int roi_x = projected_crop.roi_x;
+    const int roi_y = projected_crop.roi_y;
+    const int image_interpolation =
+        roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
 
     cv::Mat crop_image = CropSquareWithPaddingAndResize(
         view.image, roi_x, roi_y, roi_size, crop_resolution, image_interpolation);
@@ -921,20 +1350,46 @@ int main(int argc, char* argv[]) {
 
 #if DATASET_PREP_HAS_SMPL
     std::unique_ptr<SmplifyLiteMocapSolver> smpl_solver;
+    std::unique_ptr<CliffEstimator> cliff_estimator;
+    std::unique_ptr<RtmPoseDetector> rtmpose_detector;
     std::unique_ptr<SMPLLayer> debug_smpl_layer;
     if (options.smpl_enabled) {
-        SmplMocapFitOptions smpl_fit_options;
-        smpl_fit_options.num_iters = options.smpl_iters;
-        smpl_fit_options.use_cuda = options.smpl_use_cuda;
-        smpl_solver = std::make_unique<SmplifyLiteMocapSolver>(
-            options.smpl_model_path, smpl_fit_options);
-        if (!smpl_solver->IsReady()) {
-            std::cerr << "DatasetPrep: failed to initialize SMPL solver using "
-                      << options.smpl_model_path << std::endl;
-            return 1;
+        if (options.smpl_use_cliff) {
+            cliff_estimator = std::make_unique<CliffEstimator>(CliffEstimator::Options{
+                options.cliff_model_path,
+                options.cliff_use_cuda});
+            if (!cliff_estimator->Initialize()) {
+                std::cerr << "DatasetPrep: failed to initialize CLIFF estimator using "
+                          << options.cliff_model_path << std::endl;
+                return 1;
+            }
+
+            if (!options.rtmpose_model_path.empty()) {
+                RtmPoseDetectorOptions pose_options;
+                pose_options.use_cuda = options.rtmpose_use_cuda;
+                rtmpose_detector = std::make_unique<RtmPoseDetector>(pose_options);
+                if (!rtmpose_detector->Load(options.rtmpose_model_path)) {
+                    std::cerr << "DatasetPrep: failed to initialize RTMPose from "
+                              << options.rtmpose_model_path
+                              << ", falling back to projected mocap keypoints."
+                              << std::endl;
+                    rtmpose_detector.reset();
+                }
+            }
+        } else {
+            SmplMocapFitOptions smpl_fit_options;
+            smpl_fit_options.num_iters = options.smpl_iters;
+            smpl_fit_options.use_cuda = options.smpl_use_cuda;
+            smpl_solver = std::make_unique<SmplifyLiteMocapSolver>(
+                options.smpl_model_path, smpl_fit_options);
+            if (!smpl_solver->IsReady()) {
+                std::cerr << "DatasetPrep: failed to initialize SMPL solver using "
+                          << options.smpl_model_path << std::endl;
+                return 1;
+            }
         }
 
-        if (options.save_training_debug && !options.calibration_dir.empty()) {
+        if (options.save_training_debug || options.smpl_use_cliff) {
             try {
                 debug_smpl_layer = std::make_unique<SMPLLayer>(options.smpl_model_path);
                 torch::Device device(torch::kCPU);
@@ -944,6 +1399,12 @@ int main(int argc, char* argv[]) {
                 debug_smpl_layer->to(device);
                 debug_smpl_layer->eval();
             } catch (const std::exception& e) {
+                if (options.smpl_use_cliff) {
+                    std::cerr << "DatasetPrep: failed to initialize SMPL layer for CLIFF "
+                                 "multi-view fitting: "
+                              << e.what() << std::endl;
+                    return 1;
+                }
                 std::cerr << "DatasetPrep: failed to initialize training debug SMPL layer: "
                           << e.what() << std::endl;
                 debug_smpl_layer.reset();
@@ -1006,46 +1467,58 @@ int main(int argc, char* argv[]) {
         }
 
 #if DATASET_PREP_HAS_SMPL
-        if (smpl_solver) {
+        if (options.smpl_enabled) {
             for (auto& person : pose3d.people) {
-                std::vector<cv::Point3f> joint_centers;
-                std::vector<cv::Vec4f> joint_rotations;
-                std::vector<float> joint_confidences;
-                joint_centers.reserve(person.joints.size());
-                joint_rotations.reserve(person.joints.size());
-                joint_confidences.reserve(person.joints.size());
-                for (const auto& joint : person.joints) {
-                    joint_centers.push_back(joint.xyz);
-                    joint_rotations.push_back(joint.quaternion);
-                    joint_confidences.push_back(joint.confidence);
+                ResetSmplFit(&person);
+
+                if (options.smpl_use_cliff && cliff_estimator && debug_smpl_layer) {
+                    if (EstimatePersonSmplWithCliff(synced_frames,
+                                                    calibrations,
+                                                    *cliff_estimator,
+                                                    rtmpose_detector.get(),
+                                                    *debug_smpl_layer,
+                                                    options.crop_resolution,
+                                                    options.crop_margin,
+                                                    options.smpl_iters,
+                                                    &person)) {
+                        continue;
+                    }
                 }
 
-                SmplParameters smpl_parameters;
-                person.smpl_valid = smpl_solver->FitToMocap(
-                    joint_centers, joint_rotations, joint_confidences, &smpl_parameters);
-                if (person.smpl_valid) {
-                    person.smpl_pose = std::move(smpl_parameters.thetas);
-                    person.smpl_shape = std::move(smpl_parameters.betas);
-                    person.smpl_scale = smpl_parameters.mocap_scale;
-                    if (smpl_parameters.translation.size() >= 3u) {
-                        person.smpl_translation = cv::Point3f(
-                            smpl_parameters.translation[0],
-                            smpl_parameters.translation[1],
-                            smpl_parameters.translation[2]);
-                    } else {
-                        person.smpl_translation = cv::Point3f(
-                            std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN());
+                if (smpl_solver) {
+                    std::vector<cv::Point3f> joint_centers;
+                    std::vector<cv::Vec4f> joint_rotations;
+                    std::vector<float> joint_confidences;
+                    joint_centers.reserve(person.joints.size());
+                    joint_rotations.reserve(person.joints.size());
+                    joint_confidences.reserve(person.joints.size());
+                    for (const auto& joint : person.joints) {
+                        joint_centers.push_back(joint.xyz);
+                        joint_rotations.push_back(joint.quaternion);
+                        joint_confidences.push_back(joint.confidence);
                     }
-                } else {
-                    person.smpl_pose.assign(kSmplPoseParamCount, 0.0f);
-                    person.smpl_shape.assign(kSmplShapeParamCount, 0.0f);
-                    person.smpl_scale = std::numeric_limits<float>::quiet_NaN();
-                    person.smpl_translation = cv::Point3f(
-                        std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN(),
-                        std::numeric_limits<float>::quiet_NaN());
+
+                    SmplParameters smpl_parameters;
+                    person.smpl_valid = smpl_solver->FitToMocap(
+                        joint_centers, joint_rotations, joint_confidences, &smpl_parameters);
+                    if (person.smpl_valid) {
+                        person.smpl_pose = std::move(smpl_parameters.thetas);
+                        person.smpl_shape = std::move(smpl_parameters.betas);
+                        person.smpl_scale = smpl_parameters.mocap_scale;
+                        if (smpl_parameters.translation.size() >= 3u) {
+                            person.smpl_translation = cv::Point3f(
+                                smpl_parameters.translation[0],
+                                smpl_parameters.translation[1],
+                                smpl_parameters.translation[2]);
+                        } else {
+                            person.smpl_translation = cv::Point3f(
+                                std::numeric_limits<float>::quiet_NaN(),
+                                std::numeric_limits<float>::quiet_NaN(),
+                                std::numeric_limits<float>::quiet_NaN());
+                        }
+                    } else {
+                        ResetSmplFit(&person);
+                    }
                 }
             }
         }
@@ -1076,7 +1549,7 @@ int main(int argc, char* argv[]) {
                     if (BuildTrainingSample(view,
                                             background_extractor,
 #if DATASET_PREP_HAS_SMPL
-                                            debug_smpl_layer.get(),
+                                            options.save_training_debug ? debug_smpl_layer.get() : nullptr,
 #endif
                                             person,
                                             static_cast<int>(person_index),

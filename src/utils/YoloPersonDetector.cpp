@@ -7,6 +7,8 @@
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "OnnxRuntimeCudaProvider.h"
+
 YoloPersonDetector::YoloPersonDetector(const YoloPersonDetectorOptions& options)
     : options_(options) {}
 
@@ -17,10 +19,7 @@ bool YoloPersonDetector::Load(const std::string& model_path) {
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
         if (options_.use_cuda) {
-            try {
-                Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CUDA(session_options, 0));
-            } catch (const Ort::Exception&) {
-            }
+            onnxruntime_utils::TryAppendCudaExecutionProvider(session_options);
         }
 
         std::wstring model_path_w(model_path.begin(), model_path.end());
