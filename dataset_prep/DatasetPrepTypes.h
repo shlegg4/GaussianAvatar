@@ -33,6 +33,11 @@ struct MocapPerson3D {
     std::array<Joint3D, kMocapJointCount> joints{};
     std::vector<float> smpl_pose = std::vector<float>(kSmplPoseParamCount, 0.0f);
     std::vector<float> smpl_shape = std::vector<float>(kSmplShapeParamCount, 0.0f);
+    cv::Point3f smpl_translation{
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN()};
+    float smpl_scale = std::numeric_limits<float>::quiet_NaN();
     bool smpl_valid = false;
 
     float MeanConfidence() const {
@@ -215,6 +220,7 @@ struct ExportTrainingSample {
     int person_id = -1;
     cv::Mat crop_image;
     cv::Mat crop_matte;
+    cv::Mat crop_overlay;
     float img_w = 0.0f;
     float img_h = 0.0f;
     float crop_cx = 0.0f;
@@ -226,6 +232,7 @@ struct ExportTrainingSample {
     float crop_h = 0.0f;
     float focal_length = 0.0f;
     float y_sign = 1.0f;
+    float smpl_scale = std::numeric_limits<float>::quiet_NaN();
     std::vector<float> cam = std::vector<float>(3u, 0.0f);
     std::vector<float> pose = std::vector<float>(kSmplPoseParamCount, 0.0f);
     std::vector<float> betas = std::vector<float>(kSmplShapeParamCount, 0.0f);

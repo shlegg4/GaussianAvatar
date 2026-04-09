@@ -60,6 +60,8 @@ bool SmplifyLiteMultiView(SMPLLayer& smpl_layer,
 struct SmplParameters {
     std::vector<float> thetas;
     std::vector<float> betas;
+    std::vector<float> translation;
+    float mocap_scale = 1.0f;
 };
 
 struct SmplMocapFitOptions {
@@ -67,9 +69,13 @@ struct SmplMocapFitOptions {
     float lr = 5e-2f;
     float min_joint_confidence = 1e-5f;
     float position_weight = 1.0f;
-    float pose_reg = 25.0f;
+    float pose_reg = 5.0f;
     float betas_reg = 1e-3f;
     float translation_reg = 1e-3f;
+    bool normalize_human_scale = true;
+    float canonical_height_m = 1.77f;
+    float min_scale = 1e-3f;
+    float max_scale = 1000.0f;
     bool use_cuda = false;
 };
 

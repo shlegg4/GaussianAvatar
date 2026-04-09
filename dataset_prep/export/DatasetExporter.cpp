@@ -1,5 +1,6 @@
 #include "dataset_prep/export/DatasetExporter.h"
 
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -16,6 +17,22 @@ void WriteVec3(std::ostream& out, const cv::Point3f& point) {
 
 void WriteVec4(std::ostream& out, const cv::Vec4f& value) {
     out << "[" << value[0] << ", " << value[1] << ", " << value[2] << ", " << value[3] << "]";
+}
+
+void WriteOptionalVec3(std::ostream& out, const cv::Point3f& point) {
+    if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z)) {
+        WriteVec3(out, point);
+    } else {
+        out << "[null, null, null]";
+    }
+}
+
+void WriteOptionalFloat(std::ostream& out, float value) {
+    if (std::isfinite(value)) {
+        out << value;
+    } else {
+        out << "null";
+    }
 }
 
 void WriteFloatArray(std::ostream& out,
@@ -82,6 +99,20 @@ bool DatasetExporter::SaveFrame(const ExportFrameArtifacts& artifacts) {
                     !cv::imwrite(crop_path.string(), sample.crop_image, png_params)) {
                     std::cerr << "DatasetExporter: failed to write "
                               << crop_path.string() << std::endl;
+                    return false;
+                }
+            }
+        }
+
+        if (options_.save_training_debug) {
+            for (const auto& sample : artifacts.training_samples) {
+                if (sample.crop_overlay.empty()) {
+                    continue;
+                }
+                const auto overlay_path = MakeTrainingOverlayPath(artifacts, sample);
+                if (!cv::imwrite(overlay_path.string(), sample.crop_overlay, png_params)) {
+                    std::cerr << "DatasetExporter: failed to write "
+                              << overlay_path.string() << std::endl;
                     return false;
                 }
             }
@@ -155,6 +186,13 @@ bool DatasetExporter::EnsureCameraDirectories(const ExportFrameArtifacts& artifa
                     return false;
                 }
             }
+            if (options_.save_training_debug) {
+                std::filesystem::create_directories(
+                    (options_.output_dir / "overlays" / sample.camera_id), error);
+                if (error) {
+                    return false;
+                }
+            }
         }
     } else {
         for (const auto& view : artifacts.synced_frames.views) {
@@ -224,6 +262,12 @@ bool DatasetExporter::WritePoseJson(const ExportFrameArtifacts& artifacts,
         output << ",\n";
         output << "      \"smpl_shape\": ";
         WriteFloatArray(output, person.smpl_shape, kSmplShapeParamCount);
+        output << ",\n";
+        output << "      \"smpl_translation\": ";
+        WriteOptionalVec3(output, person.smpl_translation);
+        output << ",\n";
+        output << "      \"smpl_scale\": ";
+        WriteOptionalFloat(output, person.smpl_scale);
         output << "\n";
         output << "    }";
         if (person_index + 1u < artifacts.pose3d.people.size()) {
@@ -264,6 +308,9 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
         for (const auto& sample : artifacts.training_samples) {
             const auto crop_path = std::filesystem::absolute(
                 MakeTrainingCropPath(artifacts, sample)).lexically_normal();
+            const std::filesystem::path overlay_path = options_.save_training_debug && !sample.crop_overlay.empty()
+                ? std::filesystem::absolute(MakeTrainingOverlayPath(artifacts, sample)).lexically_normal()
+                : std::filesystem::path();
             output << "{\"frame\":" << artifacts.synced_frames.sync_index
                    << ",\"sync_index\":" << artifacts.synced_frames.sync_index
                    << ",\"camera_id\":\"" << JsonEscape(sample.camera_id) << "\""
@@ -272,7 +319,7 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
                    << ",\"image\":\"\""
                    << ",\"crop\":\"" << JsonEscape(crop_path.generic_string()) << "\""
                    << ",\"input\":\"\""
-                   << ",\"overlay\":\"\""
+                   << ",\"overlay\":\"" << JsonEscape(overlay_path.generic_string()) << "\""
                    << ",\"img_w\":" << sample.img_w
                    << ",\"img_h\":" << sample.img_h
                    << ",\"crop_cx\":" << sample.crop_cx
@@ -284,7 +331,9 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
                    << ",\"crop_h\":" << sample.crop_h
                    << ",\"focal_length\":" << sample.focal_length
                    << ",\"y_sign\":" << sample.y_sign
-                   << ",\"pose\":";
+                   << ",\"smpl_scale\":";
+            WriteOptionalFloat(output, sample.smpl_scale);
+            output << ",\"pose\":";
             WriteFloatArray(output, sample.pose, kSmplPoseParamCount);
             output << ",\"betas\":";
             WriteFloatArray(output, sample.betas, kSmplShapeParamCount);
@@ -347,6 +396,13 @@ std::filesystem::path DatasetExporter::MakeTrainingMattePath(
     const ExportTrainingSample& sample) const {
     return options_.output_dir / "mattes" / sample.camera_id /
            ("matte_" + MakeTrainingStem(artifacts, sample) + ".png");
+}
+
+std::filesystem::path DatasetExporter::MakeTrainingOverlayPath(
+    const ExportFrameArtifacts& artifacts,
+    const ExportTrainingSample& sample) const {
+    return options_.output_dir / "overlays" / sample.camera_id /
+           ("overlay_" + MakeTrainingStem(artifacts, sample) + ".png");
 }
 
 std::string DatasetExporter::MakeTrainingStem(const ExportFrameArtifacts& artifacts,

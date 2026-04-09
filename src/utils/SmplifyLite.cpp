@@ -665,6 +665,31 @@ constexpr int kSmplJointCount3D = 24;
 constexpr int kSmplPoseParamCount3D = 72;
 constexpr int kSmplShapeParamCount3D = 10;
 
+constexpr int kMocapLeftShoulder = 5;
+constexpr int kMocapRightShoulder = 6;
+constexpr int kMocapLeftElbow = 7;
+constexpr int kMocapRightElbow = 8;
+constexpr int kMocapLeftWrist = 9;
+constexpr int kMocapRightWrist = 10;
+constexpr int kMocapLeftAnkle = 15;
+constexpr int kMocapRightAnkle = 16;
+constexpr int kMocapPelvis = 19;
+constexpr int kMocapLeftBigToe = 20;
+constexpr int kMocapRightBigToe = 21;
+constexpr int kMocapLeftSmallToe = 22;
+constexpr int kMocapRightSmallToe = 23;
+constexpr int kMocapLeftHeel = 24;
+constexpr int kMocapRightHeel = 25;
+
+constexpr float kVitruvianArmSpanToHeight = 1.0f;
+constexpr float kVitruvianHandLengthToHeight = 0.1f;
+constexpr float kVitruvianShoulderWidthToHeight = 0.25f;
+constexpr float kVitruvianFootLengthToHeight = 1.0f / 6.0f;
+constexpr float kVitruvianWristSpanToHeight =
+    kVitruvianArmSpanToHeight - 2.0f * kVitruvianHandLengthToHeight;
+constexpr float kVitruvianShoulderToWristToHeight =
+    0.5f * (kVitruvianWristSpanToHeight - kVitruvianShoulderWidthToHeight);
+
 const MocapJointMap kMocapToSmplTargetMap[] = {
     {11, 1},  {12, 2},  {13, 4},  {14, 5},  {15, 7},  {16, 8},  {18, 12},
     {17, 15}, {5, 16},  {6, 17},  {7, 18},  {8, 19},  {9, 20},  {10, 21},
@@ -780,23 +805,154 @@ bool AverageQuaternions(const std::vector<cv::Vec4f>& joint_rotations,
     return NormalizeQuaternion(out_quaternion);
 }
 
-void SetPoseJointFromQuaternion(int smpl_joint_index,
-                                const cv::Vec4f& quaternion,
-                                std::vector<float>* pose_values)
+void SetPoseJointAxisAngle(int smpl_joint_index,
+                           const cv::Vec3f& axis_angle,
+                           std::vector<float>* pose_values)
 {
     if (pose_values == nullptr || smpl_joint_index < 0 || smpl_joint_index >= kSmplJointCount3D)
     {
         return;
     }
 
-    const cv::Vec3f axis_angle = QuaternionToAxisAngle(quaternion);
     const size_t base_index = static_cast<size_t>(smpl_joint_index) * 3u;
     (*pose_values)[base_index + 0u] = axis_angle[0];
     (*pose_values)[base_index + 1u] = axis_angle[1];
     (*pose_values)[base_index + 2u] = axis_angle[2];
 }
 
-void InitializePoseFromMocap(const std::vector<cv::Vec4f>& joint_rotations,
+void SetPoseJointFromQuaternion(int smpl_joint_index,
+                                const cv::Vec4f& quaternion,
+                                std::vector<float>* pose_values)
+{
+    SetPoseJointAxisAngle(smpl_joint_index, QuaternionToAxisAngle(quaternion), pose_values);
+}
+
+bool TryGetPoint(const std::vector<cv::Point3f>& joint_centers,
+                 const std::vector<float>& joint_confidences,
+                 int index,
+                 float min_joint_confidence,
+                 cv::Point3f* out_point);
+
+bool TryEstimateRootAxisAngleFromJoints(const std::vector<cv::Point3f>& joint_centers,
+                                        const std::vector<float>& joint_confidences,
+                                        float min_joint_confidence,
+                                        cv::Vec3f* out_axis_angle)
+{
+    if (out_axis_angle == nullptr)
+    {
+        return false;
+    }
+
+    cv::Point3f pelvis;
+    bool has_pelvis = TryGetPoint(joint_centers, joint_confidences,
+                                  kMocapPelvis, min_joint_confidence, &pelvis);
+    if (!has_pelvis)
+    {
+        cv::Point3f left_hip;
+        cv::Point3f right_hip;
+        if (!TryGetPoint(joint_centers, joint_confidences,
+                         11, min_joint_confidence, &left_hip) ||
+            !TryGetPoint(joint_centers, joint_confidences,
+                         12, min_joint_confidence, &right_hip))
+        {
+            return false;
+        }
+        pelvis = (left_hip + right_hip) * 0.5f;
+    }
+
+    cv::Point3f shoulder_midpoint;
+    {
+        cv::Point3f left_shoulder;
+        cv::Point3f right_shoulder;
+        if (TryGetPoint(joint_centers, joint_confidences,
+                        kMocapLeftShoulder, min_joint_confidence, &left_shoulder) &&
+            TryGetPoint(joint_centers, joint_confidences,
+                        kMocapRightShoulder, min_joint_confidence, &right_shoulder))
+        {
+            shoulder_midpoint = (left_shoulder + right_shoulder) * 0.5f;
+        }
+        else
+        {
+            cv::Point3f neck_or_head;
+            if (!TryGetPoint(joint_centers, joint_confidences,
+                             18, min_joint_confidence, &neck_or_head) &&
+                !TryGetPoint(joint_centers, joint_confidences,
+                             17, min_joint_confidence, &neck_or_head))
+            {
+                return false;
+            }
+            shoulder_midpoint = neck_or_head;
+        }
+    }
+
+    cv::Point3f left_side;
+    cv::Point3f right_side;
+    if (!(TryGetPoint(joint_centers, joint_confidences,
+                      11, min_joint_confidence, &left_side) &&
+          TryGetPoint(joint_centers, joint_confidences,
+                      12, min_joint_confidence, &right_side)))
+    {
+        if (!(TryGetPoint(joint_centers, joint_confidences,
+                          kMocapLeftShoulder, min_joint_confidence, &left_side) &&
+              TryGetPoint(joint_centers, joint_confidences,
+                          kMocapRightShoulder, min_joint_confidence, &right_side)))
+        {
+            return false;
+        }
+    }
+
+    cv::Vec3f up(shoulder_midpoint.x - pelvis.x,
+                 shoulder_midpoint.y - pelvis.y,
+                 shoulder_midpoint.z - pelvis.z);
+    cv::Vec3f right(right_side.x - left_side.x,
+                    right_side.y - left_side.y,
+                    right_side.z - left_side.z);
+    const float up_norm = static_cast<float>(cv::norm(up));
+    const float right_norm = static_cast<float>(cv::norm(right));
+    if (!(up_norm > 1e-6f) || !(right_norm > 1e-6f))
+    {
+        return false;
+    }
+
+    up *= (1.0f / up_norm);
+    right *= (1.0f / right_norm);
+    right -= up * right.dot(up);
+    const float right_ortho_norm = static_cast<float>(cv::norm(right));
+    if (!(right_ortho_norm > 1e-6f))
+    {
+        return false;
+    }
+    right *= (1.0f / right_ortho_norm);
+
+    cv::Vec3f forward = right.cross(up);
+    const float forward_norm = static_cast<float>(cv::norm(forward));
+    if (!(forward_norm > 1e-6f))
+    {
+        return false;
+    }
+    forward *= (1.0f / forward_norm);
+
+    right = up.cross(forward);
+    const float right_rebuilt_norm = static_cast<float>(cv::norm(right));
+    if (!(right_rebuilt_norm > 1e-6f))
+    {
+        return false;
+    }
+    right *= (1.0f / right_rebuilt_norm);
+
+    cv::Matx33f root_rotation(
+        right[0], up[0], forward[0],
+        right[1], up[1], forward[1],
+        right[2], up[2], forward[2]);
+    cv::Rodrigues(root_rotation, *out_axis_angle);
+    return std::isfinite((*out_axis_angle)[0]) &&
+           std::isfinite((*out_axis_angle)[1]) &&
+           std::isfinite((*out_axis_angle)[2]);
+}
+
+void InitializePoseFromMocap(const std::vector<cv::Point3f>& joint_centers,
+                             const std::vector<float>& joint_confidences,
+                             float min_joint_confidence,
                              std::vector<float>* pose_values)
 {
     if (pose_values == nullptr)
@@ -805,39 +961,11 @@ void InitializePoseFromMocap(const std::vector<cv::Vec4f>& joint_rotations,
     }
 
     pose_values->assign(kSmplPoseParamCount3D, 0.0f);
-
-    const auto set_single = [&](int mocap_index, int smpl_index) {
-        cv::Vec4f quaternion;
-        if (TryGetNormalizedQuaternion(joint_rotations, mocap_index, &quaternion))
-        {
-            SetPoseJointFromQuaternion(smpl_index, quaternion, pose_values);
-        }
-    };
-
-    set_single(19, 0);
-    set_single(11, 1);
-    set_single(12, 2);
-    set_single(13, 4);
-    set_single(14, 5);
-    set_single(15, 7);
-    set_single(16, 8);
-    set_single(18, 12);
-    set_single(17, 15);
-    set_single(5, 16);
-    set_single(6, 17);
-    set_single(7, 18);
-    set_single(8, 19);
-    set_single(9, 20);
-    set_single(10, 21);
-
-    cv::Vec4f quaternion;
-    if (AverageQuaternions(joint_rotations, {20, 22, 24}, &quaternion))
+    cv::Vec3f root_axis_angle;
+    if (TryEstimateRootAxisAngleFromJoints(
+            joint_centers, joint_confidences, min_joint_confidence, &root_axis_angle))
     {
-        SetPoseJointFromQuaternion(10, quaternion, pose_values);
-    }
-    if (AverageQuaternions(joint_rotations, {21, 23, 25}, &quaternion))
-    {
-        SetPoseJointFromQuaternion(11, quaternion, pose_values);
+        SetPoseJointAxisAngle(0, root_axis_angle, pose_values);
     }
 }
 
@@ -919,6 +1047,221 @@ void BuildTargets(const std::vector<cv::Point3f>& joint_centers,
     }
 }
 
+bool TryGetPoint(const std::vector<cv::Point3f>& joint_centers,
+                 const std::vector<float>& joint_confidences,
+                 int index,
+                 float min_joint_confidence,
+                 cv::Point3f* out_point)
+{
+    if (out_point == nullptr ||
+        index < 0 || index >= static_cast<int>(joint_centers.size()) ||
+        JointConfidenceAt(joint_confidences, index) < min_joint_confidence ||
+        !IsFinitePoint(joint_centers[index]))
+    {
+        return false;
+    }
+
+    *out_point = joint_centers[index];
+    return true;
+}
+
+bool TryDistance(const std::vector<cv::Point3f>& joint_centers,
+                 const std::vector<float>& joint_confidences,
+                 int index_a,
+                 int index_b,
+                 float min_joint_confidence,
+                 float* out_distance)
+{
+    if (out_distance == nullptr)
+    {
+        return false;
+    }
+
+    cv::Point3f point_a;
+    cv::Point3f point_b;
+    if (!TryGetPoint(joint_centers, joint_confidences, index_a, min_joint_confidence, &point_a) ||
+        !TryGetPoint(joint_centers, joint_confidences, index_b, min_joint_confidence, &point_b))
+    {
+        return false;
+    }
+
+    *out_distance = static_cast<float>(cv::norm(point_a - point_b));
+    return std::isfinite(*out_distance) && *out_distance > 1e-6f;
+}
+
+bool TryArmChainLength(const std::vector<cv::Point3f>& joint_centers,
+                       const std::vector<float>& joint_confidences,
+                       int shoulder_index,
+                       int elbow_index,
+                       int wrist_index,
+                       float min_joint_confidence,
+                       float* out_length)
+{
+    if (out_length == nullptr)
+    {
+        return false;
+    }
+
+    float shoulder_to_elbow = 0.0f;
+    float elbow_to_wrist = 0.0f;
+    if (!TryDistance(joint_centers, joint_confidences,
+                     shoulder_index, elbow_index,
+                     min_joint_confidence, &shoulder_to_elbow) ||
+        !TryDistance(joint_centers, joint_confidences,
+                     elbow_index, wrist_index,
+                     min_joint_confidence, &elbow_to_wrist))
+    {
+        return false;
+    }
+
+    *out_length = shoulder_to_elbow + elbow_to_wrist;
+    return std::isfinite(*out_length) && *out_length > 1e-6f;
+}
+
+bool TryFootLength(const std::vector<cv::Point3f>& joint_centers,
+                   const std::vector<float>& joint_confidences,
+                   int ankle_index,
+                   int big_toe_index,
+                   int small_toe_index,
+                   int heel_index,
+                   float min_joint_confidence,
+                   float* out_length)
+{
+    if (out_length == nullptr)
+    {
+        return false;
+    }
+
+    float ankle_to_big = 0.0f;
+    float ankle_to_small = 0.0f;
+    float heel_to_big = 0.0f;
+    float heel_to_small = 0.0f;
+    if (!TryDistance(joint_centers, joint_confidences,
+                     ankle_index, big_toe_index,
+                     min_joint_confidence, &ankle_to_big) ||
+        !TryDistance(joint_centers, joint_confidences,
+                     ankle_index, small_toe_index,
+                     min_joint_confidence, &ankle_to_small) ||
+        !TryDistance(joint_centers, joint_confidences,
+                     heel_index, big_toe_index,
+                     min_joint_confidence, &heel_to_big) ||
+        !TryDistance(joint_centers, joint_confidences,
+                     heel_index, small_toe_index,
+                     min_joint_confidence, &heel_to_small))
+    {
+        return false;
+    }
+
+    *out_length = std::max(std::max(ankle_to_big, ankle_to_small),
+                           std::max(heel_to_big, heel_to_small));
+    return std::isfinite(*out_length) && *out_length > 1e-6f;
+}
+
+float Median(std::vector<float> values)
+{
+    if (values.empty())
+    {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+
+    const size_t middle = values.size() / 2u;
+    std::nth_element(values.begin(), values.begin() + middle, values.end());
+    float median = values[middle];
+    if ((values.size() % 2u) == 0u)
+    {
+        auto lower_it = std::max_element(values.begin(), values.begin() + middle);
+        median = 0.5f * (median + *lower_it);
+    }
+    return median;
+}
+
+float EstimateVitruvianMocapScale(const std::vector<cv::Point3f>& joint_centers,
+                                  const std::vector<float>& joint_confidences,
+                                  const SmplMocapFitOptions& options)
+{
+    if (!options.normalize_human_scale || !(options.canonical_height_m > 0.0f))
+    {
+        return 1.0f;
+    }
+
+    std::vector<float> height_estimates;
+    height_estimates.reserve(6u);
+
+    const auto add_height_estimate = [&](float observed_length, float proportion_of_height) {
+        if (!(observed_length > 1e-6f) || !(proportion_of_height > 1e-6f))
+        {
+            return;
+        }
+        const float estimated_height = observed_length / proportion_of_height;
+        if (std::isfinite(estimated_height) && estimated_height > 1e-6f)
+        {
+            height_estimates.push_back(estimated_height);
+        }
+    };
+
+    float shoulder_width = 0.0f;
+    if (TryDistance(joint_centers, joint_confidences,
+                    kMocapLeftShoulder, kMocapRightShoulder,
+                    options.min_joint_confidence, &shoulder_width))
+    {
+        add_height_estimate(shoulder_width, kVitruvianShoulderWidthToHeight);
+    }
+
+    float left_arm_chain = 0.0f;
+    if (TryArmChainLength(joint_centers, joint_confidences,
+                          kMocapLeftShoulder, kMocapLeftElbow, kMocapLeftWrist,
+                          options.min_joint_confidence, &left_arm_chain))
+    {
+        add_height_estimate(left_arm_chain, kVitruvianShoulderToWristToHeight);
+    }
+
+    float right_arm_chain = 0.0f;
+    if (TryArmChainLength(joint_centers, joint_confidences,
+                          kMocapRightShoulder, kMocapRightElbow, kMocapRightWrist,
+                          options.min_joint_confidence, &right_arm_chain))
+    {
+        add_height_estimate(right_arm_chain, kVitruvianShoulderToWristToHeight);
+    }
+
+    if (shoulder_width > 1e-6f &&
+        left_arm_chain > 1e-6f &&
+        right_arm_chain > 1e-6f)
+    {
+        add_height_estimate(left_arm_chain + shoulder_width + right_arm_chain,
+                            kVitruvianWristSpanToHeight);
+    }
+
+    float left_foot_length = 0.0f;
+    if (TryFootLength(joint_centers, joint_confidences,
+                      kMocapLeftAnkle, kMocapLeftBigToe, kMocapLeftSmallToe, kMocapLeftHeel,
+                      options.min_joint_confidence, &left_foot_length))
+    {
+        add_height_estimate(left_foot_length, kVitruvianFootLengthToHeight);
+    }
+
+    float right_foot_length = 0.0f;
+    if (TryFootLength(joint_centers, joint_confidences,
+                      kMocapRightAnkle, kMocapRightBigToe, kMocapRightSmallToe, kMocapRightHeel,
+                      options.min_joint_confidence, &right_foot_length))
+    {
+        add_height_estimate(right_foot_length, kVitruvianFootLengthToHeight);
+    }
+
+    const float raw_height = Median(height_estimates);
+    if (!(raw_height > 1e-6f))
+    {
+        return 1.0f;
+    }
+
+    const float scale = options.canonical_height_m / raw_height;
+    if (!std::isfinite(scale))
+    {
+        return 1.0f;
+    }
+
+    return std::clamp(scale, options.min_scale, options.max_scale);
+}
+
 }  // namespace
 
 SmplifyLiteMocapSolver::SmplifyLiteMocapSolver(const std::string& model_path,
@@ -954,24 +1297,42 @@ bool SmplifyLiteMocapSolver::FitToMocap(const std::vector<cv::Point3f>& joint_ce
                                         const std::vector<float>& joint_confidences,
                                         SmplParameters* out_parameters)
 {
+    (void)joint_rotations;
     if (!IsReady() || out_parameters == nullptr || joint_centers.size() < kMocapJointCount3D)
     {
         return false;
     }
 
-    std::vector<cv::Vec4f> normalized_rotations = joint_rotations;
-    normalized_rotations.resize(kMocapJointCount3D, cv::Vec4f(1.0f, 0.0f, 0.0f, 0.0f));
-
     std::vector<float> pose_init_values;
-    InitializePoseFromMocap(normalized_rotations, &pose_init_values);
+    InitializePoseFromMocap(joint_centers, joint_confidences,
+                            options_.min_joint_confidence, &pose_init_values);
 
     out_parameters->thetas = pose_init_values;
     out_parameters->betas.assign(kSmplShapeParamCount3D, 0.0f);
+    out_parameters->translation.clear();
+    out_parameters->mocap_scale = 1.0f;
+
+    const float mocap_scale = EstimateVitruvianMocapScale(
+        joint_centers, joint_confidences, options_);
+    std::vector<cv::Point3f> scaled_joint_centers = joint_centers;
+    if (std::isfinite(mocap_scale) && std::abs(mocap_scale - 1.0f) > 1e-6f)
+    {
+        for (auto& joint_center : scaled_joint_centers)
+        {
+            if (!IsFinitePoint(joint_center))
+            {
+                continue;
+            }
+            joint_center.x *= mocap_scale;
+            joint_center.y *= mocap_scale;
+            joint_center.z *= mocap_scale;
+        }
+    }
 
     std::vector<int> smpl_indices;
     std::vector<float> target_positions;
     std::vector<float> target_weights;
-    BuildTargets(joint_centers, joint_confidences, options_.min_joint_confidence,
+    BuildTargets(scaled_joint_centers, joint_confidences, options_.min_joint_confidence,
                  &smpl_indices, &target_positions, &target_weights);
     if (smpl_indices.empty() || target_positions.empty() || target_weights.empty())
     {
@@ -1053,10 +1414,14 @@ bool SmplifyLiteMocapSolver::FitToMocap(const std::vector<cv::Point3f>& joint_ce
 
     auto pose_cpu = pose.detach().cpu().contiguous().reshape({-1});
     auto betas_cpu = betas.detach().cpu().contiguous().reshape({-1});
+    auto trans_cpu = trans.detach().cpu().contiguous().reshape({-1});
 
     out_parameters->thetas.assign(pose_cpu.data_ptr<float>(),
                                   pose_cpu.data_ptr<float>() + pose_cpu.numel());
     out_parameters->betas.assign(betas_cpu.data_ptr<float>(),
                                  betas_cpu.data_ptr<float>() + betas_cpu.numel());
+    out_parameters->translation.assign(trans_cpu.data_ptr<float>(),
+                                       trans_cpu.data_ptr<float>() + trans_cpu.numel());
+    out_parameters->mocap_scale = mocap_scale;
     return true;
 }

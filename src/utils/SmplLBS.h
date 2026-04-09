@@ -81,7 +81,9 @@ struct SMPLLayer : torch::nn::Module {
     torch::Tensor J_regressor;  // [24, 6890]
     torch::Tensor parents;      // [24] (Long)
     torch::Tensor weights;      // [6890, 24]
+    torch::Tensor faces;        // [F, 3] (Long)
     torch::Tensor parents_cpu;  // [24] cached on CPU
+    torch::Tensor faces_cpu;    // [F, 3] cached on CPU
     std::array<int64_t, 24> parents_host{};
 
     // Constructor: Loads parameters from .pt file
@@ -129,6 +131,14 @@ struct SMPLLayer : torch::nn::Module {
         posedirs    = register_buffer("posedirs", get_tensor("posedirs"));
         J_regressor = register_buffer("J_regressor", get_tensor("J_regressor"));
         weights     = register_buffer("weights", get_tensor("weights"));
+        if (dict.contains(c10::IValue("faces"))) {
+            auto raw_faces = get_tensor("faces").to(torch::kLong).clone();
+            faces = register_buffer("faces", raw_faces);
+            faces_cpu = raw_faces.to(torch::kCPU).to(torch::kLong).contiguous();
+        } else {
+            faces = register_buffer("faces", torch::zeros({0, 3}, torch::TensorOptions().dtype(torch::kLong)));
+            faces_cpu = faces.to(torch::kCPU).contiguous();
+        }
 
         // 2. Load Parents (Safety Fix)
         auto raw_parents = get_tensor("parents");

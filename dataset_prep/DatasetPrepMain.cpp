@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,8 @@
 #include "dataset_prep/ingestion/VideoSynchronizer.h"
 #include "dataset_prep/processing/BackgroundExtractor.h"
 #if DATASET_PREP_HAS_SMPL
+#include "utils/HmrMathHelpers.h"
+#include "utils/SmplLBS.h"
 #include "utils/SmplifyLite.h"
 #endif
 
@@ -44,6 +48,7 @@ struct CliOptions {
     bool modnet_use_cuda = false;
     int modnet_input_size = 512;
     float modnet_binary_threshold = -1.0f;
+    bool save_training_debug = true;
 #if DATASET_PREP_HAS_SMPL
     bool smpl_enabled = true;
 #else
@@ -51,7 +56,7 @@ struct CliOptions {
 #endif
     std::string smpl_model_path = "smpl_data.pt";
     bool smpl_use_cuda = false;
-    int smpl_iters = 20;
+    int smpl_iters = 60;
 };
 
 std::vector<std::string> SplitList(const std::string& value) {
@@ -110,6 +115,7 @@ void PrintUsage() {
         << "  --prefer-frame-seq           Match poses by frame index first\n"
         << "  --no-images                  Skip RGB export\n"
         << "  --no-masks                   Skip matte export\n"
+        << "  --no-training-debug          Skip per-sample training debug overlays\n"
         << "  --no-pose-json               Skip per-frame 3D pose json export\n"
         << "  --modnet model.onnx          Required MODNet model for mask extraction\n"
         << "  --modnet-cuda                Request CUDA provider for MODNet\n"
@@ -232,6 +238,10 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
         }
         if (arg == "--no-masks") {
             options.save_masks = false;
+            continue;
+        }
+        if (arg == "--no-training-debug") {
+            options.save_training_debug = false;
             continue;
         }
         if (arg == "--no-pose-json") {
@@ -373,8 +383,288 @@ cv::Mat CropSquareWithPaddingAndResize(const cv::Mat& src,
     return resized;
 }
 
+#if DATASET_PREP_HAS_SMPL
+bool BuildTrainingDebugOverlay(SMPLLayer& smpl_layer,
+                               const MocapPerson3D& person,
+                               const CameraCalibration& calibration,
+                               ExportTrainingSample* sample) {
+    if (sample == nullptr || sample->crop_image.empty() ||
+        sample->pose.size() < kSmplPoseParamCount ||
+        sample->betas.size() < kSmplShapeParamCount ||
+        sample->cam.size() < 3u) {
+        return false;
+    }
+
+    cv::Mat overlay = sample->crop_image.clone();
+
+    try {
+        torch::NoGradGuard no_grad;
+        const auto device = smpl_layer.v_template.device();
+        const auto tensor_options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+
+        auto pose_tensor = torch::from_blob(sample->pose.data(), {1, 24, 3}, torch::kFloat32)
+                               .clone()
+                               .to(device);
+        auto betas_tensor = torch::from_blob(sample->betas.data(), {1, 10}, torch::kFloat32)
+                                .clone()
+                                .to(device);
+        auto trans_zeros = torch::zeros({1, 3}, tensor_options);
+
+        const auto smpl_out = smpl_layer.forward(betas_tensor, pose_tensor, trans_zeros);
+        const auto verts_cpu = smpl_out.vertices.squeeze(0).to(torch::kCPU).contiguous();
+        const auto trans = EstimateTranslation(
+            sample->cam,
+            sample->crop_cx,
+            sample->crop_cy,
+            sample->crop_size,
+            sample->focal_length,
+            sample->img_w,
+            sample->img_h);
+
+        float x0 = sample->crop_x0;
+        float y0 = sample->crop_y0;
+        if (!(sample->crop_w > 0.0f) || !(sample->crop_h > 0.0f)) {
+            x0 = sample->crop_cx - static_cast<float>(overlay.cols) * 0.5f;
+            y0 = sample->crop_cy - static_cast<float>(overlay.rows) * 0.5f;
+        }
+        const float cx_crop = sample->img_w * 0.5f - x0;
+        const float cy_crop = sample->img_h * 0.5f - y0;
+        int projected_target_joints = 0;
+
+        const int current_visible = CountProjectedInFramePinhole(
+            verts_cpu, trans, sample->y_sign, sample->focal_length,
+            cx_crop, cy_crop, overlay.cols, overlay.rows);
+        const int pos_visible = CountProjectedInFramePinhole(
+            verts_cpu, trans, 1.0f, sample->focal_length,
+            cx_crop, cy_crop, overlay.cols, overlay.rows);
+        const int neg_visible = CountProjectedInFramePinhole(
+            verts_cpu, trans, -1.0f, sample->focal_length,
+            cx_crop, cy_crop, overlay.cols, overlay.rows);
+        const float suggested_y_sign = (neg_visible > pos_visible) ? -1.0f : 1.0f;
+
+        auto verts_acc = verts_cpu.accessor<float, 2>();
+        std::vector<cv::Vec3f> camera_vertices;
+        std::vector<cv::Point> projected_vertices;
+        std::vector<uint8_t> vertex_valid;
+        camera_vertices.resize(static_cast<size_t>(verts_acc.size(0)));
+        projected_vertices.resize(static_cast<size_t>(verts_acc.size(0)));
+        vertex_valid.assign(static_cast<size_t>(verts_acc.size(0)), 0u);
+
+        for (int vertex_index = 0; vertex_index < verts_acc.size(0); ++vertex_index) {
+            const float X = verts_acc[vertex_index][0] + trans[0];
+            const float Y = verts_acc[vertex_index][1] * sample->y_sign + trans[1];
+            const float Z = verts_acc[vertex_index][2] + trans[2];
+            camera_vertices[static_cast<size_t>(vertex_index)] = cv::Vec3f(X, Y, Z);
+            if (!(Z > 1e-6f)) {
+                continue;
+            }
+
+            const float u = (sample->focal_length * X / Z) + cx_crop;
+            const float v = (sample->focal_length * Y / Z) + cy_crop;
+            projected_vertices[static_cast<size_t>(vertex_index)] = cv::Point(
+                static_cast<int>(std::lround(u)),
+                static_cast<int>(std::lround(v)));
+            vertex_valid[static_cast<size_t>(vertex_index)] =
+                (u >= 0.0f && v >= 0.0f &&
+                 u < static_cast<float>(overlay.cols) &&
+                 v < static_cast<float>(overlay.rows))
+                    ? 1u
+                    : 0u;
+        }
+
+        if (smpl_layer.faces_cpu.defined() && smpl_layer.faces_cpu.numel() > 0) {
+            struct ProjectedTriangle {
+                float depth = 0.0f;
+                cv::Point points[3];
+                cv::Scalar color;
+            };
+
+            std::vector<ProjectedTriangle> triangles;
+            auto faces_acc = smpl_layer.faces_cpu.accessor<int64_t, 2>();
+            triangles.reserve(static_cast<size_t>(faces_acc.size(0)));
+
+            for (int face_index = 0; face_index < faces_acc.size(0); ++face_index) {
+                const int i0 = static_cast<int>(faces_acc[face_index][0]);
+                const int i1 = static_cast<int>(faces_acc[face_index][1]);
+                const int i2 = static_cast<int>(faces_acc[face_index][2]);
+                if (i0 < 0 || i1 < 0 || i2 < 0 ||
+                    i0 >= verts_acc.size(0) ||
+                    i1 >= verts_acc.size(0) ||
+                    i2 >= verts_acc.size(0)) {
+                    continue;
+                }
+
+                const cv::Vec3f& p0 = camera_vertices[static_cast<size_t>(i0)];
+                const cv::Vec3f& p1 = camera_vertices[static_cast<size_t>(i1)];
+                const cv::Vec3f& p2 = camera_vertices[static_cast<size_t>(i2)];
+                if (!(p0[2] > 1e-6f) || !(p1[2] > 1e-6f) || !(p2[2] > 1e-6f)) {
+                    continue;
+                }
+                if (!vertex_valid[static_cast<size_t>(i0)] &&
+                    !vertex_valid[static_cast<size_t>(i1)] &&
+                    !vertex_valid[static_cast<size_t>(i2)]) {
+                    continue;
+                }
+
+                const cv::Vec3f edge01 = p1 - p0;
+                const cv::Vec3f edge02 = p2 - p0;
+                const cv::Vec3f normal = edge01.cross(edge02);
+                const cv::Vec3f center = (p0 + p1 + p2) * (1.0f / 3.0f);
+                const bool front_facing = normal.dot(-center) > 0.0f;
+
+                ProjectedTriangle triangle;
+                triangle.depth = (p0[2] + p1[2] + p2[2]) * (1.0f / 3.0f);
+                triangle.points[0] = projected_vertices[static_cast<size_t>(i0)];
+                triangle.points[1] = projected_vertices[static_cast<size_t>(i1)];
+                triangle.points[2] = projected_vertices[static_cast<size_t>(i2)];
+                triangle.color = front_facing
+                    ? cv::Scalar(60, 200, 60)
+                    : cv::Scalar(60, 60, 200);
+                triangles.push_back(triangle);
+            }
+
+            std::sort(triangles.begin(),
+                      triangles.end(),
+                      [](const ProjectedTriangle& a, const ProjectedTriangle& b) {
+                          return a.depth > b.depth;
+                      });
+
+            cv::Mat mesh_layer(overlay.size(), overlay.type(), cv::Scalar::all(0));
+            cv::Mat coverage(overlay.size(), CV_8U, cv::Scalar(0));
+            for (const auto& triangle : triangles) {
+                cv::fillConvexPoly(mesh_layer, triangle.points, 3, triangle.color, cv::LINE_AA);
+                cv::fillConvexPoly(coverage, triangle.points, 3, cv::Scalar(255), cv::LINE_AA);
+                const cv::Point* contour = triangle.points;
+                const int contour_size = 3;
+                cv::polylines(mesh_layer,
+                              &contour,
+                              &contour_size,
+                              1,
+                              true,
+                              cv::Scalar(20, 20, 20),
+                              1,
+                              cv::LINE_AA);
+            }
+
+            cv::Mat blended;
+            cv::addWeighted(sample->crop_image, 0.55, mesh_layer, 0.45, 0.0, blended);
+            blended.copyTo(overlay, coverage);
+        } else {
+            for (int vertex_index = 0; vertex_index < verts_acc.size(0); vertex_index += 4) {
+                if (!vertex_valid[static_cast<size_t>(vertex_index)]) {
+                    continue;
+                }
+                cv::circle(overlay,
+                           projected_vertices[static_cast<size_t>(vertex_index)],
+                           1,
+                           cv::Scalar(0, 255, 0),
+                           -1,
+                           cv::LINE_AA);
+            }
+        }
+
+        for (const auto& joint : person.joints) {
+            if (!joint.IsValid()) {
+                continue;
+            }
+            const cv::Vec3f joint_global(joint.xyz.x, joint.xyz.y, joint.xyz.z);
+            const cv::Vec3f joint_local = calibration.R * joint_global + calibration.t;
+            if (!(joint_local[2] > 1e-6f)) {
+                continue;
+            }
+
+            const float u = (sample->focal_length * joint_local[0] / joint_local[2]) + cx_crop;
+            const float v = (sample->focal_length * joint_local[1] / joint_local[2]) + cy_crop;
+            if (u < 0.0f || v < 0.0f ||
+                u >= static_cast<float>(overlay.cols) ||
+                v >= static_cast<float>(overlay.rows)) {
+                continue;
+            }
+
+            cv::circle(overlay,
+                       cv::Point(static_cast<int>(std::lround(u)),
+                                 static_cast<int>(std::lround(v))),
+                       3,
+                       cv::Scalar(0, 255, 255),
+                       -1,
+                       cv::LINE_AA);
+            projected_target_joints++;
+        }
+
+        const int font = cv::FONT_HERSHEY_SIMPLEX;
+        const double scale = 0.4;
+        const int thickness = 1;
+        const cv::Scalar text_color = suggested_y_sign == sample->y_sign
+            ? cv::Scalar(0, 255, 255)
+            : cv::Scalar(0, 128, 255);
+        const cv::Scalar bg_color(0, 0, 0);
+
+        std::vector<std::string> lines;
+        {
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(1)
+                 << "y_sign=" << sample->y_sign
+                 << " visible=" << current_visible;
+            lines.push_back(line.str());
+        }
+        {
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(1)
+                 << "pos=" << pos_visible
+                 << " neg=" << neg_visible
+                 << " suggested=" << suggested_y_sign;
+            lines.push_back(line.str());
+        }
+        {
+            std::ostringstream line;
+            line << "target_joints=" << projected_target_joints;
+            lines.push_back(line.str());
+        }
+        if (std::isfinite(sample->smpl_scale) && sample->smpl_scale > 0.0f) {
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(3)
+                 << "scale=" << sample->smpl_scale;
+            lines.push_back(line.str());
+        }
+        {
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(3)
+                 << "root=[" << sample->pose[0] << ", "
+                 << sample->pose[1] << ", "
+                 << sample->pose[2] << "]";
+            lines.push_back(line.str());
+        }
+
+        int y = 18;
+        for (const auto& line : lines) {
+            int baseline = 0;
+            const cv::Size size = cv::getTextSize(line, font, scale, thickness, &baseline);
+            const cv::Point text_origin(8, y);
+            cv::rectangle(overlay,
+                          text_origin + cv::Point(-4, -size.height - 4),
+                          text_origin + cv::Point(size.width + 4, 4),
+                          bg_color,
+                          cv::FILLED);
+            cv::putText(overlay, line, text_origin, font, scale, text_color, thickness, cv::LINE_AA);
+            y += size.height + 10;
+        }
+
+        sample->crop_overlay = std::move(overlay);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "DatasetPrep: failed to build training debug overlay for "
+                  << sample->camera_id << " frame " << sample->video_frame_index
+                  << ": " << e.what() << std::endl;
+        return false;
+    }
+}
+#endif
+
 bool BuildTrainingSample(const SyncedView& view,
                          BackgroundExtractor& background_extractor,
+#if DATASET_PREP_HAS_SMPL
+                         SMPLLayer* debug_smpl_layer,
+#endif
                          const MocapPerson3D& person,
                          int person_index,
                          const CameraCalibration& calibration,
@@ -383,9 +673,6 @@ bool BuildTrainingSample(const SyncedView& view,
                          ExportTrainingSample* out_sample) {
     if (out_sample == nullptr || view.image.empty() ||
         !person.smpl_valid || person.smpl_pose.size() < 3u) {
-        return false;
-    }
-    if (person.joints.empty() || !person.joints[0].IsValid()) {
         return false;
     }
 
@@ -416,10 +703,41 @@ bool BuildTrainingSample(const SyncedView& view,
     cv::Vec3f local_orient;
     cv::Rodrigues(smpl_local_rotation, local_orient);
 
-    const cv::Vec3f root_global(person.joints[0].xyz.x,
-                                person.joints[0].xyz.y,
-                                person.joints[0].xyz.z);
-    const cv::Vec3f root_local = calibration.R * root_global + calibration.t;
+    const float mocap_scale =
+        (std::isfinite(person.smpl_scale) && person.smpl_scale > 0.0f)
+            ? person.smpl_scale
+            : 1.0f;
+    const cv::Vec3f calibration_t_metric(
+        calibration.t[0] * mocap_scale,
+        calibration.t[1] * mocap_scale,
+        calibration.t[2] * mocap_scale);
+    cv::Vec3f root_global(0.0f, 0.0f, 0.0f);
+    bool has_root_global = false;
+    if (std::isfinite(person.smpl_translation.x) &&
+        std::isfinite(person.smpl_translation.y) &&
+        std::isfinite(person.smpl_translation.z)) {
+        root_global = cv::Vec3f(person.smpl_translation.x,
+                                person.smpl_translation.y,
+                                person.smpl_translation.z);
+        has_root_global = true;
+    } else {
+        if (person.joints[19].IsValid()) {
+            root_global = cv::Vec3f(person.joints[19].xyz.x * mocap_scale,
+                                    person.joints[19].xyz.y * mocap_scale,
+                                    person.joints[19].xyz.z * mocap_scale);
+            has_root_global = true;
+        } else if (person.joints[11].IsValid() && person.joints[12].IsValid()) {
+            root_global = cv::Vec3f(
+                0.5f * (person.joints[11].xyz.x + person.joints[12].xyz.x) * mocap_scale,
+                0.5f * (person.joints[11].xyz.y + person.joints[12].xyz.y) * mocap_scale,
+                0.5f * (person.joints[11].xyz.z + person.joints[12].xyz.z) * mocap_scale);
+            has_root_global = true;
+        }
+    }
+    if (!has_root_global) {
+        return false;
+    }
+    const cv::Vec3f root_local = calibration.R * root_global + calibration_t_metric;
     const float X = root_local[0];
     const float Y = root_local[1];
     const float Z = root_local[2];
@@ -525,6 +843,7 @@ bool BuildTrainingSample(const SyncedView& view,
     sample.crop_h = static_cast<float>(crop_resolution);
     sample.focal_length = train_focal;
     sample.y_sign = 1.0f;
+    sample.smpl_scale = mocap_scale;
     sample.cam = {s, tx, ty};
     std::copy_n(person.smpl_pose.begin(),
                 std::min(person.smpl_pose.size(), sample.pose.size()),
@@ -535,6 +854,12 @@ bool BuildTrainingSample(const SyncedView& view,
     std::copy_n(person.smpl_shape.begin(),
                 std::min(person.smpl_shape.size(), sample.betas.size()),
                 sample.betas.begin());
+
+#if DATASET_PREP_HAS_SMPL
+    if (debug_smpl_layer != nullptr) {
+        BuildTrainingDebugOverlay(*debug_smpl_layer, person, calibration, &sample);
+    }
+#endif
 
     *out_sample = std::move(sample);
     return true;
@@ -596,6 +921,7 @@ int main(int argc, char* argv[]) {
 
 #if DATASET_PREP_HAS_SMPL
     std::unique_ptr<SmplifyLiteMocapSolver> smpl_solver;
+    std::unique_ptr<SMPLLayer> debug_smpl_layer;
     if (options.smpl_enabled) {
         SmplMocapFitOptions smpl_fit_options;
         smpl_fit_options.num_iters = options.smpl_iters;
@@ -606,6 +932,22 @@ int main(int argc, char* argv[]) {
             std::cerr << "DatasetPrep: failed to initialize SMPL solver using "
                       << options.smpl_model_path << std::endl;
             return 1;
+        }
+
+        if (options.save_training_debug && !options.calibration_dir.empty()) {
+            try {
+                debug_smpl_layer = std::make_unique<SMPLLayer>(options.smpl_model_path);
+                torch::Device device(torch::kCPU);
+                if (options.smpl_use_cuda && torch::cuda::is_available()) {
+                    device = torch::Device(torch::kCUDA);
+                }
+                debug_smpl_layer->to(device);
+                debug_smpl_layer->eval();
+            } catch (const std::exception& e) {
+                std::cerr << "DatasetPrep: failed to initialize training debug SMPL layer: "
+                          << e.what() << std::endl;
+                debug_smpl_layer.reset();
+            }
         }
     }
 #else
@@ -619,6 +961,7 @@ int main(int argc, char* argv[]) {
         options.output_dir,
         options.save_images,
         options.save_masks,
+        options.save_training_debug,
         options.save_pose_json,
         true,
         3});
@@ -683,9 +1026,26 @@ int main(int argc, char* argv[]) {
                 if (person.smpl_valid) {
                     person.smpl_pose = std::move(smpl_parameters.thetas);
                     person.smpl_shape = std::move(smpl_parameters.betas);
+                    person.smpl_scale = smpl_parameters.mocap_scale;
+                    if (smpl_parameters.translation.size() >= 3u) {
+                        person.smpl_translation = cv::Point3f(
+                            smpl_parameters.translation[0],
+                            smpl_parameters.translation[1],
+                            smpl_parameters.translation[2]);
+                    } else {
+                        person.smpl_translation = cv::Point3f(
+                            std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN(),
+                            std::numeric_limits<float>::quiet_NaN());
+                    }
                 } else {
                     person.smpl_pose.assign(kSmplPoseParamCount, 0.0f);
                     person.smpl_shape.assign(kSmplShapeParamCount, 0.0f);
+                    person.smpl_scale = std::numeric_limits<float>::quiet_NaN();
+                    person.smpl_translation = cv::Point3f(
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN());
                 }
             }
         }
@@ -715,6 +1075,9 @@ int main(int argc, char* argv[]) {
                     ExportTrainingSample sample;
                     if (BuildTrainingSample(view,
                                             background_extractor,
+#if DATASET_PREP_HAS_SMPL
+                                            debug_smpl_layer.get(),
+#endif
                                             person,
                                             static_cast<int>(person_index),
                                             *calibration,

@@ -12,6 +12,7 @@ public:
         std::filesystem::path output_dir;
         bool save_images = true;
         bool save_masks = true;
+        bool save_training_debug = true;
         bool save_pose_json = true;
         bool append_manifest = true;
         int png_compression = 3;
@@ -33,6 +34,8 @@ private:
                                                const ExportTrainingSample& sample) const;
     std::filesystem::path MakeTrainingMattePath(const ExportFrameArtifacts& artifacts,
                                                 const ExportTrainingSample& sample) const;
+    std::filesystem::path MakeTrainingOverlayPath(const ExportFrameArtifacts& artifacts,
+                                                  const ExportTrainingSample& sample) const;
     std::string MakeTrainingStem(const ExportFrameArtifacts& artifacts,
                                  const ExportTrainingSample& sample) const;
     std::string MakeFrameStem(int sync_index) const;
