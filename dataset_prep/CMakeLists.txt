@@ -7,12 +7,113 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(DATASET_PREP_ENABLE_SMPL "Enable SMPL parameter fitting support" ON)
-set(ONNXRUNTIME_ROOT "" CACHE PATH "Path to an ONNX Runtime installation used for MODNet")
+if(WIN32)
+    set(_dataset_prep_default_download_onnxruntime_gpu ON)
+else()
+    set(_dataset_prep_default_download_onnxruntime_gpu OFF)
+endif()
+option(DATASET_PREP_DOWNLOAD_ONNXRUNTIME_GPU "Download and use the official prebuilt Windows GPU ONNX Runtime package" ${_dataset_prep_default_download_onnxruntime_gpu})
+unset(_dataset_prep_default_download_onnxruntime_gpu)
+
+set(ONNXRUNTIME_ROOT "" CACHE PATH "Optional path to an ONNX Runtime installation. Leave empty to use the downloaded GPU package on Windows.")
+set(DATASET_PREP_ONNXRUNTIME_VERSION "1.23.2" CACHE STRING "ONNX Runtime version used by dataset_prep")
+set(DATASET_PREP_ONNXRUNTIME_PACKAGE_NAME "onnxruntime-win-x64-gpu-${DATASET_PREP_ONNXRUNTIME_VERSION}")
+set(DATASET_PREP_ONNXRUNTIME_DOWNLOAD_URL "https://github.com/microsoft/onnxruntime/releases/download/v${DATASET_PREP_ONNXRUNTIME_VERSION}/${DATASET_PREP_ONNXRUNTIME_PACKAGE_NAME}.zip")
 set(Torch_ROOT "C:/libtorch" CACHE PATH "Path to a LibTorch installation used for SMPL fitting")
 
+function(dataset_prep_import_prebuilt_onnxruntime out_root out_runtime_dir)
+    if(NOT WIN32)
+        message(FATAL_ERROR "DATASET_PREP_DOWNLOAD_ONNXRUNTIME_GPU currently supports Windows only. Set ONNXRUNTIME_ROOT or turn the option OFF on other platforms.")
+    endif()
+
+    if(ONNXRUNTIME_ROOT)
+        set(_ort_root "${ONNXRUNTIME_ROOT}")
+    else()
+        set(_ort_archive_dir "${CMAKE_BINARY_DIR}/downloads")
+        set(_ort_extract_dir "${CMAKE_BINARY_DIR}/third_party")
+        set(_ort_archive_path "${_ort_archive_dir}/${DATASET_PREP_ONNXRUNTIME_PACKAGE_NAME}.zip")
+        set(_ort_root "${_ort_extract_dir}/${DATASET_PREP_ONNXRUNTIME_PACKAGE_NAME}")
+
+        file(MAKE_DIRECTORY "${_ort_archive_dir}")
+        file(MAKE_DIRECTORY "${_ort_extract_dir}")
+
+        if(NOT EXISTS "${_ort_archive_path}")
+            message(STATUS "Downloading ONNX Runtime GPU ${DATASET_PREP_ONNXRUNTIME_VERSION} from ${DATASET_PREP_ONNXRUNTIME_DOWNLOAD_URL}")
+            file(DOWNLOAD
+                "${DATASET_PREP_ONNXRUNTIME_DOWNLOAD_URL}"
+                "${_ort_archive_path}"
+                STATUS _ort_download_status
+                SHOW_PROGRESS
+                TLS_VERIFY ON
+            )
+            list(GET _ort_download_status 0 _ort_download_code)
+            list(GET _ort_download_status 1 _ort_download_message)
+            if(NOT _ort_download_code EQUAL 0)
+                message(FATAL_ERROR "Failed to download ONNX Runtime GPU archive: [${_ort_download_code}] ${_ort_download_message}")
+            endif()
+        endif()
+
+        if(NOT EXISTS "${_ort_root}/include/onnxruntime_cxx_api.h")
+            message(STATUS "Extracting ${DATASET_PREP_ONNXRUNTIME_PACKAGE_NAME}.zip to ${_ort_extract_dir}")
+            file(ARCHIVE_EXTRACT
+                INPUT "${_ort_archive_path}"
+                DESTINATION "${_ort_extract_dir}"
+            )
+        endif()
+    endif()
+
+    if(NOT EXISTS "${_ort_root}/include/onnxruntime_cxx_api.h")
+        message(FATAL_ERROR "ONNX Runtime headers were not found under ${_ort_root}/include")
+    endif()
+
+    if(NOT EXISTS "${_ort_root}/lib/onnxruntime.lib")
+        message(FATAL_ERROR "ONNX Runtime import library was not found at ${_ort_root}/lib/onnxruntime.lib")
+    endif()
+
+    if(NOT EXISTS "${_ort_root}/lib/onnxruntime.dll")
+        message(FATAL_ERROR "ONNX Runtime DLL was not found at ${_ort_root}/lib/onnxruntime.dll")
+    endif()
+
+    if(NOT TARGET onnxruntime::onnxruntime)
+        add_library(onnxruntime::onnxruntime SHARED IMPORTED GLOBAL)
+        set_target_properties(onnxruntime::onnxruntime PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${_ort_root}/include"
+            IMPORTED_IMPLIB "${_ort_root}/lib/onnxruntime.lib"
+            IMPORTED_LOCATION "${_ort_root}/lib/onnxruntime.dll"
+        )
+
+        foreach(_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+            set_property(TARGET onnxruntime::onnxruntime APPEND PROPERTY IMPORTED_CONFIGURATIONS ${_cfg})
+            set_target_properties(onnxruntime::onnxruntime PROPERTIES
+                "IMPORTED_IMPLIB_${_cfg}" "${_ort_root}/lib/onnxruntime.lib"
+                "IMPORTED_LOCATION_${_cfg}" "${_ort_root}/lib/onnxruntime.dll"
+            )
+        endforeach()
+    endif()
+
+    message(STATUS "Using ONNX Runtime from ${_ort_root}")
+    set(${out_root} "${_ort_root}" PARENT_SCOPE)
+    set(${out_runtime_dir} "${_ort_root}/lib" PARENT_SCOPE)
+endfunction()
+
 # Find OpenCV (vcpkg intercepts this if the vcpkg toolchain is used)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio calib3d)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio calib3d dnn)
 message(STATUS "Found OpenCV ${OpenCV_VERSION}")
+
+set(DATASET_PREP_ONNXRUNTIME_ROOT "")
+set(DATASET_PREP_ONNXRUNTIME_RUNTIME_DIR "")
+
+if(ONNXRUNTIME_ROOT OR DATASET_PREP_DOWNLOAD_ONNXRUNTIME_GPU)
+    dataset_prep_import_prebuilt_onnxruntime(
+        DATASET_PREP_ONNXRUNTIME_ROOT
+        DATASET_PREP_ONNXRUNTIME_RUNTIME_DIR
+    )
+else()
+    find_package(onnxruntime CONFIG REQUIRED)
+    if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg.cmake")
+        set(DATASET_PREP_ONNXRUNTIME_RUNTIME_DIR "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+    endif()
+endif()
 
 set(DATASET_PREP_SOURCES
     DatasetPrepMain.cpp
@@ -20,8 +121,10 @@ set(DATASET_PREP_SOURCES
     ingestion/MocapPoseParser.cpp
     ingestion/VideoSynchronizer.cpp
     processing/BackgroundExtractor.cpp
-    processing/CliffEstimator.cpp
+    processing/PearEstimator.cpp
     export/DatasetExporter.cpp
+    utils/ModNetMatte.cpp
+    ../src/utils/YoloPersonDetector.cpp
 )
 
 add_executable(dataset_prep ${DATASET_PREP_SOURCES})
@@ -53,6 +156,7 @@ if(MSVC)
             "${VCPKG_BIN_DIR}/opencv_imgcodecs*.dll"
             "${VCPKG_BIN_DIR}/opencv_videoio*.dll"
             "${VCPKG_BIN_DIR}/opencv_calib3d*.dll"
+            "${VCPKG_BIN_DIR}/opencv_dnn*.dll"
             
             # FFmpeg Codecs (Critical for videoio backend)
             "${VCPKG_BIN_DIR}/avformat*.dll"
@@ -66,9 +170,6 @@ if(MSVC)
             "${VCPKG_BIN_DIR}/jpeg*.dll"
             "${VCPKG_BIN_DIR}/tiff*.dll"
             "${VCPKG_BIN_DIR}/zlib*.dll"
-
-            # ONNX Runtime
-            "${VCPKG_BIN_DIR}/onnxruntime*.dll"
         )
         
         if(OPENCV_RUNTIME_DLLS)
@@ -76,7 +177,22 @@ if(MSVC)
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${OPENCV_RUNTIME_DLLS}
                 $<TARGET_FILE_DIR:dataset_prep>
-                COMMENT "Copying OpenCV, FFmpeg, and Image Codec DLLs from vcpkg to output directory"
+                COMMENT "Copying OpenCV, FFmpeg, and image codec DLLs from vcpkg to output directory"
+            )
+        endif()
+    endif()
+
+    if(DATASET_PREP_ONNXRUNTIME_RUNTIME_DIR)
+        file(GLOB ONNXRUNTIME_RUNTIME_DLLS
+            "${DATASET_PREP_ONNXRUNTIME_RUNTIME_DIR}/onnxruntime*.dll"
+        )
+
+        if(ONNXRUNTIME_RUNTIME_DLLS)
+            add_custom_command(TARGET dataset_prep POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ONNXRUNTIME_RUNTIME_DLLS}
+                $<TARGET_FILE_DIR:dataset_prep>
+                COMMENT "Copying ONNX Runtime DLLs to output directory"
             )
         endif()
     endif()
@@ -117,9 +233,7 @@ if(DATASET_PREP_ENABLE_SMPL)
 else()
     target_compile_definitions(dataset_prep PRIVATE DATASET_PREP_HAS_SMPL=0)
 endif()
-   
-find_package(onnxruntime CONFIG REQUIRED) 
-target_sources(dataset_prep PRIVATE utils/ModNetMatte.cpp) 
+
 target_link_libraries(dataset_prep PRIVATE onnxruntime::onnxruntime)
 
 

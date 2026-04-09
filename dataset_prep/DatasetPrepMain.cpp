@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
@@ -17,7 +19,7 @@
 #include "dataset_prep/ingestion/MocapPoseParser.h"
 #include "dataset_prep/ingestion/VideoSynchronizer.h"
 #include "dataset_prep/processing/BackgroundExtractor.h"
-#include "dataset_prep/processing/CliffEstimator.h"
+#include "dataset_prep/processing/PearEstimator.h"
 #if DATASET_PREP_HAS_SMPL
 #include "utils/HmrInferenceUtils.h"
 #include "utils/HmrMathHelpers.h"
@@ -25,9 +27,12 @@
 #include "utils/SmplLBS.h"
 #include "utils/SmplifyLite.h"
 #endif
+#include "utils/YoloPersonDetector.h"
 
 namespace dataset_prep {
 namespace {
+
+using SteadyClock = std::chrono::steady_clock;
 
 struct CliOptions {
     std::vector<std::filesystem::path> video_paths;
@@ -57,14 +62,18 @@ struct CliOptions {
 #else
     bool smpl_enabled = false;
 #endif
-    bool smpl_use_cliff = true;
+    bool smpl_use_pear = true;
     std::string smpl_model_path = "smpl_data.pt";
     bool smpl_use_cuda = false;
     int smpl_iters = 60;
-    std::string cliff_model_path = "cliff_hr48_static.onnx";
-    bool cliff_use_cuda = false;
+    std::string pear_model_path = "pear.onnx";
+    bool pear_use_cuda = false;
     std::string rtmpose_model_path = "rtmpose26.onnx";
     bool rtmpose_use_cuda = false;
+    std::string yolo_model_path = "yolov8n.onnx";
+    bool yolo_use_cuda = false;
+    float yolo_conf_threshold = 0.25f;
+    float yolo_nms_threshold = 0.45f;
 };
 
 std::vector<std::string> SplitList(const std::string& value) {
@@ -129,6 +138,15 @@ std::filesystem::path ResolveExistingPath(const std::filesystem::path& input_pat
     return input_path;
 }
 
+double ElapsedMilliseconds(const SteadyClock::time_point& start,
+                           const SteadyClock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void LogProgress(const std::string& message) {
+    std::cout << message << std::endl;
+}
+
 void PrintUsage() {
     std::cout
         << "Usage:\n"
@@ -156,14 +174,20 @@ void PrintUsage() {
         << "  --modnet-threshold value     Binarize matte at the provided threshold [0,1]\n"
 #if DATASET_PREP_HAS_SMPL
         << "  --no-smpl                    Skip SMPL parameter fitting\n"
-        << "  --smpl-from-mocap           Use the old mocap-only SMPL solver instead of CLIFF\n"
+        << "  --smpl-from-mocap           Use the old mocap-only SMPL solver instead of PEAR\n"
         << "  --smpl-model path            Path to the SMPL model archive (.pt)\n"
         << "  --smpl-cuda                  Request CUDA for SMPL fitting when available\n"
         << "  --smpl-iters value           Number of optimization steps per person\n"
-        << "  --cliff-model path           Path to the CLIFF ONNX model\n"
-        << "  --cliff-cuda                 Request CUDA provider for CLIFF inference\n"
+        << "  --pear-model path            Path to the PEAR ONNX model\n"
+        << "  --pear-cuda                  Request CUDA provider for PEAR inference\n"
+        << "  --cliff-model path           Deprecated alias for --pear-model\n"
+        << "  --cliff-cuda                 Deprecated alias for --pear-cuda\n"
         << "  --rtmpose-model path         Path to the RTMPose ONNX model used for multi-view merge\n"
         << "  --rtmpose-cuda               Request CUDA provider for RTMPose inference\n"
+        << "  --yolo-model path            Path to the YOLO ONNX model used for person crops\n"
+        << "  --yolo-cuda                  Request CUDA provider for YOLO inference\n"
+        << "  --yolo-conf-threshold value  Minimum YOLO confidence for person detections\n"
+        << "  --yolo-nms-threshold value   NMS threshold for YOLO person detections\n"
 #endif
         << "  --help                       Show this message\n";
 }
@@ -313,7 +337,7 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
             continue;
         }
         if (arg == "--smpl-from-mocap") {
-            options.smpl_use_cliff = false;
+            options.smpl_use_pear = false;
             continue;
         }
         if (arg == "--smpl-model") {
@@ -332,14 +356,22 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
             options.smpl_iters = std::stoi(value);
             continue;
         }
-        if (arg == "--cliff-model") {
-            const char* value = require_value("--cliff-model");
+        if (arg == "--pear-model" || arg == "--cliff-model") {
+            const char* value = require_value(arg.c_str());
             if (!value) return false;
-            options.cliff_model_path = value;
+            options.pear_model_path = value;
+            if (arg == "--cliff-model") {
+                std::cerr << "DatasetPrep: --cliff-model is deprecated; using it as --pear-model."
+                          << std::endl;
+            }
             continue;
         }
-        if (arg == "--cliff-cuda") {
-            options.cliff_use_cuda = true;
+        if (arg == "--pear-cuda" || arg == "--cliff-cuda") {
+            options.pear_use_cuda = true;
+            if (arg == "--cliff-cuda") {
+                std::cerr << "DatasetPrep: --cliff-cuda is deprecated; using it as --pear-cuda."
+                          << std::endl;
+            }
             continue;
         }
         if (arg == "--rtmpose-model") {
@@ -350,6 +382,28 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
         }
         if (arg == "--rtmpose-cuda") {
             options.rtmpose_use_cuda = true;
+            continue;
+        }
+        if (arg == "--yolo-model") {
+            const char* value = require_value("--yolo-model");
+            if (!value) return false;
+            options.yolo_model_path = value;
+            continue;
+        }
+        if (arg == "--yolo-cuda") {
+            options.yolo_use_cuda = true;
+            continue;
+        }
+        if (arg == "--yolo-conf-threshold") {
+            const char* value = require_value("--yolo-conf-threshold");
+            if (!value) return false;
+            options.yolo_conf_threshold = std::stof(value);
+            continue;
+        }
+        if (arg == "--yolo-nms-threshold") {
+            const char* value = require_value("--yolo-nms-threshold");
+            if (!value) return false;
+            options.yolo_nms_threshold = std::stof(value);
             continue;
         }
 
@@ -372,8 +426,9 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
     }
     options.modnet_model_path = ResolveExistingPath(options.modnet_model_path).string();
     options.smpl_model_path = ResolveExistingPath(options.smpl_model_path).string();
-    options.cliff_model_path = ResolveExistingPath(options.cliff_model_path).string();
+    options.pear_model_path = ResolveExistingPath(options.pear_model_path).string();
     options.rtmpose_model_path = ResolveExistingPath(options.rtmpose_model_path).string();
+    options.yolo_model_path = ResolveExistingPath(options.yolo_model_path).string();
     if (options.modnet_model_path.empty()) {
         std::cerr << "Error: --modnet <model.onnx> is strictly required for background extraction." << std::endl;
         PrintUsage();
@@ -396,11 +451,12 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
         std::cerr << "Error: --crop-margin must be positive." << std::endl;
         return false;
     }
-    if (options.smpl_enabled && options.smpl_use_cliff) {
-        if (options.cliff_model_path.empty() ||
-            !std::filesystem::exists(options.cliff_model_path)) {
-            std::cerr << "Error: CLIFF model file not found: "
-                      << options.cliff_model_path << std::endl;
+    const bool yolo_required = options.smpl_enabled || !options.calibration_dir.empty();
+    if (options.smpl_enabled && options.smpl_use_pear) {
+        if (options.pear_model_path.empty() ||
+            !std::filesystem::exists(options.pear_model_path)) {
+            std::cerr << "Error: PEAR model file not found: "
+                      << options.pear_model_path << std::endl;
             return false;
         }
         if (!options.rtmpose_model_path.empty() &&
@@ -409,6 +465,22 @@ bool ParseArgs(int argc, char* argv[], CliOptions* out_options) {
                          "keypoints for the multi-view merge: "
                       << options.rtmpose_model_path << std::endl;
             options.rtmpose_model_path.clear();
+        }
+    }
+    if (yolo_required) {
+        if (options.yolo_model_path.empty() ||
+            !std::filesystem::exists(options.yolo_model_path)) {
+            std::cerr << "Error: YOLO model file not found: "
+                      << options.yolo_model_path << std::endl;
+            return false;
+        }
+        if (!(options.yolo_conf_threshold >= 0.0f) || !(options.yolo_conf_threshold <= 1.0f)) {
+            std::cerr << "Error: --yolo-conf-threshold must be in [0, 1]." << std::endl;
+            return false;
+        }
+        if (!(options.yolo_nms_threshold >= 0.0f) || !(options.yolo_nms_threshold <= 1.0f)) {
+            std::cerr << "Error: --yolo-nms-threshold must be in [0, 1]." << std::endl;
+            return false;
         }
     }
 
@@ -474,15 +546,230 @@ struct ProjectedPersonCrop {
     float fy = 0.0f;
     float cx = 0.0f;
     float cy = 0.0f;
+    float bbox_x = 0.0f;
+    float bbox_y = 0.0f;
+    float bbox_w = 0.0f;
+    float bbox_h = 0.0f;
     float crop_cx = 0.0f;
     float crop_cy = 0.0f;
     float crop_size = 0.0f;
     int roi_x = 0;
     int roi_y = 0;
     int roi_size = 0;
+    float detection_score = 0.0f;
     std::array<cv::Point2f, kMocapJointCount> projected_joints{};
     std::array<float, kMocapJointCount> joint_scores{};
 };
+
+bool BuildProjectedPersonCrop(const SyncedView& view,
+                              const MocapPerson3D& person,
+                              const CameraCalibration& calibration,
+                              float crop_margin,
+                              ProjectedPersonCrop* out_crop);
+
+bool IsValidCrop(const ProjectedPersonCrop& crop) {
+    return crop.roi_size > 0 && crop.crop_size > 0.0f;
+}
+
+size_t CountValidMatchedCrops(const std::vector<std::vector<ProjectedPersonCrop>>& matched_crops) {
+    size_t count = 0u;
+    for (const auto& view_crops : matched_crops) {
+        for (const auto& crop : view_crops) {
+            if (IsValidCrop(crop)) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+int CountValidSmplFits(const MocapFrame3D& pose3d) {
+    int count = 0;
+    for (const auto& person : pose3d.people) {
+        if (person.smpl_valid) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+cv::Rect2f CropBoundingBoxRect(const ProjectedPersonCrop& crop) {
+    return cv::Rect2f(crop.bbox_x, crop.bbox_y, crop.bbox_w, crop.bbox_h);
+}
+
+float ComputeIntersectionOverUnion(const cv::Rect2f& left, const cv::Rect2f& right) {
+    const float x0 = std::max(left.x, right.x);
+    const float y0 = std::max(left.y, right.y);
+    const float x1 = std::min(left.x + left.width, right.x + right.width);
+    const float y1 = std::min(left.y + left.height, right.y + right.height);
+    const float intersection_w = std::max(0.0f, x1 - x0);
+    const float intersection_h = std::max(0.0f, y1 - y0);
+    const float intersection_area = intersection_w * intersection_h;
+    const float union_area = left.area() + right.area() - intersection_area;
+    if (!(union_area > 0.0f)) {
+        return 0.0f;
+    }
+    return intersection_area / union_area;
+}
+
+bool BuildYoloCropFromDetection(const ProjectedPersonCrop& projected_crop,
+                                const cv::Rect2f& detection_bbox,
+                                float detection_score,
+                                float crop_margin,
+                                ProjectedPersonCrop* out_crop) {
+    if (out_crop == nullptr || !(detection_bbox.width > 1.0f) || !(detection_bbox.height > 1.0f)) {
+        return false;
+    }
+
+    ProjectedPersonCrop crop = projected_crop;
+    crop.bbox_x = detection_bbox.x;
+    crop.bbox_y = detection_bbox.y;
+    crop.bbox_w = detection_bbox.width;
+    crop.bbox_h = detection_bbox.height;
+    crop.crop_cx = detection_bbox.x + detection_bbox.width * 0.5f;
+    crop.crop_cy = detection_bbox.y + detection_bbox.height * 0.5f;
+    crop.crop_size = std::max(1.0f, std::max(detection_bbox.width, detection_bbox.height) * crop_margin);
+    crop.roi_size = std::max(1, static_cast<int>(std::ceil(crop.crop_size)));
+    crop.roi_x = static_cast<int>(std::floor(crop.crop_cx - crop.crop_size * 0.5f));
+    crop.roi_y = static_cast<int>(std::floor(crop.crop_cy - crop.crop_size * 0.5f));
+    crop.detection_score = detection_score;
+
+    *out_crop = crop;
+    return true;
+}
+
+float ScoreYoloMatch(const ProjectedPersonCrop& projected_crop, const YoloDetection& detection) {
+    const cv::Rect2f projected_bbox = CropBoundingBoxRect(projected_crop);
+    if (!(projected_bbox.width > 1.0f) || !(projected_bbox.height > 1.0f) ||
+        !(detection.bbox.width > 1.0f) || !(detection.bbox.height > 1.0f)) {
+        return -std::numeric_limits<float>::infinity();
+    }
+
+    const float iou = ComputeIntersectionOverUnion(projected_bbox, detection.bbox);
+    const cv::Point2f projected_center(projected_crop.crop_cx, projected_crop.crop_cy);
+    const cv::Point2f detection_center(
+        detection.bbox.x + detection.bbox.width * 0.5f,
+        detection.bbox.y + detection.bbox.height * 0.5f);
+    const float center_distance = cv::norm(projected_center - detection_center);
+    const float distance_scale = std::max(1.0f, std::max(projected_bbox.width, projected_bbox.height));
+    const float normalized_distance = center_distance / distance_scale;
+    const bool center_inside = detection.bbox.contains(projected_center);
+
+    if (iou <= 0.0f && !center_inside && normalized_distance > 1.75f) {
+        return -std::numeric_limits<float>::infinity();
+    }
+
+    return iou * 4.0f +
+           (center_inside ? 1.5f : 0.0f) +
+           detection.score * 0.5f -
+           normalized_distance;
+}
+
+std::vector<YoloDetection> DetectPeopleInView(YoloPersonDetector& yolo_detector, const cv::Mat& image) {
+    if (image.empty()) {
+        return {};
+    }
+
+    try {
+        cv::Rect2f ignored_bbox;
+        float ignored_score = 0.0f;
+        yolo_detector.DetectPerson(image, &ignored_bbox, &ignored_score);
+        return yolo_detector.last_detections();
+    } catch (const Ort::Exception& e) {
+        std::cerr << "DatasetPrep: YOLO inference failed: " << e.what() << std::endl;
+        return {};
+    } catch (const std::exception& e) {
+        std::cerr << "DatasetPrep: YOLO inference failed: " << e.what() << std::endl;
+        return {};
+    }
+}
+
+std::vector<std::vector<ProjectedPersonCrop>> BuildMatchedYoloCrops(
+    const SyncedFrameCollection& synced_frames,
+    const MocapFrame3D& pose3d,
+    const std::vector<CameraCalibration>& calibrations,
+    YoloPersonDetector* yolo_detector,
+    float crop_margin) {
+    std::vector<std::vector<ProjectedPersonCrop>> matched_crops(
+        synced_frames.views.size(),
+        std::vector<ProjectedPersonCrop>(pose3d.people.size()));
+    if (yolo_detector == nullptr) {
+        return matched_crops;
+    }
+
+    struct CandidateAssignment {
+        float score = -std::numeric_limits<float>::infinity();
+        size_t person_index = 0u;
+        size_t detection_index = 0u;
+        ProjectedPersonCrop crop;
+    };
+
+    for (size_t view_index = 0; view_index < synced_frames.views.size(); ++view_index) {
+        const auto& view = synced_frames.views[view_index];
+        const auto* calibration =
+            FindCalibrationBySourceIndex(calibrations, view.source_camera_index);
+        if (calibration == nullptr) {
+            continue;
+        }
+
+        const std::vector<YoloDetection> detections = DetectPeopleInView(*yolo_detector, view.image);
+        if (detections.empty()) {
+            continue;
+        }
+
+        std::vector<CandidateAssignment> candidates;
+        candidates.reserve(pose3d.people.size() * detections.size());
+        for (size_t person_index = 0; person_index < pose3d.people.size(); ++person_index) {
+            ProjectedPersonCrop projected_crop;
+            if (!BuildProjectedPersonCrop(
+                    view, pose3d.people[person_index], *calibration, crop_margin, &projected_crop)) {
+                continue;
+            }
+
+            for (size_t detection_index = 0; detection_index < detections.size(); ++detection_index) {
+                const float score = ScoreYoloMatch(projected_crop, detections[detection_index]);
+                if (!std::isfinite(score)) {
+                    continue;
+                }
+
+                ProjectedPersonCrop matched_crop;
+                if (!BuildYoloCropFromDetection(projected_crop,
+                                                detections[detection_index].bbox,
+                                                detections[detection_index].score,
+                                                crop_margin,
+                                                &matched_crop)) {
+                    continue;
+                }
+
+                CandidateAssignment candidate;
+                candidate.score = score;
+                candidate.person_index = person_index;
+                candidate.detection_index = detection_index;
+                candidate.crop = std::move(matched_crop);
+                candidates.push_back(std::move(candidate));
+            }
+        }
+
+        std::sort(candidates.begin(),
+                  candidates.end(),
+                  [](const CandidateAssignment& left, const CandidateAssignment& right) {
+                      return left.score > right.score;
+                  });
+
+        std::vector<uint8_t> used_people(pose3d.people.size(), 0u);
+        std::vector<uint8_t> used_detections(detections.size(), 0u);
+        for (const auto& candidate : candidates) {
+            if (used_people[candidate.person_index] || used_detections[candidate.detection_index]) {
+                continue;
+            }
+            matched_crops[view_index][candidate.person_index] = candidate.crop;
+            used_people[candidate.person_index] = 1u;
+            used_detections[candidate.detection_index] = 1u;
+        }
+    }
+
+    return matched_crops;
+}
 
 bool BuildProjectedPersonCrop(const SyncedView& view,
                               const MocapPerson3D& person,
@@ -556,6 +843,10 @@ bool BuildProjectedPersonCrop(const SyncedView& view,
         return false;
     }
 
+    crop.bbox_x = min_x;
+    crop.bbox_y = min_y;
+    crop.bbox_w = bbox_w;
+    crop.bbox_h = bbox_h;
     crop.crop_size = std::max(1.0f, std::max(bbox_w, bbox_h) * crop_margin);
     crop.crop_cx = (min_x + max_x) * 0.5f;
     crop.crop_cy = (min_y + max_y) * 0.5f;
@@ -600,14 +891,30 @@ std::vector<float> PoseToAxisAngleVector(const std::vector<float>& pose_values) 
     return {};
 }
 
-bool ConvertCliffPoseToWorld(const SmplResult& cliff_result,
-                             const CameraCalibration& calibration,
-                             std::vector<float>* out_pose_world) {
+cv::Vec3f CameraTranslationToWorld(const cv::Vec3f& translation_camera,
+                                   const CameraCalibration& calibration) {
+    return calibration.R.t() * (translation_camera - calibration.t);
+}
+
+std::vector<float> ConvertPearPoseToSmplAxisAngle(const SmplxResult& pear_result) {
+    if (pear_result.global_orient.size() != 3u || pear_result.body_pose.size() < 63u) {
+        return {};
+    }
+
+    std::vector<float> pose_values(kSmplPoseParamCount, 0.0f);
+    std::copy_n(pear_result.global_orient.begin(), 3u, pose_values.begin());
+    std::copy_n(pear_result.body_pose.begin(), 63u, pose_values.begin() + 3);
+    return pose_values;
+}
+
+bool ConvertPearPoseToWorld(const SmplxResult& pear_result,
+                            const CameraCalibration& calibration,
+                            std::vector<float>* out_pose_world) {
     if (out_pose_world == nullptr) {
         return false;
     }
 
-    std::vector<float> pose_world = PoseToAxisAngleVector(cliff_result.pose);
+    std::vector<float> pose_world = ConvertPearPoseToSmplAxisAngle(pear_result);
     if (pose_world.size() != kSmplPoseParamCount) {
         return false;
     }
@@ -627,11 +934,6 @@ bool ConvertCliffPoseToWorld(const SmplResult& cliff_result,
     return true;
 }
 
-cv::Vec3f CameraTranslationToWorld(const cv::Vec3f& translation_camera,
-                                   const CameraCalibration& calibration) {
-    return calibration.R.t() * (translation_camera - calibration.t);
-}
-
 void ResetSmplFit(MocapPerson3D* person) {
     if (person == nullptr) {
         return;
@@ -647,7 +949,7 @@ void ResetSmplFit(MocapPerson3D* person) {
         std::numeric_limits<float>::quiet_NaN());
 }
 
-struct CliffViewEstimate {
+struct PearViewEstimate {
     SmplifyMultiViewObservation observation;
     std::vector<float> pose_world;
     std::vector<float> betas;
@@ -655,64 +957,62 @@ struct CliffViewEstimate {
     float score = 0.0f;
 };
 
-bool EstimatePersonSmplWithCliff(const SyncedFrameCollection& synced_frames,
-                                 const std::vector<CameraCalibration>& calibrations,
-                                 CliffEstimator& cliff_estimator,
-                                 RtmPoseDetector* rtmpose_detector,
-                                 SMPLLayer& smpl_layer,
-                                 int crop_resolution,
-                                 float crop_margin,
-                                 int smpl_iters,
-                                 MocapPerson3D* person) {
+bool EstimatePersonSmplWithPear(const SyncedFrameCollection& synced_frames,
+                                const std::vector<std::vector<ProjectedPersonCrop>>& matched_crops,
+                                const std::vector<CameraCalibration>& calibrations,
+                                PearEstimator& pear_estimator,
+                                RtmPoseDetector* rtmpose_detector,
+                                SMPLLayer& smpl_layer,
+                                int crop_resolution,
+                                int smpl_iters,
+                                int person_index,
+                                MocapPerson3D* person) {
     if (person == nullptr) {
         return false;
     }
 
-    std::vector<CliffViewEstimate> views;
+    std::vector<PearViewEstimate> views;
     views.reserve(synced_frames.views.size());
 
-    for (const auto& view : synced_frames.views) {
+    for (size_t view_index = 0; view_index < synced_frames.views.size(); ++view_index) {
+        const auto& view = synced_frames.views[view_index];
         const auto* calibration =
             FindCalibrationBySourceIndex(calibrations, view.source_camera_index);
         if (calibration == nullptr) {
             continue;
         }
-
-        ProjectedPersonCrop projected_crop;
-        if (!BuildProjectedPersonCrop(view, *person, *calibration, crop_margin, &projected_crop)) {
+        if (view_index >= matched_crops.size() ||
+            person_index < 0 ||
+            static_cast<size_t>(person_index) >= matched_crops[view_index].size()) {
+            continue;
+        }
+        const ProjectedPersonCrop& matched_crop = matched_crops[view_index][static_cast<size_t>(person_index)];
+        if (!IsValidCrop(matched_crop)) {
             continue;
         }
 
         const int interpolation =
-            projected_crop.roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
+            matched_crop.roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
         cv::Mat crop_image = CropSquareWithPaddingAndResize(
             view.image,
-            projected_crop.roi_x,
-            projected_crop.roi_y,
-            projected_crop.roi_size,
+            matched_crop.roi_x,
+            matched_crop.roi_y,
+            matched_crop.roi_size,
             crop_resolution,
             interpolation);
         if (crop_image.empty()) {
             continue;
         }
 
-        SmplResult cliff_result;
-        if (!cliff_estimator.Estimate(
-                crop_image,
-                projected_crop.crop_cx,
-                projected_crop.crop_cy,
-                projected_crop.crop_size,
-                projected_crop.fx,
-                static_cast<int>(projected_crop.img_w),
-                static_cast<int>(projected_crop.img_h),
-                &cliff_result) ||
-            cliff_result.shape.size() < kSmplShapeParamCount ||
-            cliff_result.camera.size() < 3u) {
+        SmplxResult pear_result;
+        if (!pear_estimator.Estimate(crop_image, &pear_result) ||
+            pear_result.betas.size() < kSmplShapeParamCount ||
+            pear_result.camera_translation.size() < 3u) {
             continue;
         }
 
         std::vector<float> pose_world;
-        if (!ConvertCliffPoseToWorld(cliff_result, *calibration, &pose_world)) {
+        if (!ConvertPearPoseToWorld(pear_result, *calibration, &pose_world)) {
             continue;
         }
 
@@ -731,13 +1031,13 @@ bool EstimatePersonSmplWithCliff(const SyncedFrameCollection& synced_frames,
                 observation_keypoints.reserve(crop_keypoints.size());
                 observation_scores.reserve(crop_scores.size());
                 const float crop_to_full_scale =
-                    static_cast<float>(projected_crop.roi_size) /
+                    static_cast<float>(matched_crop.roi_size) /
                     static_cast<float>(crop_resolution);
                 for (size_t index = 0; index < crop_keypoints.size(); ++index) {
                     observation_keypoints.emplace_back(
-                        static_cast<float>(projected_crop.roi_x) +
+                        static_cast<float>(matched_crop.roi_x) +
                             crop_keypoints[index].x * crop_to_full_scale,
-                        static_cast<float>(projected_crop.roi_y) +
+                        static_cast<float>(matched_crop.roi_y) +
                             crop_keypoints[index].y * crop_to_full_scale);
                     observation_scores.push_back(crop_scores[index]);
                 }
@@ -746,34 +1046,30 @@ bool EstimatePersonSmplWithCliff(const SyncedFrameCollection& synced_frames,
         }
 
         if (!have_rtmpose_observation) {
-            observation_keypoints.assign(projected_crop.projected_joints.begin(),
-                                         projected_crop.projected_joints.end());
-            observation_scores.assign(projected_crop.joint_scores.begin(),
-                                      projected_crop.joint_scores.end());
+            observation_keypoints.assign(matched_crop.projected_joints.begin(),
+                                         matched_crop.projected_joints.end());
+            observation_scores.assign(matched_crop.joint_scores.begin(),
+                                      matched_crop.joint_scores.end());
         }
 
-        const cv::Vec3f translation_camera = EstimateTranslation(
-            cliff_result.camera,
-            projected_crop.crop_cx,
-            projected_crop.crop_cy,
-            projected_crop.crop_size,
-            projected_crop.fx,
-            projected_crop.img_w,
-            projected_crop.img_h);
+        const cv::Vec3f translation_camera(
+            pear_result.camera_translation[0],
+            pear_result.camera_translation[1],
+            pear_result.camera_translation[2]);
         const cv::Vec3f translation_world =
             CameraTranslationToWorld(translation_camera, *calibration);
 
-        CliffViewEstimate estimate;
+        PearViewEstimate estimate;
         estimate.observation.keypoints = std::move(observation_keypoints);
         estimate.observation.keypoint_scores = std::move(observation_scores);
-        estimate.observation.K = projected_crop.K;
+        estimate.observation.K = matched_crop.K;
         estimate.observation.R = calibration->R;
         estimate.observation.t = calibration->t;
-        estimate.observation.img_w = projected_crop.img_w;
-        estimate.observation.img_h = projected_crop.img_h;
+        estimate.observation.img_w = matched_crop.img_w;
+        estimate.observation.img_h = matched_crop.img_h;
         estimate.pose_world = std::move(pose_world);
-        estimate.betas.assign(cliff_result.shape.begin(),
-                              cliff_result.shape.begin() + kSmplShapeParamCount);
+        estimate.betas.assign(pear_result.betas.begin(),
+                              pear_result.betas.begin() + kSmplShapeParamCount);
         estimate.translation_world = translation_world;
         estimate.score =
             static_cast<float>(CountScoresAbove(estimate.observation.keypoint_scores, 0.01f)) +
@@ -788,7 +1084,7 @@ bool EstimatePersonSmplWithCliff(const SyncedFrameCollection& synced_frames,
     const auto best_view_it = std::max_element(
         views.begin(),
         views.end(),
-        [](const CliffViewEstimate& left, const CliffViewEstimate& right) {
+        [](const PearViewEstimate& left, const PearViewEstimate& right) {
             return left.score < right.score;
         });
     if (best_view_it == views.end()) {
@@ -1145,21 +1441,17 @@ bool BuildTrainingSample(const SyncedView& view,
                          const MocapPerson3D& person,
                          int person_index,
                          const CameraCalibration& calibration,
+                         const ProjectedPersonCrop& matched_crop,
                          int crop_resolution,
-                         float crop_margin,
                          ExportTrainingSample* out_sample) {
     if (out_sample == nullptr || view.image.empty() ||
-        !person.smpl_valid || person.smpl_pose.size() < 3u) {
+        !person.smpl_valid || person.smpl_pose.size() < 3u ||
+        !IsValidCrop(matched_crop)) {
         return false;
     }
-
-    ProjectedPersonCrop projected_crop;
-    if (!BuildProjectedPersonCrop(view, person, calibration, crop_margin, &projected_crop)) {
-        return false;
-    }
-    const float img_w = projected_crop.img_w;
-    const float img_h = projected_crop.img_h;
-    const float fx = projected_crop.fx;
+    const float img_w = matched_crop.img_w;
+    const float img_h = matched_crop.img_h;
+    const float fx = matched_crop.fx;
 
     cv::Vec3f global_orient(person.smpl_pose[0], person.smpl_pose[1], person.smpl_pose[2]);
     cv::Matx33f smpl_global_rotation;
@@ -1210,12 +1502,12 @@ bool BuildTrainingSample(const SyncedView& view,
     if (!(Z > kMinProjectedDepth)) {
         return false;
     }
-    const float raw_crop_size = projected_crop.crop_size;
-    const float raw_crop_cx = projected_crop.crop_cx;
-    const float raw_crop_cy = projected_crop.crop_cy;
-    const int roi_size = projected_crop.roi_size;
-    const int roi_x = projected_crop.roi_x;
-    const int roi_y = projected_crop.roi_y;
+    const float raw_crop_size = matched_crop.crop_size;
+    const float raw_crop_cx = matched_crop.crop_cx;
+    const float raw_crop_cy = matched_crop.crop_cy;
+    const int roi_size = matched_crop.roi_size;
+    const int roi_x = matched_crop.roi_x;
+    const int roi_y = matched_crop.roi_y;
     const int image_interpolation =
         roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
 
@@ -1348,19 +1640,36 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::unique_ptr<YoloPersonDetector> yolo_detector;
 #if DATASET_PREP_HAS_SMPL
     std::unique_ptr<SmplifyLiteMocapSolver> smpl_solver;
-    std::unique_ptr<CliffEstimator> cliff_estimator;
+    std::unique_ptr<PearEstimator> pear_estimator;
     std::unique_ptr<RtmPoseDetector> rtmpose_detector;
     std::unique_ptr<SMPLLayer> debug_smpl_layer;
     if (options.smpl_enabled) {
-        if (options.smpl_use_cliff) {
-            cliff_estimator = std::make_unique<CliffEstimator>(CliffEstimator::Options{
-                options.cliff_model_path,
-                options.cliff_use_cuda});
-            if (!cliff_estimator->Initialize()) {
-                std::cerr << "DatasetPrep: failed to initialize CLIFF estimator using "
-                          << options.cliff_model_path << std::endl;
+        if (options.smpl_use_pear) {
+            if (calibrations.empty()) {
+                std::cerr << "DatasetPrep: PEAR-based fitting requires camera calibrations." << std::endl;
+                return 1;
+            }
+
+            pear_estimator = std::make_unique<PearEstimator>(PearEstimator::Options{
+                options.pear_model_path,
+                options.pear_use_cuda});
+            if (!pear_estimator->Initialize()) {
+                std::cerr << "DatasetPrep: failed to initialize PEAR estimator using "
+                          << options.pear_model_path << std::endl;
+                return 1;
+            }
+
+            YoloPersonDetectorOptions yolo_options;
+            yolo_options.conf_threshold = options.yolo_conf_threshold;
+            yolo_options.nms_threshold = options.yolo_nms_threshold;
+            yolo_options.use_cuda = options.yolo_use_cuda;
+            yolo_detector = std::make_unique<YoloPersonDetector>(yolo_options);
+            if (!yolo_detector->Load(options.yolo_model_path)) {
+                std::cerr << "DatasetPrep: failed to initialize YOLO detector using "
+                          << options.yolo_model_path << std::endl;
                 return 1;
             }
 
@@ -1389,7 +1698,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (options.save_training_debug || options.smpl_use_cliff) {
+        if (options.save_training_debug || options.smpl_use_pear) {
             try {
                 debug_smpl_layer = std::make_unique<SMPLLayer>(options.smpl_model_path);
                 torch::Device device(torch::kCPU);
@@ -1399,8 +1708,8 @@ int main(int argc, char* argv[]) {
                 debug_smpl_layer->to(device);
                 debug_smpl_layer->eval();
             } catch (const std::exception& e) {
-                if (options.smpl_use_cliff) {
-                    std::cerr << "DatasetPrep: failed to initialize SMPL layer for CLIFF "
+                if (options.smpl_use_pear) {
+                    std::cerr << "DatasetPrep: failed to initialize SMPL layer for PEAR "
                                  "multi-view fitting: "
                               << e.what() << std::endl;
                     return 1;
@@ -1417,6 +1726,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 #endif
+
+    if (!calibrations.empty()) {
+        YoloPersonDetectorOptions yolo_options;
+        yolo_options.conf_threshold = options.yolo_conf_threshold;
+        yolo_options.nms_threshold = options.yolo_nms_threshold;
+        yolo_options.use_cuda = options.yolo_use_cuda;
+        if (!yolo_detector) {
+            yolo_detector = std::make_unique<YoloPersonDetector>(yolo_options);
+            if (!yolo_detector->Load(options.yolo_model_path)) {
+                std::cerr << "DatasetPrep: failed to initialize YOLO detector using "
+                          << options.yolo_model_path << std::endl;
+                return 1;
+            }
+        }
+    }
 
     DatasetExporter exporter(DatasetExporter::Options{
         options.output_dir,
@@ -1435,6 +1759,8 @@ int main(int argc, char* argv[]) {
         if (options.max_frames >= 0 && processed_frames >= options.max_frames) {
             break;
         }
+
+        const SteadyClock::time_point frame_start_time = SteadyClock::now();
 
         SyncedFrameCollection synced_frames;
         if (!synchronizer.GetNextSyncedViews(&synced_frames)) {
@@ -1466,21 +1792,54 @@ int main(int argc, char* argv[]) {
             pose3d = *matched_pose;
         }
 
+        {
+            std::ostringstream message;
+            message << "DatasetPrep: frame "
+                    << (processed_frames + 1)
+                    << " sync=" << synced_frames.sync_index
+                    << " views=" << synced_frames.views.size()
+                    << " people=" << pose3d.people.size()
+                    << " starting";
+            LogProgress(message.str());
+        }
+
+        const SteadyClock::time_point yolo_start_time = SteadyClock::now();
+        LogProgress("DatasetPrep: matching YOLO crops...");
+        const auto matched_yolo_crops = BuildMatchedYoloCrops(
+            synced_frames,
+            pose3d,
+            calibrations,
+            yolo_detector.get(),
+            options.crop_margin);
+        {
+            std::ostringstream message;
+            message << "DatasetPrep: YOLO crop matching finished with "
+                    << CountValidMatchedCrops(matched_yolo_crops)
+                    << " matched crops in "
+                    << std::fixed << std::setprecision(1)
+                    << ElapsedMilliseconds(yolo_start_time, SteadyClock::now()) << " ms";
+            LogProgress(message.str());
+        }
+
 #if DATASET_PREP_HAS_SMPL
         if (options.smpl_enabled) {
-            for (auto& person : pose3d.people) {
+            const SteadyClock::time_point smpl_start_time = SteadyClock::now();
+            LogProgress("DatasetPrep: fitting SMPL parameters...");
+            for (size_t person_index = 0; person_index < pose3d.people.size(); ++person_index) {
+                auto& person = pose3d.people[person_index];
                 ResetSmplFit(&person);
 
-                if (options.smpl_use_cliff && cliff_estimator && debug_smpl_layer) {
-                    if (EstimatePersonSmplWithCliff(synced_frames,
-                                                    calibrations,
-                                                    *cliff_estimator,
-                                                    rtmpose_detector.get(),
-                                                    *debug_smpl_layer,
-                                                    options.crop_resolution,
-                                                    options.crop_margin,
-                                                    options.smpl_iters,
-                                                    &person)) {
+                if (options.smpl_use_pear && pear_estimator && debug_smpl_layer) {
+                    if (EstimatePersonSmplWithPear(synced_frames,
+                                                   matched_yolo_crops,
+                                                   calibrations,
+                                                   *pear_estimator,
+                                                   rtmpose_detector.get(),
+                                                   *debug_smpl_layer,
+                                                   options.crop_resolution,
+                                                   options.smpl_iters,
+                                                   static_cast<int>(person_index),
+                                                   &person)) {
                         continue;
                     }
                 }
@@ -1521,6 +1880,16 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+            {
+                std::ostringstream message;
+                message << "DatasetPrep: SMPL fitting finished with "
+                        << CountValidSmplFits(pose3d)
+                        << "/" << pose3d.people.size()
+                        << " valid people in "
+                        << std::fixed << std::setprecision(1)
+                        << ElapsedMilliseconds(smpl_start_time, SteadyClock::now()) << " ms";
+                LogProgress(message.str());
+            }
         }
 #endif
 
@@ -1530,13 +1899,27 @@ int main(int argc, char* argv[]) {
         artifacts.pose3d = pose3d;
         artifacts.training_export_requested = !calibrations.empty();
         if (!artifacts.training_export_requested) {
+            const SteadyClock::time_point mask_start_time = SteadyClock::now();
+            LogProgress("DatasetPrep: extracting mattes...");
             if (!background_extractor.Process(synced_frames, &artifacts.masks)) {
                 return 1;
+            }
+            {
+                std::ostringstream message;
+                message << "DatasetPrep: extracted "
+                        << artifacts.masks.size()
+                        << " mattes in "
+                        << std::fixed << std::setprecision(1)
+                        << ElapsedMilliseconds(mask_start_time, SteadyClock::now()) << " ms";
+                LogProgress(message.str());
             }
         }
 
         if (artifacts.training_export_requested) {
-            for (const auto& view : artifacts.synced_frames.views) {
+            const SteadyClock::time_point training_start_time = SteadyClock::now();
+            LogProgress("DatasetPrep: building training samples...");
+            for (size_t view_index = 0; view_index < artifacts.synced_frames.views.size(); ++view_index) {
+                const auto& view = artifacts.synced_frames.views[view_index];
                 const auto* calibration =
                     FindCalibrationBySourceIndex(calibrations, view.source_camera_index);
                 if (calibration == nullptr) {
@@ -1545,6 +1928,10 @@ int main(int argc, char* argv[]) {
 
                 for (size_t person_index = 0; person_index < artifacts.pose3d.people.size(); ++person_index) {
                     const auto& person = artifacts.pose3d.people[person_index];
+                    if (view_index >= matched_yolo_crops.size() ||
+                        person_index >= matched_yolo_crops[view_index].size()) {
+                        continue;
+                    }
                     ExportTrainingSample sample;
                     if (BuildTrainingSample(view,
                                             background_extractor,
@@ -1554,17 +1941,41 @@ int main(int argc, char* argv[]) {
                                             person,
                                             static_cast<int>(person_index),
                                             *calibration,
+                                            matched_yolo_crops[view_index][person_index],
                                             options.crop_resolution,
-                                            options.crop_margin,
                                             &sample)) {
                         artifacts.training_samples.push_back(std::move(sample));
                     }
                 }
             }
+            {
+                std::ostringstream message;
+                message << "DatasetPrep: built "
+                        << artifacts.training_samples.size()
+                        << " training samples in "
+                        << std::fixed << std::setprecision(1)
+                        << ElapsedMilliseconds(training_start_time, SteadyClock::now()) << " ms";
+                LogProgress(message.str());
+            }
         }
 
+        const SteadyClock::time_point save_start_time = SteadyClock::now();
+        LogProgress("DatasetPrep: saving outputs...");
         if (!exporter.SaveFrame(artifacts)) {
             return 1;
+        }
+        {
+            std::ostringstream message;
+            message << "DatasetPrep: frame "
+                    << (processed_frames + 1)
+                    << " completed in "
+                    << std::fixed << std::setprecision(1)
+                    << ElapsedMilliseconds(frame_start_time, SteadyClock::now())
+                    << " ms"
+                    << " (save "
+                    << ElapsedMilliseconds(save_start_time, SteadyClock::now())
+                    << " ms)";
+            LogProgress(message.str());
         }
 
         ++processed_frames;
