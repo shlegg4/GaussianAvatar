@@ -1340,7 +1340,7 @@ bool BuildTrainingDebugOverlay(SMPLLayer& smpl_layer,
 
             // X, Y, Z are now in the model's native camera space
             const float X = verts_acc[vertex_index][0] + X_virt;
-            const float Y = verts_acc[vertex_index][1] + Y_virt; 
+            const float Y = verts_acc[vertex_index][1] * sample->y_sign + Y_virt;
             const float Z = verts_acc[vertex_index][2] + Z_virt;
             
             camera_vertices[static_cast<size_t>(vertex_index)] = cv::Vec3f(X, Y, Z);
@@ -1609,10 +1609,12 @@ bool BuildTrainingSample(const SyncedView& view,
     const int roi_x = matched_crop.roi_x;
     const int roi_y = matched_crop.roi_y;
     const float virtual_size = 256.0f;
-    const float scale_back = static_cast<float>(roi_size) / virtual_size;
+    const float scale_back = raw_crop_size / virtual_size;
+    const float model_tx = raw_crop_cx - (virtual_size * 0.5f) * scale_back;
+    const float model_ty = raw_crop_cy - (virtual_size * 0.5f) * scale_back;
     const cv::Matx23f model_to_full(
-        scale_back, 0.0f, static_cast<float>(roi_x),
-        0.0f, scale_back, static_cast<float>(roi_y));
+        scale_back, 0.0f, model_tx,
+        0.0f, scale_back, model_ty);
     const int image_interpolation =
         roi_size > crop_resolution ? cv::INTER_AREA : cv::INTER_CUBIC;
 
