@@ -1528,7 +1528,7 @@ public:
             sh_reg_loss = higher_orders.pow(2).mean();
         }
 
-        const float sobel_weight = 0.05f;
+        const float sobel_weight = 0.2f;
         auto loss = (1.0f - lambda_dssim_) * final_recon +
                     lambda_dssim_ * final_ssim +
                     sobel_weight * final_sobel +
