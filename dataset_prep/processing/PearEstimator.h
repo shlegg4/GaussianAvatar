@@ -17,6 +17,7 @@ struct SmplxResult {
     std::vector<float> betas;
     std::vector<float> expression;
     std::vector<float> camera_translation;
+    std::vector<float> camera_rt;
 };
 
 class PearEstimator {

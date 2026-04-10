@@ -333,8 +333,10 @@ bool PearEstimator::Estimate(const cv::Mat& crop_image, SmplxResult* out_result)
 
     SmplxResult result;
     std::vector<float> betas;
+    std::vector<float> camera_rt;
     std::vector<float> expression;
-    if (!ExtractCameraTranslation(outputs[static_cast<size_t>(impl_->camera_output_index)],
+    if (!CopyTensorToVector(outputs[static_cast<size_t>(impl_->camera_output_index)], &camera_rt) ||
+        !ExtractCameraTranslation(outputs[static_cast<size_t>(impl_->camera_output_index)],
                                   &result.camera_translation) ||
         !ConvertPoseTensorToAxisAngle(outputs[static_cast<size_t>(impl_->global_pose_output_index)],
                                       &result.global_orient) ||
@@ -351,6 +353,7 @@ bool PearEstimator::Estimate(const cv::Mat& crop_image, SmplxResult* out_result)
         return false;
     }
 
+    result.camera_rt = std::move(camera_rt);
     AssignVectorPrefix(betas, 10u, &result.betas);
     AssignVectorPrefix(expression, 10u, &result.expression);
     *out_result = std::move(result);
