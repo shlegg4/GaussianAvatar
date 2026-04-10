@@ -918,12 +918,8 @@ struct GaussianAvatar : torch::nn::Module
         auto R_posed = torch::stack({X, Y, N}, 3);
 
         auto R_posed_flat = R_posed.reshape({-1, 3, 3});
-        auto offsets_batch = g_offsets.unsqueeze(0).expand({batch_count, gaussian_count, 3});
-
-        // Use R_posed_flat instead of R_skin_flat
-        auto posed_offsets = torch::bmm(R_posed_flat, offsets_batch.reshape({-1, 3, 1}))
-                                 .squeeze(2)
-                                 .view({batch_count, gaussian_count, 3});
+        auto normal_offsets = g_offsets.index({Slice(), 2}).view({1, gaussian_count, 1});
+        auto posed_offsets = N * normal_offsets;
 
         // Re-calculate Skinning Rotation for the Gaussian Orientation (Quaternions)
         // We still need R_skin for the ROTATION of the Gaussian splat itself
@@ -1455,7 +1451,7 @@ public:
 
         auto current_scales = CappedScales(avatar_.g_scales) * render_scale_modifier_;
         auto scale_reg = torch::mean(current_scales.pow(2).sum(1));
-        auto offset_reg = torch::mean(torch::abs(avatar_.g_offsets));
+        auto offset_reg = torch::mean(torch::abs(avatar_.g_offsets.index({torch::indexing::Slice(), 2})));
         auto x_scale = current_scales.index({torch::indexing::Slice(), 0});
         auto y_scale = current_scales.index({torch::indexing::Slice(), 1});
         auto xy_max = torch::max(x_scale, y_scale);
@@ -1485,9 +1481,10 @@ public:
             const int64_t k_neighbors = avatar_.knn_indices.size(1);
             auto knn_flat = avatar_.knn_indices.reshape({-1});
 
-            auto neighbor_offsets = avatar_.g_offsets.index_select(0, knn_flat).view({-1, k_neighbors, 3});
-            auto offset_diff = avatar_.g_offsets.unsqueeze(1) - neighbor_offsets;
-            skin_smoothness_loss = offset_diff.pow(2).sum(-1).mean();
+            auto offset_z = avatar_.g_offsets.index({Slice(), 2});
+            auto neighbor_offset_z = offset_z.index_select(0, knn_flat).view({-1, k_neighbors});
+            auto offset_diff = offset_z.unsqueeze(1) - neighbor_offset_z;
+            skin_smoothness_loss = offset_diff.pow(2).mean();
 
             auto q = torch::nn::functional::normalize(
                 avatar_.g_rots,
@@ -1604,7 +1601,7 @@ public:
 
             const auto color_param = use_sh_ ? avatar_.g_sh : avatar_.g_colors;
             result.std_rot = avatar_.g_rots.detach().std();
-            result.std_offset = avatar_.g_offsets.detach().std();
+            result.std_offset = avatar_.g_offsets.index({Slice(), 2}).detach().std();
             result.std_scale = avatar_.g_scales.detach().std();
             result.std_color = color_param.defined() ? color_param.detach().std() : torch::Tensor();
             result.std_opacity = avatar_.g_opacities.detach().std();
@@ -2431,8 +2428,8 @@ int run_real_training(int argc, char *argv[])
                         bind_buffer[base + 0] = bary_ptr[base3 + 0];
                         bind_buffer[base + 1] = bary_ptr[base3 + 1];
                         bind_buffer[base + 2] = bary_ptr[base3 + 2];
-                        bind_buffer[base + 3] = off_ptr[base3 + 0];
-                        bind_buffer[base + 4] = off_ptr[base3 + 1];
+                        bind_buffer[base + 3] = 0.0f;
+                        bind_buffer[base + 4] = 0.0f;
                         bind_buffer[base + 5] = off_ptr[base3 + 2];
                         bind_buffer[base + 6] = rot_ptr[base4 + 0];
                         bind_buffer[base + 7] = rot_ptr[base4 + 1];

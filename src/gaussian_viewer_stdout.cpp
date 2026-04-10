@@ -740,7 +740,9 @@ int main(int argc, char **argv)
                 auto R_posed = ComputeTriFrames(A, B, C);
                 auto R_canon = ComputeTriFrames(A_can, B_can, C_can);
                 auto R_skin = torch::bmm(R_posed, R_canon.transpose(1, 2));
-                auto posed_offsets = torch::bmm(R_skin, bind_offsets.unsqueeze(2)).squeeze(2);
+                auto posed_normals = R_posed.select(2, 2);
+                auto normal_offsets = bind_offsets.index({Slice(), 2}).unsqueeze(1);
+                auto posed_offsets = posed_normals * normal_offsets;
 
                 auto u = bind_bary.index({Slice(), 0}).unsqueeze(1);
                 auto v = bind_bary.index({Slice(), 1}).unsqueeze(1);

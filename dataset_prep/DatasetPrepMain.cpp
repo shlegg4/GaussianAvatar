@@ -303,6 +303,41 @@ std::array<float, 3> BuildTrainingCameraParams(const cv::Vec3f& translation,
     };
 }
 
+cv::Mat ApplyCropMatte(const cv::Mat& crop_image, const cv::Mat& crop_matte) {
+    if (crop_image.empty() || crop_matte.empty()) {
+        return crop_image.clone();
+    }
+
+    cv::Mat matte_resized;
+    if (crop_matte.size() != crop_image.size()) {
+        cv::resize(crop_matte, matte_resized, crop_image.size(), 0.0, 0.0, cv::INTER_LINEAR);
+    } else {
+        matte_resized = crop_matte;
+    }
+
+    cv::Mat matte_f32;
+    if (matte_resized.type() == CV_32F) {
+        matte_f32 = matte_resized;
+    } else {
+        matte_resized.convertTo(matte_f32, CV_32F, 1.0 / 255.0);
+    }
+
+    cv::Mat matte_bgr;
+    if (matte_f32.channels() == 1) {
+        cv::cvtColor(matte_f32, matte_bgr, cv::COLOR_GRAY2BGR);
+    } else {
+        matte_bgr = matte_f32;
+    }
+
+    cv::Mat crop_f32;
+    crop_image.convertTo(crop_f32, CV_32F, 1.0 / 255.0);
+
+    cv::Mat matted_f32 = crop_f32.mul(matte_bgr);
+    cv::Mat matted_crop;
+    matted_f32.convertTo(matted_crop, crop_image.type(), 255.0);
+    return matted_crop;
+}
+
 }  // namespace
 
 cv::Mat CropSquareWithPaddingAndResize(const cv::Mat& src, int x, int y, int size, int target_res) {
@@ -355,8 +390,8 @@ void WriteFloatArray(std::ostream& out, const std::vector<float>& values, size_t
 // --- MAIN PIPELINE ---
 
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        std::cerr << "Usage: dataset_prep <video.mp4> <output_dir> <camera_id> [max_frames]\n";
+    if (argc < 4 || argc > 6) {
+        std::cerr << "Usage: dataset_prep <video.mp4> <output_dir> <camera_id> [max_frames] [frame_stride]\n";
         return 1;
     }
 
@@ -364,8 +399,13 @@ int main(int argc, char* argv[]) {
     const fs::path output_dir = argv[2];
     const std::string camera_id = argv[3];
     const int max_frames = (argc > 4) ? std::stoi(argv[4]) : -1;
+    const int frame_stride = (argc > 5) ? std::stoi(argv[5]) : 1;
+    if (frame_stride <= 0) {
+        std::cerr << "frame_stride must be >= 1.\n";
+        return 1;
+    }
 
-    const int target_crop_res = 512;
+    const int target_crop_res = 1024;
     const float crop_margin = 1.25f;
     // Initialize Outputs
     fs::create_directories(output_dir / "crops" / camera_id);
@@ -423,10 +463,20 @@ int main(int argc, char* argv[]) {
 
     cv::Mat frame;
     int frame_index = 0;
+    int selected_frame_count = 0;
+    int exported_frame_count = 0;
 
     while (cap.read(frame)) {
-        if (max_frames >= 0 && frame_index >= max_frames) break;
-        std::cout << "Processing frame " << frame_index << "..." << std::endl;
+        const int current_frame_index = frame_index++;
+        if ((current_frame_index % frame_stride) != 0) {
+            continue;
+        }
+        if (max_frames >= 0 && selected_frame_count >= max_frames) {
+            break;
+        }
+        ++selected_frame_count;
+
+        std::cout << "Processing frame " << current_frame_index << "..." << std::endl;
 
         cv::Rect2f best_bbox;
         float best_score = 0.0f;
@@ -478,8 +528,9 @@ int main(int argc, char* argv[]) {
             // 1.5. Extract Matte using MODNet <-- NEW
             cv::Mat crop_matte;
             if (!modnet.ProcessImage(crop_image, &crop_matte)) {
-                std::cerr << "Warning: Failed to extract matte on frame " << frame_index << "\n";
+                std::cerr << "Warning: Failed to extract matte on frame " << current_frame_index << "\n";
             }
+            cv::Mat crop_image_to_save = ApplyCropMatte(crop_image, crop_matte);
 
             // 2. Run PEAR
             SmplxResult pear_result;
@@ -554,14 +605,14 @@ int main(int argc, char* argv[]) {
 
                 // 5. Save Artifacts
                 std::ostringstream stem;
-                stem << "frame_" << std::setw(6) << std::setfill('0') << frame_index;
+                stem << "frame_" << std::setw(6) << std::setfill('0') << current_frame_index;
                 
                 std::string crop_path = (output_dir / "crops" / camera_id / ("crop_" + stem.str() + ".png")).string();
                 std::string overlay_path = (output_dir / "overlays" / camera_id / ("overlay_" + stem.str() + ".png")).string();
                 std::string full_path = (output_dir / "overlays_full" / camera_id / (stem.str() + ".jpg")).string();
                 std::string matte_path = (output_dir / "mattes" / camera_id / ("matte_" + stem.str() + ".png")).string(); // <-- NEW
                 
-                cv::imwrite(crop_path, crop_image);
+                cv::imwrite(crop_path, crop_image_to_save);
                 cv::imwrite(overlay_path, crop_overlay);
                 cv::imwrite(full_path, full_overlay);
                 if (!crop_matte.empty()) {
@@ -569,11 +620,11 @@ int main(int argc, char* argv[]) {
                 }
 
                 // 6. Write to JSONL
-                jsonl_out << "{\"frame\":" << frame_index
-                          << ",\"sync_index\":" << frame_index
+                jsonl_out << "{\"frame\":" << current_frame_index
+                          << ",\"sync_index\":" << current_frame_index
                           << ",\"camera_id\":\"" << JsonEscape(camera_id) << "\""
                           << ",\"person_id\":0"
-                          << ",\"video_frame_index\":" << frame_index
+                          << ",\"video_frame_index\":" << current_frame_index
                           << ",\"crop\":\"" << JsonEscape(crop_path) << "\""
                           << ",\"mask\":\"" << JsonEscape(matte_path) << "\"" // <-- NEW: Added mask to JSON metadata
                           << ",\"overlay\":\"" << JsonEscape(overlay_path) << "\""
@@ -602,11 +653,14 @@ int main(int argc, char* argv[]) {
                 }
                 jsonl_out
                            << "}\n";
+                ++exported_frame_count;
             }
         }
-        frame_index++;
     }
 
-    std::cout << "Finished processing " << frame_index << " frames." << std::endl;
+    std::cout << "Finished exporting " << exported_frame_count
+              << " frames from " << selected_frame_count
+              << " selected source frames (read " << frame_index
+              << ", stride " << frame_stride << ")." << std::endl;
     return 0;
 }
