@@ -7,6 +7,7 @@
 struct TrainSample
 {
     int frame = -1;
+    std::string body_model = "smpl";
     std::string crop_path;
     int img_w = 0;
     int img_h = 0;
@@ -22,15 +23,21 @@ struct TrainSample
     std::vector<float> pose;
     std::vector<float> betas;
     std::vector<float> cam;
+    std::vector<float> smplx_expression;
+    std::vector<float> smplx_jaw_pose;
+    std::vector<float> smplx_eye_pose;
+    std::vector<float> smplx_left_hand_pose;
+    std::vector<float> smplx_right_hand_pose;
     std::vector<float> camera_rt;
     std::array<float, 3> translation{0.0f, 0.0f, 0.0f};
     bool has_translation = false;
+    bool uses_smplx = false;
 };
 
 struct TrainOptions
 {
     std::string jsonl_path;
-    std::string smpl_model_path = "smpl_data.pt";
+    std::string smpl_model_path = "smplx_data.pt";
     int num_gaussians = 5000;
     int max_gaussians = -1;
     int epochs = 1;

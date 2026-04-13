@@ -33,6 +33,11 @@ struct TrainingBatch
     torch::Tensor packed_masks;
     torch::Tensor pose_base_batch; // [B, 24, 3]
     torch::Tensor trans_base_batch; // [B, 3]
+    torch::Tensor expression_batch; // [B, E]
+    torch::Tensor jaw_pose_batch; // [B, 3]
+    torch::Tensor eye_pose_batch; // [B, 6]
+    torch::Tensor left_hand_pose_batch; // [B, 45]
+    torch::Tensor right_hand_pose_batch; // [B, 45]
     torch::Tensor time_tensor; // [B, 1]
     torch::Tensor crop_params; // [B, 3]
     torch::Tensor y_signs; // [B]
@@ -158,6 +163,11 @@ public:
                        const std::vector<CachedSampleData> &cached,
                        const torch::Tensor &all_poses,
                        const torch::Tensor &all_trans,
+                       const torch::Tensor &all_expression,
+                       const torch::Tensor &all_jaw_pose,
+                       const torch::Tensor &all_eye_pose,
+                       const torch::Tensor &all_left_hand_pose,
+                       const torch::Tensor &all_right_hand_pose,
                        const torch::Tensor &all_time,
                        const torch::Tensor &all_crops,
                        std::vector<int64_t> ordered_indices,
@@ -169,6 +179,11 @@ public:
           cached_(cached),
           all_poses_(all_poses),
           all_trans_(all_trans),
+          all_expression_(all_expression),
+          all_jaw_pose_(all_jaw_pose),
+          all_eye_pose_(all_eye_pose),
+          all_left_hand_pose_(all_left_hand_pose),
+          all_right_hand_pose_(all_right_hand_pose),
           all_time_(all_time),
           all_crops_(all_crops),
           batch_size_(std::max(1, batch_size)),
@@ -510,6 +525,11 @@ private:
 
         batch.pose_base_batch = all_poses_.index_select(0, idx_tensor).view({-1, 24, 3});
         batch.trans_base_batch = all_trans_.index_select(0, idx_tensor).view({-1, 3});
+        batch.expression_batch = all_expression_.index_select(0, idx_tensor);
+        batch.jaw_pose_batch = all_jaw_pose_.index_select(0, idx_tensor).view({-1, 3});
+        batch.eye_pose_batch = all_eye_pose_.index_select(0, idx_tensor).view({-1, 6});
+        batch.left_hand_pose_batch = all_left_hand_pose_.index_select(0, idx_tensor).view({-1, 45});
+        batch.right_hand_pose_batch = all_right_hand_pose_.index_select(0, idx_tensor).view({-1, 45});
         batch.time_tensor = all_time_.index_select(0, idx_tensor);
         batch.crop_params = all_crops_.index_select(0, idx_tensor).view({-1, 3});
 
@@ -541,6 +561,11 @@ private:
     const std::vector<CachedSampleData> &cached_;
     const torch::Tensor &all_poses_;
     const torch::Tensor &all_trans_;
+    const torch::Tensor &all_expression_;
+    const torch::Tensor &all_jaw_pose_;
+    const torch::Tensor &all_eye_pose_;
+    const torch::Tensor &all_left_hand_pose_;
+    const torch::Tensor &all_right_hand_pose_;
     const torch::Tensor &all_time_;
     const torch::Tensor &all_crops_;
     int batch_size_ = 1;

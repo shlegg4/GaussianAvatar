@@ -146,10 +146,19 @@ bool ParseTrainSample(const std::string &line, TrainSample *out)
     std::vector<float> smplx_shape;
     std::vector<float> smplx_global_orient;
     std::vector<float> smplx_body_pose;
+    std::vector<float> smplx_expression;
+    std::vector<float> smplx_jaw_pose;
+    std::vector<float> smplx_eye_pose;
+    std::vector<float> smplx_left_hand_pose;
+    std::vector<float> smplx_right_hand_pose;
     double value = 0.0;
     if (ExtractNumberField(line, "frame", &value))
     {
         sample.frame = static_cast<int>(value);
+    }
+    if (ExtractStringField(line, "body_model", &sample.body_model) && sample.body_model.empty())
+    {
+        sample.body_model = "smpl";
     }
     if (!ExtractStringField(line, "crop", &sample.crop_path))
         return false;
@@ -189,12 +198,30 @@ bool ParseTrainSample(const std::string &line, TrainSample *out)
     const bool has_smplx_shape = ExtractArrayField(line, "smplx_shape", &smplx_shape) && !smplx_shape.empty();
     const bool has_smplx_global = ExtractArrayField(line, "smplx_global_orient", &smplx_global_orient) && !smplx_global_orient.empty();
     const bool has_smplx_body = ExtractArrayField(line, "smplx_body_pose", &smplx_body_pose) && !smplx_body_pose.empty();
+    ExtractArrayField(line, "smplx_expression", &smplx_expression);
+    ExtractArrayField(line, "smplx_jaw_pose", &smplx_jaw_pose);
+    ExtractArrayField(line, "smplx_eye_pose", &smplx_eye_pose);
+    ExtractArrayField(line, "smplx_left_hand_pose", &smplx_left_hand_pose);
+    ExtractArrayField(line, "smplx_right_hand_pose", &smplx_right_hand_pose);
 
     if (!ExtractArrayField(line, "camera_rt", &sample.camera_rt))
     {
         sample.camera_rt.clear();
     }
     sample.has_translation = TryBuildTranslationFromCameraRt(sample.camera_rt, &sample.translation);
+    sample.uses_smplx = has_smplx_shape || has_smplx_global || has_smplx_body ||
+                        !smplx_expression.empty() || !smplx_jaw_pose.empty() ||
+                        !smplx_eye_pose.empty() || !smplx_left_hand_pose.empty() ||
+                        !smplx_right_hand_pose.empty() || sample.body_model == "smplx";
+    if (sample.uses_smplx)
+    {
+        sample.body_model = "smplx";
+        sample.smplx_expression = std::move(smplx_expression);
+        sample.smplx_jaw_pose = std::move(smplx_jaw_pose);
+        sample.smplx_eye_pose = std::move(smplx_eye_pose);
+        sample.smplx_left_hand_pose = std::move(smplx_left_hand_pose);
+        sample.smplx_right_hand_pose = std::move(smplx_right_hand_pose);
+    }
 
     if (has_smplx_shape)
     {

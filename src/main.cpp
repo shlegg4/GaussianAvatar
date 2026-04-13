@@ -32,7 +32,7 @@
 #include "SharedGaussian.h"
 #include "utils/HmrInferenceUtils.h"
 #include "utils/HmrMathHelpers.h"
-#include "utils/SmplLBS.h"
+#include "utils/SmplxLBS.h"
 #include "utils/image/MaskUtils.h"
 #include "utils/image/TensorCvUtils.h"
 #include "utils/io/PathUtils.h"
@@ -45,6 +45,132 @@
 #include "utils/train/TrainJsonl.h"
 #include "utils/train/TrainTypes.h"
 #include "utils/train/ViewerExport.h"
+
+namespace
+{
+
+constexpr int64_t kSmplPoseParamCount = 72;
+constexpr int64_t kSmplPoseJointCount = 24;
+constexpr int64_t kSmplxExpressionParamCount = 250;
+constexpr int64_t kSmplxJawPoseParamCount = 3;
+constexpr int64_t kSmplxEyePoseParamCount = 6;
+constexpr int64_t kSmplxHandPoseParamCount = 45;
+
+void AppendPaddedVector(const std::vector<float> &source, size_t target_count, std::vector<float> *dest)
+{
+    if (dest == nullptr)
+    {
+        return;
+    }
+    const size_t copy_count = std::min(source.size(), target_count);
+    dest->insert(dest->end(), source.begin(), source.begin() + static_cast<std::ptrdiff_t>(copy_count));
+    dest->insert(dest->end(), target_count - copy_count, 0.0f);
+}
+
+torch::Tensor TensorFromPaddedVector(const std::vector<float> &source,
+                                     int64_t target_count,
+                                     torch::Device device)
+{
+    std::vector<float> padded;
+    padded.reserve(static_cast<size_t>(target_count));
+    AppendPaddedVector(source, static_cast<size_t>(target_count), &padded);
+    return torch::from_blob(padded.data(),
+                            {1, target_count},
+                            torch::TensorOptions().dtype(torch::kFloat32))
+        .clone()
+        .to(device);
+}
+
+bool SamplesUseSmplx(const std::vector<TrainSample> &samples)
+{
+    for (const auto &sample : samples)
+    {
+        if (sample.uses_smplx)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::filesystem::path FindAncestorFile(std::filesystem::path start_dir,
+                                       const std::string &filename,
+                                       int max_levels = 6)
+{
+    if (filename.empty())
+    {
+        return {};
+    }
+
+    if (start_dir.empty())
+    {
+        start_dir = std::filesystem::current_path();
+    }
+
+    std::error_code ec;
+    start_dir = std::filesystem::absolute(start_dir, ec);
+    if (ec)
+    {
+        ec.clear();
+        start_dir = std::filesystem::current_path();
+    }
+
+    for (int level = 0; level <= max_levels; ++level)
+    {
+        const std::filesystem::path candidate = start_dir / filename;
+        if (std::filesystem::exists(candidate, ec))
+        {
+            return candidate;
+        }
+        ec.clear();
+
+        const std::filesystem::path parent = start_dir.parent_path();
+        if (parent.empty() || parent == start_dir)
+        {
+            break;
+        }
+        start_dir = parent;
+    }
+
+    return {};
+}
+
+std::string ResolveAvatarModelPath(const std::string &requested_path)
+{
+    if (requested_path.empty())
+    {
+        return requested_path;
+    }
+
+    std::error_code ec;
+    std::filesystem::path path(requested_path);
+    if (std::filesystem::exists(path, ec))
+    {
+        return std::filesystem::absolute(path, ec).string();
+    }
+    ec.clear();
+
+    if (path.is_relative())
+    {
+        const std::filesystem::path relative_candidate = std::filesystem::current_path() / path;
+        if (std::filesystem::exists(relative_candidate, ec))
+        {
+            return std::filesystem::absolute(relative_candidate, ec).string();
+        }
+        ec.clear();
+    }
+
+    const std::filesystem::path ancestor_candidate =
+        FindAncestorFile(std::filesystem::current_path(), path.filename().string());
+    if (!ancestor_candidate.empty())
+    {
+        return ancestor_candidate.string();
+    }
+
+    return requested_path;
+}
+
+} // namespace
 
 bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
 {
@@ -617,6 +743,11 @@ struct TrainDataGPU
 {
     torch::Tensor all_poses; // (N, 72)
     torch::Tensor all_trans; // (N, 3)
+    torch::Tensor all_expression; // (N, 250)
+    torch::Tensor all_jaw_pose; // (N, 3)
+    torch::Tensor all_eye_pose; // (N, 6)
+    torch::Tensor all_left_hand_pose; // (N, 45)
+    torch::Tensor all_right_hand_pose; // (N, 45)
     torch::Tensor all_time;  // (N, 1)
     torch::Tensor all_crops; // (N, 3) -> [cx, cy, size] normalized
 
@@ -625,10 +756,20 @@ struct TrainDataGPU
         const int64_t N = static_cast<int64_t>(samples.size());
         std::vector<float> flat_poses;
         std::vector<float> flat_trans;
+        std::vector<float> flat_expression;
+        std::vector<float> flat_jaw_pose;
+        std::vector<float> flat_eye_pose;
+        std::vector<float> flat_left_hand_pose;
+        std::vector<float> flat_right_hand_pose;
         std::vector<float> flat_time;
         std::vector<float> flat_crops;
-        flat_poses.reserve(static_cast<size_t>(N) * 72u);
+        flat_poses.reserve(static_cast<size_t>(N) * static_cast<size_t>(kSmplPoseParamCount));
         flat_trans.reserve(static_cast<size_t>(N) * 3u);
+        flat_expression.reserve(static_cast<size_t>(N) * static_cast<size_t>(kSmplxExpressionParamCount));
+        flat_jaw_pose.reserve(static_cast<size_t>(N) * static_cast<size_t>(kSmplxJawPoseParamCount));
+        flat_eye_pose.reserve(static_cast<size_t>(N) * static_cast<size_t>(kSmplxEyePoseParamCount));
+        flat_left_hand_pose.reserve(static_cast<size_t>(N) * static_cast<size_t>(kSmplxHandPoseParamCount));
+        flat_right_hand_pose.reserve(static_cast<size_t>(N) * static_cast<size_t>(kSmplxHandPoseParamCount));
         flat_time.reserve(static_cast<size_t>(N));
         flat_crops.reserve(static_cast<size_t>(N) * 3u);
 
@@ -652,6 +793,12 @@ struct TrainDataGPU
             {
                 throw std::runtime_error("Unsupported pose size: " + std::to_string(s.pose.size()));
             }
+
+            AppendPaddedVector(s.smplx_expression, static_cast<size_t>(kSmplxExpressionParamCount), &flat_expression);
+            AppendPaddedVector(s.smplx_jaw_pose, static_cast<size_t>(kSmplxJawPoseParamCount), &flat_jaw_pose);
+            AppendPaddedVector(s.smplx_eye_pose, static_cast<size_t>(kSmplxEyePoseParamCount), &flat_eye_pose);
+            AppendPaddedVector(s.smplx_left_hand_pose, static_cast<size_t>(kSmplxHandPoseParamCount), &flat_left_hand_pose);
+            AppendPaddedVector(s.smplx_right_hand_pose, static_cast<size_t>(kSmplxHandPoseParamCount), &flat_right_hand_pose);
 
             cv::Vec3f t;
             if (s.has_translation)
@@ -683,8 +830,13 @@ struct TrainDataGPU
         }
 
         auto opts = torch::TensorOptions().dtype(torch::kFloat32);
-        all_poses = torch::from_blob(flat_poses.data(), {N, 72}, opts).clone().to(device);
+        all_poses = torch::from_blob(flat_poses.data(), {N, kSmplPoseParamCount}, opts).clone().to(device);
         all_trans = torch::from_blob(flat_trans.data(), {N, 3}, opts).clone().to(device);
+        all_expression = torch::from_blob(flat_expression.data(), {N, kSmplxExpressionParamCount}, opts).clone().to(device);
+        all_jaw_pose = torch::from_blob(flat_jaw_pose.data(), {N, kSmplxJawPoseParamCount}, opts).clone().to(device);
+        all_eye_pose = torch::from_blob(flat_eye_pose.data(), {N, kSmplxEyePoseParamCount}, opts).clone().to(device);
+        all_left_hand_pose = torch::from_blob(flat_left_hand_pose.data(), {N, kSmplxHandPoseParamCount}, opts).clone().to(device);
+        all_right_hand_pose = torch::from_blob(flat_right_hand_pose.data(), {N, kSmplxHandPoseParamCount}, opts).clone().to(device);
         all_time = torch::from_blob(flat_time.data(), {N, 1}, opts).clone().to(device);
         all_crops = torch::from_blob(flat_crops.data(), {N, 3}, opts).clone().to(device);
     }
@@ -692,21 +844,21 @@ struct TrainDataGPU
 
 struct GaussianAvatar : torch::nn::Module
 {
-    std::shared_ptr<SMPLLayer> smpl;
+    std::shared_ptr<SMPLXLayer> smplx;
     torch::Tensor g_scales, g_rots, g_opacities, g_colors, g_offsets, g_sh;
-    torch::Tensor g_bary_coords, g_face_indices, knn_indices, faces_buffer;
+    torch::Tensor g_bary_coords, g_face_indices, knn_indices, knn_dists, faces_buffer;
     torch::Tensor v_template_cached, faces_cached;
 
     GaussianAvatar(const std::string &model_path)
     {
-        smpl = std::make_shared<SMPLLayer>(model_path);
-        register_module("smpl", smpl);
+        smplx = std::make_shared<SMPLXLayer>(model_path);
+        register_module("smplx", smplx);
     }
 
     void init_gaussians(int num_gaussians, torch::Tensor faces_idx, float render_scale_modifier, int sh_degree)
     {
-        auto device = smpl->v_template.device();
-        v_template_cached = smpl->v_template.clone().detach();
+        auto device = smplx->v_template.device();
+        v_template_cached = smplx->v_template.clone().detach();
         faces_cached = faces_idx.clone().detach();
         faces_buffer = faces_cached.to(device);
         int num_faces = faces_buffer.size(0);
@@ -720,7 +872,7 @@ struct GaussianAvatar : torch::nn::Module
         auto w = 1.0 - r1 - r2;
         g_bary_coords = torch::cat({r1, r2, w}, 1);
 
-        auto verts = smpl->v_template.to(device);
+        auto verts = smplx->v_template.to(device);
         auto face_a = verts.index_select(0, faces_buffer.index({torch::indexing::Slice(), 0}));
         auto face_b = verts.index_select(0, faces_buffer.index({torch::indexing::Slice(), 1}));
         auto face_c = verts.index_select(0, faces_buffer.index({torch::indexing::Slice(), 2}));
@@ -730,18 +882,13 @@ struct GaussianAvatar : torch::nn::Module
         auto face_area = 0.5f * torch::norm(cross, 2, 1);
         auto area_prob = face_area / torch::clamp_min(face_area.sum(), 1e-8f);
 
-        auto uniform_prob = torch::ones_like(face_area);
-        uniform_prob = uniform_prob / uniform_prob.sum();
-
-        auto face_prob = (area_prob * 0.5f) + (uniform_prob * 0.5f);
+        auto face_prob = area_prob;
 
         g_face_indices = torch::multinomial(face_prob, num_gaussians, true);
 
         register_buffer("g_face_indices", g_face_indices);
         register_buffer("g_bary_coords", g_bary_coords);
-        auto face_scale = torch::sqrt(torch::clamp_min(face_area, 1e-12f));
         const float safe_scale_mod = std::max(render_scale_modifier, 1e-6f);
-        const float normal_scale = 0.05f;
 
         auto z_axis = torch::tensor({0.0f, 0.0f, 1.0f}, torch::TensorOptions().device(device));
         auto z_expand = z_axis.unsqueeze(0).expand({num_faces, 3});
@@ -756,25 +903,6 @@ struct GaussianAvatar : torch::nn::Module
         auto qw = torch::cos(half);
         auto qxyz = axis_unit * torch::sin(half).unsqueeze(1);
         auto face_quats = torch::cat({qw.unsqueeze(1), qxyz}, 1);
-
-        // 1. Get the base scale from the face area
-        float density_ratio = static_cast<float>(num_faces) / static_cast<float>(num_gaussians);
-        
-        // Use the square root because scale is a 1D radius, but we are dividing 2D area
-        float density_multiplier = std::sqrt(density_ratio);
-        
-        // 0.6f is a safe base coverage overlap factor. 
-        auto face_scale_sel = face_scale.index_select(0, g_face_indices) * (0.6f * density_multiplier);
-
-        // 2. Enforce a minimum physical radius (e.g., 3mm) so they don't start "dead"
-        float min_init_scale = 0.0005f;
-        face_scale_sel = torch::clamp_min(face_scale_sel, min_init_scale);
-
-        // 3. Convert to log-space for the optimizer
-        auto log_scale_base = torch::log(face_scale_sel / safe_scale_mod);
-
-        // Use the same log scale for X, Y, AND Z
-        g_scales = torch::stack({log_scale_base, log_scale_base, log_scale_base}, 1).clone().set_requires_grad(true);
 
         auto g_rots_init = face_quats.index_select(0, g_face_indices);
         g_rots = g_rots_init.detach().clone().set_requires_grad(true);
@@ -795,6 +923,7 @@ struct GaussianAvatar : torch::nn::Module
         const int64_t K = 64;
         const int64_t num_pts = num_gaussians;
         knn_indices = torch::zeros({num_pts, K}, torch::TensorOptions().dtype(torch::kLong).device(device));
+        knn_dists = torch::zeros({num_pts, K}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
         if (num_pts > 0)
         {
             auto selected_faces = faces_buffer.index_select(0, g_face_indices);
@@ -845,8 +974,15 @@ struct GaussianAvatar : torch::nn::Module
                 }
 
                 knn_indices.index_put_({Slice(q_start, q_end)}, best_indices);
+                knn_dists.index_put_({Slice(q_start, q_end)}, best_dists);
             }
         }
+
+        float min_init_scale = 0.0005f;
+        auto mean_knn_dist = knn_dists.index({Slice(), Slice(0, 3)}).mean(1);
+        auto knn_scale = torch::clamp_min(mean_knn_dist, min_init_scale);
+        auto log_scale_base = torch::log(knn_scale / safe_scale_mod);
+        g_scales = torch::stack({log_scale_base, log_scale_base, log_scale_base}, 1).clone().set_requires_grad(true);
 
         register_parameter("g_scales", g_scales);
         register_parameter("g_rots", g_rots);
@@ -857,13 +993,14 @@ struct GaussianAvatar : torch::nn::Module
         register_buffer("v_template_cached", v_template_cached);
         register_buffer("faces_cached", faces_cached);
         register_buffer("knn_indices", knn_indices);
+        register_buffer("knn_dists", knn_dists);
     }
 
     std::tuple<torch::Tensor, torch::Tensor> get_bone_data()
     {
         auto device = g_bary_coords.device();
          
-        auto v_weights = smpl->weights.to(device); 
+        auto v_weights = smplx->weights.to(device); 
         
         auto selected_faces = faces_buffer.index_select(0, g_face_indices);
         
@@ -895,12 +1032,19 @@ struct GaussianAvatar : torch::nn::Module
     }
 
 
-    std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor betas, torch::Tensor pose, torch::Tensor trans)
+    std::tuple<torch::Tensor, torch::Tensor> forward(torch::Tensor betas,
+                                                     torch::Tensor expression,
+                                                     torch::Tensor pose,
+                                                     torch::Tensor jaw_pose,
+                                                     torch::Tensor eye_pose,
+                                                     torch::Tensor left_hand_pose,
+                                                     torch::Tensor right_hand_pose,
+                                                     torch::Tensor trans)
     {
         using torch::indexing::Slice;
 
-        auto smpl_out = smpl->forward(betas, pose, trans);
-        auto verts_posed = smpl_out.vertices;
+        auto smplx_out = smplx->forward(betas, expression, pose, jaw_pose, eye_pose, left_hand_pose, right_hand_pose, trans);
+        auto verts_posed = smplx_out.vertices;
         const int64_t batch_count = verts_posed.size(0);
         const int64_t gaussian_count = g_face_indices.size(0);
 
@@ -1214,7 +1358,14 @@ public:
         torch::Tensor batch_rots;
 
         {
-            std::tie(batch_means3D, batch_rots) = avatar_.forward(betas_batch, pose_total, zero_trans);
+            std::tie(batch_means3D, batch_rots) = avatar_.forward(betas_batch,
+                                                                  batch.expression_batch,
+                                                                  pose_total,
+                                                                  batch.jaw_pose_batch,
+                                                                  batch.eye_pose_batch,
+                                                                  batch.left_hand_pose_batch,
+                                                                  batch.right_hand_pose_batch,
+                                                                  zero_trans);
         }
 
         if (batch_means3D.dim() == 2)
@@ -1536,7 +1687,7 @@ public:
             sh_reg_loss = higher_orders.pow(2).mean();
         }
 
-        const float sobel_weight = 0.2f;
+        const float sobel_weight = 0.5f;
         auto loss = (1.0f - lambda_dssim_) * final_recon +
                     lambda_dssim_ * final_ssim +
                     sobel_weight * final_sobel +
@@ -1756,7 +1907,7 @@ int run_real_training(int argc, char *argv[])
         return -1;
     }
     const std::string &jsonl_path = options.jsonl_path;
-    const std::string &smpl_model_path = options.smpl_model_path;
+    std::string avatar_model_path = options.smpl_model_path;
     const int num_gaussians = options.num_gaussians;
     const int max_gaussians = options.max_gaussians;
     const int epochs = options.epochs;
@@ -1837,6 +1988,31 @@ int run_real_training(int argc, char *argv[])
         std::cerr << "No training samples found in " << jsonl_path << std::endl;
         return -1;
     }
+    const bool dataset_uses_smplx = SamplesUseSmplx(samples);
+    const std::filesystem::path avatar_model_input_path(avatar_model_path);
+    const std::string avatar_model_name = avatar_model_input_path.filename().string();
+    if (avatar_model_name == "smpl_data.pt" || avatar_model_name == "smplx_libtorch.pt")
+    {
+        const std::filesystem::path replacement = avatar_model_input_path.has_parent_path()
+                                                      ? (avatar_model_input_path.parent_path() / "smplx_data.pt")
+                                                      : std::filesystem::path("smplx_data.pt");
+        avatar_model_path = replacement.string();
+        if (dataset_uses_smplx)
+        {
+            std::cout << "Detected SMPL-X dataset. Using " << avatar_model_path << " for the Gaussian avatar stage." << std::endl;
+        }
+        else
+        {
+            std::cout << "Using " << avatar_model_path << " for the Gaussian avatar stage." << std::endl;
+        }
+    }
+
+    const std::string resolved_avatar_model_path = ResolveAvatarModelPath(avatar_model_path);
+    if (resolved_avatar_model_path != avatar_model_path)
+    {
+        std::cout << "Resolved avatar model path to " << resolved_avatar_model_path << std::endl;
+        avatar_model_path = resolved_avatar_model_path;
+    }
 
     torch::Device device(torch::kCUDA);
     const int ssim_window_size = 11;
@@ -1892,14 +2068,9 @@ int run_real_training(int argc, char *argv[])
 
     TrainDataGPU gpu_data(samples, device);
 
-    GaussianAvatar avatar(smpl_model_path);
+    GaussianAvatar avatar(avatar_model_path);
     avatar.to(device);
-
-    std::ifstream smpl_in(smpl_model_path, std::ios::binary);
-    std::vector<char> f_bytes((std::istreambuf_iterator<char>(smpl_in)), (std::istreambuf_iterator<char>()));
-    auto dict = torch::pickle_load(f_bytes).toGenericDict();
-    torch::Tensor faces = dict.at("faces").toTensor().to(torch::kLong).to(device);
-    avatar.init_gaussians(num_gaussians, faces, render_scale_modifier, options.sh_degree);
+    avatar.init_gaussians(num_gaussians, avatar.smplx->faces.to(device), render_scale_modifier, options.sh_degree);
     PoseRefiner pose_refiner;
     pose_refiner.to(device);
     const auto avg_betas = ComputeAverageBetas(samples);
@@ -1917,8 +2088,13 @@ int run_real_training(int argc, char *argv[])
         std::cerr << "Failed to initialize canonical betas." << std::endl;
         return -1;
     }
-    auto canonical_pose = torch::zeros({1, 24, 3}, canonical_betas.options());
+    auto canonical_pose = torch::zeros({1, kSmplPoseJointCount, 3}, canonical_betas.options());
     auto canonical_trans = torch::zeros({1, 3}, canonical_betas.options());
+    auto canonical_expression = torch::zeros({1, kSmplxExpressionParamCount}, canonical_betas.options());
+    auto canonical_jaw_pose = torch::zeros({1, kSmplxJawPoseParamCount}, canonical_betas.options());
+    auto canonical_eye_pose = torch::zeros({1, kSmplxEyePoseParamCount}, canonical_betas.options());
+    auto canonical_left_hand_pose = torch::zeros({1, kSmplxHandPoseParamCount}, canonical_betas.options());
+    auto canonical_right_hand_pose = torch::zeros({1, kSmplxHandPoseParamCount}, canonical_betas.options());
 
     const bool use_sh = sh_degree > 0;
     auto sh = use_sh ? avatar.g_sh : torch::zeros({0}, torch::TensorOptions().device(device));
@@ -2101,6 +2277,11 @@ int run_real_training(int argc, char *argv[])
                               cached,
                               gpu_data.all_poses,
                               gpu_data.all_trans,
+                              gpu_data.all_expression,
+                              gpu_data.all_jaw_pose,
+                              gpu_data.all_eye_pose,
+                              gpu_data.all_left_hand_pose,
+                              gpu_data.all_right_hand_pose,
                               gpu_data.all_time,
                               gpu_data.all_crops,
                               std::vector<int64_t>{},
@@ -2383,7 +2564,14 @@ int run_real_training(int argc, char *argv[])
             torch::Tensor sh_to_send = sh;
 
             // 1. Always calculate canonical geometry for saving/viewing
-            std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
+            std::tie(positions, rotations) = avatar.forward(canonical_betas,
+                                                            canonical_expression,
+                                                            canonical_pose,
+                                                            canonical_jaw_pose,
+                                                            canonical_eye_pose,
+                                                            canonical_left_hand_pose,
+                                                            canonical_right_hand_pose,
+                                                            canonical_trans);
 
             if (use_sh)
             {
@@ -2619,7 +2807,14 @@ int run_real_training(int argc, char *argv[])
                 torch::Tensor means3D;
                 torch::Tensor current_rots;
                 std::tie(means3D, current_rots) =
-                    avatar.forward(canonical_betas, pose, torch::zeros({1, 3}, canonical_betas.options()));
+                    avatar.forward(canonical_betas,
+                                   TensorFromPaddedVector(sample.smplx_expression, kSmplxExpressionParamCount, device),
+                                   pose,
+                                   TensorFromPaddedVector(sample.smplx_jaw_pose, kSmplxJawPoseParamCount, device),
+                                   TensorFromPaddedVector(sample.smplx_eye_pose, kSmplxEyePoseParamCount, device),
+                                   TensorFromPaddedVector(sample.smplx_left_hand_pose, kSmplxHandPoseParamCount, device),
+                                   TensorFromPaddedVector(sample.smplx_right_hand_pose, kSmplxHandPoseParamCount, device),
+                                   torch::zeros({1, 3}, canonical_betas.options()));
                 torch::Tensor current_sh = use_sh ? avatar.g_sh : torch::zeros({0}, avatar.g_colors.options());
                 if (use_sh && sh_degree > 0)
                 {
@@ -2693,7 +2888,14 @@ int run_real_training(int argc, char *argv[])
     {
         torch::NoGradGuard no_grad;
         torch::Tensor positions, rotations, scales, colors;
-        std::tie(positions, rotations) = avatar.forward(canonical_betas, canonical_pose, canonical_trans);
+        std::tie(positions, rotations) = avatar.forward(canonical_betas,
+                                                        canonical_expression,
+                                                        canonical_pose,
+                                                        canonical_jaw_pose,
+                                                        canonical_eye_pose,
+                                                        canonical_left_hand_pose,
+                                                        canonical_right_hand_pose,
+                                                        canonical_trans);
         scales = capped_scales(avatar.g_scales);
         if (use_sh)
         {
@@ -2767,10 +2969,11 @@ int run_real_training(int argc, char *argv[])
         else if (options.mesh_method == "uv")
         {
             std::filesystem::path smpl_uv_obj_path =
-                std::filesystem::path(smpl_model_path).parent_path() / "smpl_uv.obj";
+                std::filesystem::path(avatar_model_path).parent_path() /
+                (dataset_uses_smplx ? "smplx_uv.obj" : "smpl_uv.obj");
             if (!std::filesystem::exists(smpl_uv_obj_path))
             {
-                smpl_uv_obj_path = "smpl_uv.obj";
+                smpl_uv_obj_path = dataset_uses_smplx ? "smplx_uv.obj" : "smpl_uv.obj";
             }
 
             torch::Tensor smpl_face_uvs = LoadSmplUVsFromOBJ(smpl_uv_obj_path.string());
