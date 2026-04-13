@@ -10,4 +10,8 @@ data/
 *.html
 *.js
 *.jpg
-*third_party
+*third_partypear_ehm.data
+smplx_neutral.pt
+smplx_data.pt
+smplx_libtorch.pt
+smpl_data.pt
