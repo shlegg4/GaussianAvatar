@@ -653,9 +653,17 @@ struct TrainDataGPU
                 throw std::runtime_error("Unsupported pose size: " + std::to_string(s.pose.size()));
             }
 
-            cv::Vec3f t = EstimateTranslation(s.cam, s.crop_cx, s.crop_cy,
-                                              s.crop_size, s.focal_length,
-                                              static_cast<float>(s.img_w), static_cast<float>(s.img_h));
+            cv::Vec3f t;
+            if (s.has_translation)
+            {
+                t = cv::Vec3f(s.translation[0], s.translation[1], s.translation[2]);
+            }
+            else
+            {
+                t = EstimateTranslation(s.cam, s.crop_cx, s.crop_cy,
+                                        s.crop_size, s.focal_length,
+                                        static_cast<float>(s.img_w), static_cast<float>(s.img_h));
+            }
             flat_trans.push_back(t[0]);
             flat_trans.push_back(t[1]);
             flat_trans.push_back(t[2]);
@@ -2503,10 +2511,18 @@ int run_real_training(int argc, char *argv[])
                 res.camera = sample.cam;
 
                 auto pose_base = PoseToAxisAngle(res).to(device);
-                cv::Vec3f trans_cv = EstimateTranslation(res.camera, sample.crop_cx, sample.crop_cy,
-                                                         sample.crop_size, sample.focal_length,
-                                                         static_cast<float>(sample.img_w),
-                                                         static_cast<float>(sample.img_h));
+                cv::Vec3f trans_cv;
+                if (sample.has_translation)
+                {
+                    trans_cv = cv::Vec3f(sample.translation[0], sample.translation[1], sample.translation[2]);
+                }
+                else
+                {
+                    trans_cv = EstimateTranslation(res.camera, sample.crop_cx, sample.crop_cy,
+                                                   sample.crop_size, sample.focal_length,
+                                                   static_cast<float>(sample.img_w),
+                                                   static_cast<float>(sample.img_h));
+                }
                 auto trans_base = torch::tensor({trans_cv[0], trans_cv[1], trans_cv[2]},
                                                 torch::TensorOptions().device(device).dtype(torch::kFloat))
                                       .unsqueeze(0);

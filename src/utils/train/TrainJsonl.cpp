@@ -1,7 +1,79 @@
 #include "utils/train/TrainJsonl.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
 #include <utility>
+
+namespace
+{
+
+cv::Matx33f ProjectionSignFlip()
+{
+    return cv::Matx33f(-1.0f, 0.0f, 0.0f,
+                       0.0f, -1.0f, 0.0f,
+                       0.0f, 0.0f, 1.0f);
+}
+
+cv::Matx33f ExtractCameraRotation(const std::vector<float> &camera_rt)
+{
+    if (camera_rt.size() >= 16u)
+    {
+        return cv::Matx33f(camera_rt[0], camera_rt[1], camera_rt[2],
+                           camera_rt[4], camera_rt[5], camera_rt[6],
+                           camera_rt[8], camera_rt[9], camera_rt[10]);
+    }
+    return cv::Matx33f::eye();
+}
+
+void ApplyExtraRootRotation(const cv::Matx33f &extra_rotation, std::vector<float> *pose_axis_angle)
+{
+    if (pose_axis_angle == nullptr || pose_axis_angle->size() < 3u)
+    {
+        return;
+    }
+
+    cv::Vec3f root_aa((*pose_axis_angle)[0], (*pose_axis_angle)[1], (*pose_axis_angle)[2]);
+    cv::Matx33f root_rot;
+    cv::Rodrigues(root_aa, root_rot);
+
+    const cv::Matx33f rotated_root = extra_rotation * root_rot;
+    cv::Vec3f rotated_root_aa;
+    cv::Rodrigues(cv::Mat(rotated_root), rotated_root_aa);
+
+    (*pose_axis_angle)[0] = rotated_root_aa[0];
+    (*pose_axis_angle)[1] = rotated_root_aa[1];
+    (*pose_axis_angle)[2] = rotated_root_aa[2];
+}
+
+std::vector<float> BuildLegacyPoseFromSmplx(const std::vector<float> &global_orient,
+                                            const std::vector<float> &body_pose)
+{
+    std::vector<float> pose(72u, 0.0f);
+    const size_t global_count = std::min<size_t>(3u, global_orient.size());
+    std::copy_n(global_orient.begin(), global_count, pose.begin());
+
+    const size_t body_count = std::min<size_t>(63u, body_pose.size());
+    std::copy_n(body_pose.begin(), body_count, pose.begin() + 3);
+    return pose;
+}
+
+bool TryBuildTranslationFromCameraRt(const std::vector<float> &camera_rt,
+                                     std::array<float, 3> *translation)
+{
+    if (translation == nullptr || camera_rt.size() < 16u)
+    {
+        return false;
+    }
+
+    (*translation)[0] = -camera_rt[3];
+    (*translation)[1] = -camera_rt[7];
+    (*translation)[2] = camera_rt[11];
+    return true;
+}
+
+} // namespace
 
 bool ExtractStringField(const std::string &line, const std::string &key, std::string *out)
 {
@@ -71,6 +143,9 @@ bool ExtractArrayField(const std::string &line, const std::string &key, std::vec
 bool ParseTrainSample(const std::string &line, TrainSample *out)
 {
     TrainSample sample;
+    std::vector<float> smplx_shape;
+    std::vector<float> smplx_global_orient;
+    std::vector<float> smplx_body_pose;
     double value = 0.0;
     if (ExtractNumberField(line, "frame", &value))
     {
@@ -111,14 +186,45 @@ bool ParseTrainSample(const std::string &line, TrainSample *out)
         return false;
     sample.y_sign = static_cast<float>(value);
 
-    if (!ExtractArrayField(line, "pose", &sample.pose))
-        return false;
-    if (!ExtractArrayField(line, "betas", &sample.betas))
-        return false;
-    if (!ExtractArrayField(line, "cam", &sample.cam))
-        return false;
+    const bool has_smplx_shape = ExtractArrayField(line, "smplx_shape", &smplx_shape) && !smplx_shape.empty();
+    const bool has_smplx_global = ExtractArrayField(line, "smplx_global_orient", &smplx_global_orient) && !smplx_global_orient.empty();
+    const bool has_smplx_body = ExtractArrayField(line, "smplx_body_pose", &smplx_body_pose) && !smplx_body_pose.empty();
 
-    if (sample.pose.empty() || sample.betas.empty() || sample.cam.empty())
+    if (!ExtractArrayField(line, "camera_rt", &sample.camera_rt))
+    {
+        sample.camera_rt.clear();
+    }
+    sample.has_translation = TryBuildTranslationFromCameraRt(sample.camera_rt, &sample.translation);
+
+    if (has_smplx_shape)
+    {
+        sample.betas = smplx_shape;
+    }
+    else if (!ExtractArrayField(line, "betas", &sample.betas))
+    {
+        return false;
+    }
+
+    if (has_smplx_global && has_smplx_body)
+    {
+        sample.pose = BuildLegacyPoseFromSmplx(smplx_global_orient, smplx_body_pose);
+        if (sample.camera_rt.size() >= 16u)
+        {
+            const cv::Matx33f train_rotation = ProjectionSignFlip() * ExtractCameraRotation(sample.camera_rt);
+            ApplyExtraRootRotation(train_rotation, &sample.pose);
+        }
+    }
+    else if (!ExtractArrayField(line, "pose", &sample.pose))
+    {
+        return false;
+    }
+
+    if (!ExtractArrayField(line, "cam", &sample.cam))
+    {
+        sample.cam.clear();
+    }
+
+    if (sample.pose.empty() || sample.betas.empty() || (!sample.has_translation && sample.cam.empty()))
         return false;
     *out = std::move(sample);
     return true;

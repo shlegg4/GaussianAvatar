@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,9 @@ struct TrainSample
     std::vector<float> pose;
     std::vector<float> betas;
     std::vector<float> cam;
+    std::vector<float> camera_rt;
+    std::array<float, 3> translation{0.0f, 0.0f, 0.0f};
+    bool has_translation = false;
 };
 
 struct TrainOptions
