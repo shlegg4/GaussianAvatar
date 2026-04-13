@@ -564,10 +564,11 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Warning: Failed to extract matte on frame " << current_frame_index << "\n";
             }
             cv::Mat crop_image_to_save = ApplyCropMatte(crop_image, crop_matte);
+            cv::Mat pear_input_image = ApplyCropMatte(pear_crop_image, crop_matte);
 
             // 2. Run PEAR
             SmplxResult pear_result;
-            if (pear.Estimate(pear_crop_image, &pear_result)) { 
+            if (pear.Estimate(pear_input_image, &pear_result)) {
                 // 3. Coordinate Math
                 const cv::Matx33f camera_rotation = ExtractPearCameraRotation(pear_result);
                 const cv::Vec3f camera_translation = ExtractPearCameraTranslation(pear_result);

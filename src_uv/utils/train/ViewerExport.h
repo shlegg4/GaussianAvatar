@@ -1,0 +1,74 @@
+#pragma once
+
+#include <filesystem>
+#include <string>
+
+#include <torch/torch.h>
+
+bool SaveViewerData(const std::filesystem::path &output_dir, int epoch,
+                    const torch::Tensor &positions,
+                    const torch::Tensor &colors,
+                    const torch::Tensor &opacities,
+                    const torch::Tensor &scales,
+                    const torch::Tensor &rotations,
+                    const torch::Tensor &sh,
+                    int sh_degree,
+                    const torch::Tensor &bone_indices,
+                    const torch::Tensor &bone_weights);
+
+bool SaveViewerDataOverwrite(const std::filesystem::path &output_dir,
+                             const torch::Tensor &positions,
+                             const torch::Tensor &colors,
+                             const torch::Tensor &opacities,
+                             const torch::Tensor &scales,
+                             const torch::Tensor &rotations,
+                             const torch::Tensor &sh,
+                             int sh_degree, 
+                             const torch::Tensor &bone_indices,
+                             const torch::Tensor &bone_weights);
+
+bool ExportOrientedPointCloudPly(const std::filesystem::path &path,
+                                 const torch::Tensor &positions,
+                                 const torch::Tensor &rotations,
+                                 const torch::Tensor &scales,
+                                 const torch::Tensor &opacities,
+                                 const torch::Tensor &colors,
+                                 float opacity_threshold,
+                                 int samples_per_gaussian);
+
+bool ExtractMeshTSDF_Open3D(const std::filesystem::path &output_path,
+                            const torch::Tensor &means3D,
+                            const torch::Tensor &colors_or_sh,
+                            const torch::Tensor &opacities,
+                            const torch::Tensor &scales,
+                            const torch::Tensor &rotations,
+                            int sh_degree,
+                            int H = 1024,
+                            int W = 1024,
+                            bool save_debug_frames = true);
+
+bool ExtractMeshPoisson_Open3D(const std::filesystem::path &output_path,
+                               const torch::Tensor &positions,
+                               const torch::Tensor &colors_or_sh,
+                               const torch::Tensor &opacities,
+                               const torch::Tensor &scales, // <-- NEW
+                               const torch::Tensor &rotations,
+                               int sh_degree,
+                               float opacity_threshold = 0.5f,
+                               int samples_per_gaussian = 20, // <-- NEW
+                               int depth = 11);
+
+torch::Tensor LoadSmplUVsFromOBJ(const std::string &obj_path);
+
+bool ExtractSMPLTextureMap(const std::filesystem::path &output_path,
+                           const torch::Tensor &colors,
+                           const torch::Tensor &opacities,
+                            const torch::Tensor &scales,
+                            const torch::Tensor &rotations,
+                            const torch::Tensor &offsets, 
+                           const torch::Tensor &face_indices,
+                           const torch::Tensor &bary_coords,
+                           const torch::Tensor &smpl_face_uvs,
+                           const torch::Tensor &v_template,
+                           const torch::Tensor &mesh_faces,
+                           int resolution = 4096);

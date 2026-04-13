@@ -19,9 +19,9 @@
             "command": "cmake",
             "args": [
                 "-S",
-                "${workspaceFolder}/src",
+                "${workspaceFolder}/src_uv",
                 "-B",
-                "${workspaceFolder}/src/build",
+                "${workspaceFolder}/src_uv/build",
                 "-G",
                 "Ninja",
                 "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
@@ -46,7 +46,7 @@
             "command": "cmake",
             "args": [
                 "--build",
-                "${workspaceFolder}/src/build"
+                "${workspaceFolder}/src_uv/build"
             ],
             "group": {
                 "kind": "build",

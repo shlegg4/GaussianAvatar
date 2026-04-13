@@ -7,3 +7,7 @@ data/
 *.onnx.data
 *.engine
 *.png
+*.html
+*.js
+*.jpg
+*third_party
