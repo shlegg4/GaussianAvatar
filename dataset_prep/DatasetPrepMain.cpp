@@ -18,7 +18,8 @@
 #include "dataset_prep/processing/BackgroundExtractor.h" 
 #include "utils/YoloPersonDetector.h"
 #if DATASET_PREP_HAS_SMPL
-#include "utils/SmplLBS.h"
+#include <torch/torch.h>
+#include <torch/script.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -30,6 +31,33 @@ namespace {
 
 constexpr int kPearInputRes = 256;
 constexpr float kPearCameraFocal = 24.0f;
+constexpr int64_t kSmplxShapeParamCount = 10;
+constexpr int64_t kSmplxExpressionParamCount = 240;
+constexpr int64_t kSmplxGlobalOrientParamCount = 3;
+constexpr int64_t kSmplxBodyPoseParamCount = 63;
+constexpr int64_t kSmplxJawPoseParamCount = 3;
+constexpr int64_t kSmplxEyePoseParamCount = 6;
+constexpr int64_t kSmplxHandPoseParamCount = 45;
+
+std::vector<float> PadFloatVector(const std::vector<float>& values, size_t expected_count) {
+    std::vector<float> padded(expected_count, 0.0f);
+    const size_t copy_count = std::min(values.size(), expected_count);
+    std::copy_n(values.begin(), copy_count, padded.begin());
+    return padded;
+}
+
+#if DATASET_PREP_HAS_SMPL
+torch::Tensor MakeTorchInputTensor(const std::vector<float>& values,
+                                   int64_t expected_count,
+                                   const torch::Device& device) {
+    std::vector<float> padded = PadFloatVector(values, static_cast<size_t>(expected_count));
+    auto tensor = torch::from_blob(
+        padded.data(),
+        {1, expected_count},
+        torch::TensorOptions().dtype(torch::kFloat32));
+    return tensor.clone().to(device);
+}
+#endif
 
 bool SanitizeBBox(const cv::Rect2f& bbox, int img_width, int img_height, cv::Rect2f* out_bbox) {
     if (out_bbox == nullptr) {
@@ -447,11 +475,16 @@ int main(int argc, char* argv[]) {
     }
 
 #if DATASET_PREP_HAS_SMPL
-    std::unique_ptr<SMPLLayer> smpl_layer = std::make_unique<SMPLLayer>("C:\\Users\\Sam\\Documents\\GaussianAvatar\\smpl_data.pt");
-    if (torch::cuda::is_available()) {
-        smpl_layer->to(torch::kCUDA);
+    torch::jit::script::Module smplx_layer;
+    try {
+        smplx_layer = torch::jit::load("C:\\Users\\Sam\\Documents\\GaussianAvatar\\smplx_libtorch.pt");
+    } catch (const c10::Error& error) {
+        std::cerr << "Failed to load SMPL-X TorchScript module.\n"
+                  << error.what() << std::endl;
+        return 1;
     }
-    smpl_layer->eval();
+    smplx_layer.to(torch::kCPU);
+    smplx_layer.eval();
 #endif
 
     // Process Video
@@ -534,8 +567,7 @@ int main(int argc, char* argv[]) {
 
             // 2. Run PEAR
             SmplxResult pear_result;
-            if (pear.Estimate(pear_crop_image, &pear_result)) {
-                 
+            if (pear.Estimate(pear_crop_image, &pear_result)) { 
                 // 3. Coordinate Math
                 const cv::Matx33f camera_rotation = ExtractPearCameraRotation(pear_result);
                 const cv::Vec3f camera_translation = ExtractPearCameraTranslation(pear_result);
@@ -546,6 +578,20 @@ int main(int argc, char* argv[]) {
                 ApplyExtraRootRotation(train_rotation, &train_pose_local);
                 const std::array<float, 3> train_camera = BuildTrainingCameraParams(
                     train_translation, training_crop, frame.cols, frame.rows);
+                const std::vector<float> smplx_global_orient =
+                    PadFloatVector(pear_result.global_orient, static_cast<size_t>(kSmplxGlobalOrientParamCount));
+                const std::vector<float> smplx_body_pose =
+                    PadFloatVector(pear_result.body_pose, static_cast<size_t>(kSmplxBodyPoseParamCount));
+                const std::vector<float> smplx_jaw_pose =
+                    PadFloatVector(pear_result.jaw_pose, static_cast<size_t>(kSmplxJawPoseParamCount));
+                const std::vector<float> smplx_eye_pose(
+                    static_cast<size_t>(kSmplxEyePoseParamCount), 0.0f);
+                const std::vector<float> smplx_left_hand_pose =
+                    PadFloatVector(pear_result.left_hand_pose, static_cast<size_t>(kSmplxHandPoseParamCount));
+                const std::vector<float> smplx_right_hand_pose =
+                    PadFloatVector(pear_result.right_hand_pose, static_cast<size_t>(kSmplxHandPoseParamCount));
+                const std::vector<float> smplx_expression =
+                    PadFloatVector(pear_result.expression, static_cast<size_t>(kSmplxExpressionParamCount));
 
                 // 4. Render Overlay
                 cv::Mat crop_overlay = crop_image.clone();
@@ -554,17 +600,64 @@ int main(int argc, char* argv[]) {
                  
 #if DATASET_PREP_HAS_SMPL
                 torch::NoGradGuard no_grad;
-                
-                // Move input tensors to CUDA
-                auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
-                auto pose_tensor = torch::from_blob(render_pose_local.data(), {1, 24, 3}, torch::kFloat32).to(device).clone();
-                auto betas_tensor = torch::from_blob(pear_result.betas.data(), {1, 10}, torch::kFloat32).to(device).clone();
-                auto trans_zeros = torch::zeros({1, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 
-                const auto smpl_out = smpl_layer->forward(betas_tensor, pose_tensor, trans_zeros);
-                
-                // Move the result back to CPU for OpenCV rendering
-                auto verts_tensor = smpl_out.vertices.squeeze(0).to(torch::kCPU).contiguous();
+                // The exported SMPL-X TorchScript wrapper was traced on CPU tensors.
+                // Keep dataset_prep inference on CPU here to avoid device-mismatch issues.
+                const torch::Device smplx_device(torch::kCPU);
+
+                if (!pear_result.betas.empty()) {
+                    std::cout << "PEAR betas: [";
+                    for (size_t beta_index = 0; beta_index < pear_result.betas.size(); ++beta_index) {
+                        if (beta_index > 0u) {
+                            std::cout << ", ";
+                        }
+                        std::cout << pear_result.betas[beta_index];
+                    }
+                    std::cout << "]\n";
+                }
+
+                std::vector<torch::jit::IValue> smplx_inputs;
+                smplx_inputs.emplace_back(MakeTorchInputTensor(pear_result.betas,
+                                                               kSmplxShapeParamCount,
+                                                               smplx_device));
+                smplx_inputs.emplace_back(MakeTorchInputTensor(smplx_expression,
+                                                               kSmplxExpressionParamCount,
+                                                               smplx_device));
+                smplx_inputs.emplace_back(MakeTorchInputTensor(smplx_global_orient,
+                                                               kSmplxGlobalOrientParamCount,
+                                                               smplx_device));
+                smplx_inputs.emplace_back(MakeTorchInputTensor(smplx_body_pose,
+                                                               kSmplxBodyPoseParamCount,
+                                                               smplx_device));
+                smplx_inputs.emplace_back(MakeTorchInputTensor(smplx_jaw_pose,
+                                                               kSmplxJawPoseParamCount,
+                                                               smplx_device));
+                smplx_inputs.emplace_back(MakeTorchInputTensor(smplx_eye_pose,
+                                                               kSmplxEyePoseParamCount,
+                                                               smplx_device));
+                smplx_inputs.emplace_back(MakeTorchInputTensor(smplx_left_hand_pose,
+                                                               kSmplxHandPoseParamCount,
+                                                               smplx_device));
+                smplx_inputs.emplace_back(MakeTorchInputTensor(smplx_right_hand_pose,
+                                                               kSmplxHandPoseParamCount,
+                                                               smplx_device));
+
+                const auto smplx_out = smplx_layer.forward(smplx_inputs).toTuple();
+                if (!smplx_out || smplx_out->elements().size() < 3u) {
+                    std::cerr << "Warning: SMPL-X forward returned an unexpected output tuple on frame "
+                              << current_frame_index << "\n";
+                    continue;
+                }
+
+                auto verts_tensor = smplx_out->elements()[0].toTensor().squeeze(0).to(torch::kCPU).contiguous();
+                auto joints_tensor = smplx_out->elements()[2].toTensor().squeeze(0).to(torch::kCPU).contiguous();
+                auto joints_acc = joints_tensor.accessor<float, 2>();
+                if (joints_acc.size(0) > 0) {
+                    std::cout << "SMPL-X pelvis root joint 3D before verts_acc: ("
+                              << joints_acc[0][0] << ", "
+                              << joints_acc[0][1] << ", "
+                              << joints_acc[0][2] << ")\n";
+                }
                 auto verts_acc = verts_tensor.accessor<float, 2>();
 
                 std::vector<cv::Point> projected_vertices(
@@ -590,17 +683,17 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                cv::Mat warped_overlay = cv::Mat::zeros(full_overlay.size(), full_overlay.type());
-                cv::warpAffine(crop_mesh_overlay,
-                               warped_overlay,
-                               cv::Mat(crop_inv_trans),
-                               full_overlay.size(),
-                               cv::INTER_LINEAR,
-                               cv::BORDER_CONSTANT,
-                               cv::Scalar(0, 0, 0));
-                cv::Mat mask;
-                cv::cvtColor(warped_overlay, mask, cv::COLOR_BGR2GRAY);
-                warped_overlay.copyTo(full_overlay, mask);
+                // cv::Mat warped_overlay = cv::Mat::zeros(full_overlay.size(), full_overlay.type());
+                // cv::warpAffine(crop_mesh_overlay,
+                //                warped_overlay,
+                //                cv::Mat(crop_inv_trans),
+                //                full_overlay.size(),
+                //                cv::INTER_LINEAR,
+                //                cv::BORDER_CONSTANT,
+                //                cv::Scalar(0, 0, 0));
+                // cv::Mat mask;
+                // cv::cvtColor(warped_overlay, mask, cv::COLOR_BGR2GRAY);
+                // warped_overlay.copyTo(full_overlay, mask);
 #endif
 
                 // 5. Save Artifacts
@@ -647,6 +740,23 @@ int main(int argc, char* argv[]) {
                           << train_camera[0] << ", "
                           << train_camera[1] << ", "
                           << train_camera[2] << "]";
+                jsonl_out << ",\"body_model\":\"smplx\"";
+                jsonl_out << ",\"smplx_shape\":";
+                WriteFloatArray(jsonl_out, pear_result.betas, static_cast<size_t>(kSmplxShapeParamCount));
+                jsonl_out << ",\"smplx_expression\":";
+                WriteFloatArray(jsonl_out, smplx_expression, static_cast<size_t>(kSmplxExpressionParamCount));
+                jsonl_out << ",\"smplx_global_orient\":";
+                WriteFloatArray(jsonl_out, smplx_global_orient, static_cast<size_t>(kSmplxGlobalOrientParamCount));
+                jsonl_out << ",\"smplx_body_pose\":";
+                WriteFloatArray(jsonl_out, smplx_body_pose, static_cast<size_t>(kSmplxBodyPoseParamCount));
+                jsonl_out << ",\"smplx_jaw_pose\":";
+                WriteFloatArray(jsonl_out, smplx_jaw_pose, static_cast<size_t>(kSmplxJawPoseParamCount));
+                jsonl_out << ",\"smplx_eye_pose\":";
+                WriteFloatArray(jsonl_out, smplx_eye_pose, static_cast<size_t>(kSmplxEyePoseParamCount));
+                jsonl_out << ",\"smplx_left_hand_pose\":";
+                WriteFloatArray(jsonl_out, smplx_left_hand_pose, static_cast<size_t>(kSmplxHandPoseParamCount));
+                jsonl_out << ",\"smplx_right_hand_pose\":";
+                WriteFloatArray(jsonl_out, smplx_right_hand_pose, static_cast<size_t>(kSmplxHandPoseParamCount));
                 if (!pear_result.camera_rt.empty()) {
                     jsonl_out << ",\"camera_rt\":";
                     WriteFloatArray(jsonl_out, pear_result.camera_rt, 16u);

@@ -2666,7 +2666,7 @@ int run_real_training(int argc, char *argv[])
                 return render_result;
             };
 
-            if ((epoch + 1) % 10 == 0 || epoch == (epochs - 1))
+            if ((epoch + 1) % 10 == 0 || epoch == (epochs - 1) || epoch == 0)
             {
                 const int saved_pairs = SaveEpochViewPairs(samples, cached, out_dir_path, epoch, render_view);
                 std::cout << "Epoch " << epoch << " saved " << saved_pairs << " view pairs." << std::endl;
