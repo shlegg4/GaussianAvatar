@@ -139,6 +139,21 @@ target_include_directories(dataset_prep
 target_link_libraries(dataset_prep PRIVATE ${OpenCV_LIBS})
 target_compile_definitions(dataset_prep PRIVATE NOMINMAX)
 
+add_executable(dataset_novel_view_render
+    NovelViewRenderMain.cpp
+    ../src/utils/train/TrainJsonl.cpp
+)
+
+target_include_directories(dataset_novel_view_render
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+
+target_link_libraries(dataset_novel_view_render PRIVATE ${OpenCV_LIBS})
+target_compile_definitions(dataset_novel_view_render PRIVATE NOMINMAX)
+
 if(MSVC)
     target_compile_definitions(dataset_prep PRIVATE CV_IGNORE_DEBUG_BUILD_GUARD=1)
 
@@ -211,6 +226,9 @@ if(DATASET_PREP_ENABLE_SMPL)
     target_link_libraries(dataset_prep PRIVATE "${TORCH_LIBRARIES}")
     target_compile_definitions(dataset_prep PRIVATE DATASET_PREP_HAS_SMPL=1)
 
+    target_link_libraries(dataset_novel_view_render PRIVATE "${TORCH_LIBRARIES}")
+    target_compile_definitions(dataset_novel_view_render PRIVATE DATASET_PREP_HAS_SMPL=1)
+
     if(MSVC)
         file(GLOB TORCH_DLLS "${TORCH_INSTALL_PREFIX}/lib/*.dll")
         if(TORCH_DLLS)
@@ -232,9 +250,12 @@ if(DATASET_PREP_ENABLE_SMPL)
     endif()
 else()
     target_compile_definitions(dataset_prep PRIVATE DATASET_PREP_HAS_SMPL=0)
+    target_compile_definitions(dataset_novel_view_render PRIVATE DATASET_PREP_HAS_SMPL=0)
 endif()
 
 target_link_libraries(dataset_prep PRIVATE onnxruntime::onnxruntime)
+target_link_libraries(dataset_novel_view_render PRIVATE onnxruntime::onnxruntime)
 
 
 set_property(TARGET dataset_prep PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+set_property(TARGET dataset_novel_view_render PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")

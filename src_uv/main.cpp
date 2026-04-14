@@ -2494,6 +2494,17 @@ int run_real_training(int argc, char *argv[])
 
                 auto pose = pose_base + pose_delta;
                 auto trans = (trans_base + trans_delta).squeeze(0);
+                auto effective_expression =
+                    TensorFromPaddedVector(sample.smplx_expression, kSmplxExpressionParamCount, device) +
+                    canonical_expression;
+                auto effective_jaw_pose =
+                    TensorFromPaddedVector(sample.smplx_jaw_pose, kSmplxJawPoseParamCount, device);
+                auto effective_eye_pose =
+                    TensorFromPaddedVector(sample.smplx_eye_pose, kSmplxEyePoseParamCount, device);
+                auto effective_left_hand_pose =
+                    TensorFromPaddedVector(sample.smplx_left_hand_pose, kSmplxHandPoseParamCount, device);
+                auto effective_right_hand_pose =
+                    TensorFromPaddedVector(sample.smplx_right_hand_pose, kSmplxHandPoseParamCount, device);
 
                 PoseSampleExport pose_export;
                 auto pose_base_cpu = pose_base.detach().to(torch::kCPU).contiguous().view({24, 3});
@@ -2537,6 +2548,42 @@ int run_real_training(int argc, char *argv[])
                 pose_export.valid = true;
                 render_result.pose_export = pose_export;
 
+                SmplxParamsExport smplx_export;
+                auto betas_cpu = canonical_betas.detach().to(torch::kCPU).contiguous().view({-1});
+                auto expression_cpu = effective_expression.detach().to(torch::kCPU).contiguous().view({-1});
+                auto jaw_pose_cpu = effective_jaw_pose.detach().to(torch::kCPU).contiguous().view({-1});
+                auto eye_pose_cpu = effective_eye_pose.detach().to(torch::kCPU).contiguous().view({-1});
+                auto left_hand_pose_cpu = effective_left_hand_pose.detach().to(torch::kCPU).contiguous().view({-1});
+                auto right_hand_pose_cpu = effective_right_hand_pose.detach().to(torch::kCPU).contiguous().view({-1});
+
+                const float *betas_ptr = betas_cpu.data_ptr<float>();
+                const float *expression_ptr = expression_cpu.data_ptr<float>();
+                const float *jaw_pose_ptr = jaw_pose_cpu.data_ptr<float>();
+                const float *eye_pose_ptr = eye_pose_cpu.data_ptr<float>();
+                const float *left_hand_pose_ptr = left_hand_pose_cpu.data_ptr<float>();
+                const float *right_hand_pose_ptr = right_hand_pose_cpu.data_ptr<float>();
+
+                smplx_export.body_model = "smplx";
+                smplx_export.y_sign = sample.y_sign;
+                smplx_export.transl = {trans_ptr[0], trans_ptr[1], trans_ptr[2]};
+                smplx_export.betas.assign(betas_ptr, betas_ptr + static_cast<size_t>(betas_cpu.numel()));
+                smplx_export.pose_axis_angle.assign(
+                    pose_refined_ptr, pose_refined_ptr + static_cast<size_t>(pose_refined_cpu.numel()));
+                smplx_export.expression.assign(
+                    expression_ptr, expression_ptr + static_cast<size_t>(expression_cpu.numel()));
+                smplx_export.jaw_pose.assign(
+                    jaw_pose_ptr, jaw_pose_ptr + static_cast<size_t>(jaw_pose_cpu.numel()));
+                smplx_export.eye_pose.assign(
+                    eye_pose_ptr, eye_pose_ptr + static_cast<size_t>(eye_pose_cpu.numel()));
+                smplx_export.left_hand_pose.assign(
+                    left_hand_pose_ptr,
+                    left_hand_pose_ptr + static_cast<size_t>(left_hand_pose_cpu.numel()));
+                smplx_export.right_hand_pose.assign(
+                    right_hand_pose_ptr,
+                    right_hand_pose_ptr + static_cast<size_t>(right_hand_pose_cpu.numel()));
+                smplx_export.valid = true;
+                render_result.smplx_export = std::move(smplx_export);
+
                 if (viewer_stream_poses)
                 {
                     auto pose_stream_cpu = pose_refined_cpu.contiguous();
@@ -2569,12 +2616,12 @@ int run_real_training(int argc, char *argv[])
                 torch::Tensor current_rots;
                 std::tie(means3D, current_rots) =
                     avatar.forward(canonical_betas,
-                                   TensorFromPaddedVector(sample.smplx_expression, kSmplxExpressionParamCount, device) + canonical_expression,
+                                   effective_expression,
                                    pose,
-                                   TensorFromPaddedVector(sample.smplx_jaw_pose, kSmplxJawPoseParamCount, device),
-                                   TensorFromPaddedVector(sample.smplx_eye_pose, kSmplxEyePoseParamCount, device),
-                                   TensorFromPaddedVector(sample.smplx_left_hand_pose, kSmplxHandPoseParamCount, device),
-                                   TensorFromPaddedVector(sample.smplx_right_hand_pose, kSmplxHandPoseParamCount, device),
+                                   effective_jaw_pose,
+                                   effective_eye_pose,
+                                   effective_left_hand_pose,
+                                   effective_right_hand_pose,
                                    torch::zeros({1, 3}, canonical_betas.options()));
                 torch::Tensor current_sh = use_sh ? avatar.current_flat_sh : torch::zeros({0}, avatar.g_colors.options());
                 if (use_sh && sh_degree > 0)

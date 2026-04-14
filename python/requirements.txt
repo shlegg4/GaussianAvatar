@@ -1,0 +1,5 @@
+numpy>=1.26
+torch>=2.0
+trimesh>=4.0
+pyrender>=0.1.45
+pyglet<2

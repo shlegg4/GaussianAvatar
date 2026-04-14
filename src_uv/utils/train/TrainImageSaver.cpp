@@ -48,9 +48,84 @@ struct PoseJsonRecord
     PoseSampleExport pose;
 };
 
+struct SmplxJsonRecord
+{
+    size_t sample_index = 0;
+    int frame = -1;
+    std::string image_file;
+    std::string crop_path;
+    SmplxParamsExport params;
+};
+
+std::string EscapeJsonString(const std::string &value)
+{
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char ch : value)
+    {
+        switch (ch)
+        {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            escaped += ch;
+            break;
+        }
+    }
+    return escaped;
+}
+
 void WriteVec3(std::ostream &out, const std::array<float, 3> &value)
 {
     out << "[" << value[0] << ", " << value[1] << ", " << value[2] << "]";
+}
+
+void WriteFloatVector(std::ostream &out, const std::vector<float> &values)
+{
+    out << "[";
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out << ", ";
+        }
+        out << values[i];
+    }
+    out << "]";
+}
+
+void WriteFloatVectorSlice(std::ostream &out,
+                           const std::vector<float> &values,
+                           size_t offset,
+                           size_t count)
+{
+    out << "[";
+    if (offset < values.size())
+    {
+        const size_t end = std::min(values.size(), offset + count);
+        for (size_t i = offset; i < end; ++i)
+        {
+            if (i > offset)
+            {
+                out << ", ";
+            }
+            out << values[i];
+        }
+    }
+    out << "]";
 }
 
 void WritePoseBlock(std::ostream &out,
@@ -138,6 +213,94 @@ bool WritePoseBlocksJson(const std::filesystem::path &json_path,
     json_file << "}\n";
     return true;
 }
+
+bool WriteEffectiveSmplxJson(const std::filesystem::path &json_path,
+                             int epoch,
+                             const std::vector<SmplxJsonRecord> &records)
+{
+    std::ofstream json_file(json_path);
+    if (!json_file.is_open())
+    {
+        std::cerr << "Failed to open effective SMPL-X json path: " << json_path.string() << std::endl;
+        return false;
+    }
+
+    json_file.setf(std::ios::fixed);
+    json_file << std::setprecision(6);
+
+    json_file << "{\n";
+    json_file << "  \"epoch\": " << epoch << ",\n";
+    json_file << "  \"model_type\": \"smplx\",\n";
+    json_file << "  \"pose_layout\": {\n";
+    json_file << "    \"global_orient\": 3,\n";
+    json_file << "    \"body_pose\": 63,\n";
+    json_file << "    \"jaw_pose\": 3,\n";
+    json_file << "    \"eye_pose\": 6,\n";
+    json_file << "    \"left_hand_pose\": 45,\n";
+    json_file << "    \"right_hand_pose\": 45\n";
+    json_file << "  },\n";
+    json_file << "  \"samples\": [\n";
+
+    for (size_t i = 0; i < records.size(); ++i)
+    {
+        const auto &record = records[i];
+        json_file << "    {\n";
+        json_file << "      \"sample_index\": " << record.sample_index << ",\n";
+        json_file << "      \"frame\": " << record.frame << ",\n";
+        json_file << "      \"image_file\": \"" << EscapeJsonString(record.image_file) << "\",\n";
+        json_file << "      \"crop_path\": \"" << EscapeJsonString(record.crop_path) << "\",\n";
+        json_file << "      \"body_model\": \"" << EscapeJsonString(record.params.body_model) << "\",\n";
+        json_file << "      \"y_sign\": " << record.params.y_sign << ",\n";
+        json_file << "      \"effective_smplx_params\": {\n";
+        json_file << "        \"betas\": ";
+        WriteFloatVector(json_file, record.params.betas);
+        json_file << ",\n";
+        json_file << "        \"transl\": ";
+        WriteVec3(json_file, record.params.transl);
+        json_file << ",\n";
+        json_file << "        \"global_orient\": ";
+        WriteFloatVectorSlice(json_file, record.params.pose_axis_angle, 0u, 3u);
+        json_file << ",\n";
+        json_file << "        \"body_pose\": ";
+        WriteFloatVectorSlice(json_file, record.params.pose_axis_angle, 3u, 63u);
+        json_file << ",\n";
+        json_file << "        \"pose_axis_angle\": ";
+        WriteFloatVector(json_file, record.params.pose_axis_angle);
+        json_file << ",\n";
+        json_file << "        \"expression\": ";
+        WriteFloatVector(json_file, record.params.expression);
+        json_file << ",\n";
+        json_file << "        \"jaw_pose\": ";
+        WriteFloatVector(json_file, record.params.jaw_pose);
+        json_file << ",\n";
+        json_file << "        \"left_eye_pose\": ";
+        WriteFloatVectorSlice(json_file, record.params.eye_pose, 0u, 3u);
+        json_file << ",\n";
+        json_file << "        \"right_eye_pose\": ";
+        WriteFloatVectorSlice(json_file, record.params.eye_pose, 3u, 3u);
+        json_file << ",\n";
+        json_file << "        \"eye_pose\": ";
+        WriteFloatVector(json_file, record.params.eye_pose);
+        json_file << ",\n";
+        json_file << "        \"left_hand_pose\": ";
+        WriteFloatVector(json_file, record.params.left_hand_pose);
+        json_file << ",\n";
+        json_file << "        \"right_hand_pose\": ";
+        WriteFloatVector(json_file, record.params.right_hand_pose);
+        json_file << "\n";
+        json_file << "      }\n";
+        json_file << "    }";
+        if (i + 1 < records.size())
+        {
+            json_file << ",";
+        }
+        json_file << "\n";
+    }
+
+    json_file << "  ]\n";
+    json_file << "}\n";
+    return true;
+}
 } // namespace
 
 int SaveEpochViewPairs(const std::vector<TrainSample> &samples,
@@ -164,6 +327,8 @@ int SaveEpochViewPairs(const std::vector<TrainSample> &samples,
     int saved = 0;
     std::vector<PoseJsonRecord> pose_records;
     pose_records.reserve(samples.size());
+    std::vector<SmplxJsonRecord> smplx_records;
+    smplx_records.reserve(samples.size());
     torch::NoGradGuard no_grad;
     for (size_t i = 0; i < samples.size(); ++i)
     {
@@ -224,6 +389,16 @@ int SaveEpochViewPairs(const std::vector<TrainSample> &samples,
                 record.pose = render_result.pose_export;
                 pose_records.push_back(record);
             }
+            if (render_result.smplx_export.valid)
+            {
+                SmplxJsonRecord record;
+                record.sample_index = i;
+                record.frame = sample.frame;
+                record.image_file = name.str();
+                record.crop_path = sample.crop_path;
+                record.params = render_result.smplx_export;
+                smplx_records.push_back(record);
+            }
         }
     }
 
@@ -231,6 +406,12 @@ int SaveEpochViewPairs(const std::vector<TrainSample> &samples,
     if (!WritePoseBlocksJson(json_path, epoch, pose_records))
     {
         std::cerr << "Failed to write pose block json for epoch " << epoch << std::endl;
+    }
+
+    const auto smplx_json_path = epoch_dir / "effective_smplx_params.json";
+    if (!WriteEffectiveSmplxJson(smplx_json_path, epoch, smplx_records))
+    {
+        std::cerr << "Failed to write effective SMPL-X json for epoch " << epoch << std::endl;
     }
 
     return saved;

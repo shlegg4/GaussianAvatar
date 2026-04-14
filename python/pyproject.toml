@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smplx-debug-renderer"
+version = "0.1.0"
+description = "Interactive viewer for SMPL-X debug exports produced by src_uv."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.0",
+    "trimesh>=4.0",
+    "pyrender>=0.1.45",
+    "pyglet<2",
+]
+
+[project.scripts]
+smplx-debug-render = "smplx_debug_renderer.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -32,7 +32,7 @@
                 "--offset-lr",
                 "0.00001",
                 "--color-lr",
-                "0.005",
+                "0.001",
                 "--opacity-lr",
                 "0.001",
                 "--scale-lr",
@@ -140,11 +140,50 @@
             "preLaunchTask": "Build Dataset Prep (Ninja)",
             "program": "${workspaceFolder}/build_dataset_prep/dataset_prep.exe",
             "args": [
-                "C:\\Users\\Sam\\Downloads\\Test2.MOV",
+                "--output-dir",
                 "${workspaceFolder}/dataset_outputs",
-                "cam0",
-                "100",
-                "2"
+                "--target-camera",
+                "cam0", 
+                "--feed",
+                "cam0=C:\\Users\\Sam\\Downloads\\Test2.MOV",
+                "--max-frames",
+                "400",
+                "--frame-stride",
+                "4"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build_dataset_prep/",
+            "environment": [
+                {
+                    "name": "PATH",
+                    "value": "C:/Program Files/NVIDIA/CUDNN/v9.18/bin;C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin;C:/opencv/build/x64/vc16/bin;C:/libtorch/lib;${workspaceFolder}/build_dataset_prep;${env:PATH}"
+                }
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug (dataset_novel_view_render)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "preLaunchTask": "Build Dataset Prep (Ninja)",
+            "program": "${workspaceFolder}/build_dataset_prep/dataset_novel_view_render.exe",
+            "args": [
+                "--jsonl",
+                "${workspaceFolder}/dataset_outputs/frames.jsonl",
+                "--smplx-model",
+                "${workspaceFolder}/smplx_data.pt",
+                "--output",
+                "${workspaceFolder}/dataset_outputs/novel_side_view.mp4",
+                "--rtmpose-keypoints-json",
+                "${workspaceFolder}/dataset_outputs/rtmpose_keypoints3d.jsonl",
+                "--yaw-deg",
+                "90",
+                "--width",
+                "1280",
+                "--height",
+                "720",
+                "--fps",
+                "6"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build_dataset_prep/",
