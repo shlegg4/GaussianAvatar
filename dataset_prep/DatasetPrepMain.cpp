@@ -46,6 +46,9 @@ constexpr int64_t kSmplxEyePoseParamCount = 6;
 constexpr int64_t kSmplxHandPoseParamCount = 45;
 constexpr int kSmplxRootJointIndex = 0;
 constexpr float kTriangulationMinScore = 0.25f;
+constexpr float kTemporalMaxRotationStepRad = 0.35f;
+constexpr float kTemporalMaxTranslationStep = 0.15f;
+constexpr float kTwoPi = 2.0f * static_cast<float>(CV_PI);
 
 struct JointMapEntry {
     int mocap_index;
@@ -289,6 +292,108 @@ void ApplyExtraRootRotation(const cv::Matx33f& extra_rotation, std::vector<float
     (*pose_axis_angle)[0] = rotated_root_aa[0];
     (*pose_axis_angle)[1] = rotated_root_aa[1];
     (*pose_axis_angle)[2] = rotated_root_aa[2];
+}
+
+cv::Vec3f SmoothAxisAngleRotation(const cv::Vec3f& previous_axis_angle,
+                                  const cv::Vec3f& current_axis_angle,
+                                  float alpha,
+                                  float max_step_radians) {
+    cv::Matx33f previous_rotation;
+    cv::Matx33f current_rotation;
+    cv::Rodrigues(previous_axis_angle, previous_rotation);
+    cv::Rodrigues(current_axis_angle, current_rotation);
+
+    const cv::Matx33f relative_rotation = current_rotation * previous_rotation.t();
+    cv::Vec3f relative_axis_angle;
+    cv::Rodrigues(cv::Mat(relative_rotation), relative_axis_angle);
+
+    const float relative_angle = static_cast<float>(cv::norm(relative_axis_angle));
+    if (relative_angle <= 1e-8f) {
+        return previous_axis_angle;
+    }
+
+    float step_scale = std::clamp(alpha, 0.0f, 1.0f);
+    if (max_step_radians > 0.0f) {
+        step_scale = std::min(step_scale, max_step_radians / relative_angle);
+    }
+
+    const cv::Vec3f step_axis_angle = relative_axis_angle * step_scale;
+    cv::Matx33f step_rotation;
+    cv::Rodrigues(step_axis_angle, step_rotation);
+
+    const cv::Matx33f smoothed_rotation = step_rotation * previous_rotation;
+    cv::Vec3f smoothed_axis_angle;
+    cv::Rodrigues(cv::Mat(smoothed_rotation), smoothed_axis_angle);
+
+    const float smoothed_angle = static_cast<float>(cv::norm(smoothed_axis_angle));
+    if (smoothed_angle <= 1e-8f) {
+        return smoothed_axis_angle;
+    }
+
+    const cv::Vec3f axis = smoothed_axis_angle * (1.0f / smoothed_angle);
+    const cv::Vec3f alt_axis = -axis;
+    std::array<cv::Vec3f, 4> candidates = {
+        smoothed_axis_angle,
+        axis * (smoothed_angle - kTwoPi),
+        axis * (smoothed_angle + kTwoPi),
+        alt_axis * (kTwoPi - smoothed_angle),
+    };
+
+    cv::Vec3f best_axis_angle = candidates[0];
+    float best_distance = static_cast<float>(cv::norm(candidates[0] - previous_axis_angle));
+    for (size_t candidate_index = 1; candidate_index < candidates.size(); ++candidate_index) {
+        const float distance =
+            static_cast<float>(cv::norm(candidates[candidate_index] - previous_axis_angle));
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_axis_angle = candidates[candidate_index];
+        }
+    }
+    return best_axis_angle;
+}
+
+void SmoothAxisAngleBlocks(const std::vector<float>& previous_values,
+                           std::vector<float>* current_values,
+                           float alpha,
+                           float max_step_radians) {
+    if (current_values == nullptr || current_values->size() < 3u ||
+        previous_values.size() < current_values->size()) {
+        return;
+    }
+
+    for (size_t offset = 0; offset + 2u < current_values->size(); offset += 3u) {
+        const cv::Vec3f previous_axis_angle(previous_values[offset + 0u],
+                                            previous_values[offset + 1u],
+                                            previous_values[offset + 2u]);
+        const cv::Vec3f current_axis_angle((*current_values)[offset + 0u],
+                                           (*current_values)[offset + 1u],
+                                           (*current_values)[offset + 2u]);
+        const cv::Vec3f smoothed_axis_angle =
+            SmoothAxisAngleRotation(previous_axis_angle,
+                                    current_axis_angle,
+                                    alpha,
+                                    max_step_radians);
+        (*current_values)[offset + 0u] = smoothed_axis_angle[0];
+        (*current_values)[offset + 1u] = smoothed_axis_angle[1];
+        (*current_values)[offset + 2u] = smoothed_axis_angle[2];
+    }
+}
+
+cv::Vec3f SmoothTranslationStep(const cv::Vec3f& previous_translation,
+                                const cv::Vec3f& current_translation,
+                                float alpha,
+                                float max_step) {
+    cv::Vec3f delta = current_translation - previous_translation;
+    const float delta_norm = static_cast<float>(cv::norm(delta));
+    if (delta_norm <= 1e-8f) {
+        return previous_translation;
+    }
+
+    float step_scale = std::clamp(alpha, 0.0f, 1.0f);
+    if (max_step > 0.0f) {
+        step_scale = std::min(step_scale, max_step / delta_norm);
+    }
+    return previous_translation + delta * step_scale;
 }
 
 struct TrainingCropMetadata {
@@ -757,6 +862,7 @@ struct DatasetPrepOptions {
     int max_frames = -1;
     int frame_stride = 1;
     double sync_tolerance_ms = 8.0;
+    float temporal_smooth_alpha = 1.0f;
 };
 
 struct PreparedViewSample {
@@ -785,7 +891,8 @@ void PrintUsage(std::ostream& out) {
         << "  dataset_prep <video.mp4> <output_dir> <camera_id> [max_frames] [frame_stride]\n"
         << "  dataset_prep --output-dir <dir> --target-camera <camera_id>\n"
         << "               --feed <camera_id=video.mp4> [--feed <camera_id=video.mp4> ...]\n"
-        << "               [--max-frames N] [--frame-stride N] [--sync-tolerance-ms MS]\n";
+        << "               [--max-frames N] [--frame-stride N] [--sync-tolerance-ms MS]\n"
+        << "               [--smooth-alpha A]\n";
 }
 
 bool ParseFeedSpec(const std::string& feed_spec, VideoSourceConfig* out_source) {
@@ -864,6 +971,12 @@ bool ParseCommandLine(int argc, char* argv[], DatasetPrepOptions* out_options) {
                     return false;
                 }
                 options.sync_tolerance_ms = std::stod(argv[++arg_index]);
+            } else if (arg == "--smooth-alpha") {
+                if (arg_index + 1 >= argc) {
+                    std::cerr << "Missing value after --smooth-alpha.\n";
+                    return false;
+                }
+                options.temporal_smooth_alpha = std::stof(argv[++arg_index]);
             } else if (!arg.empty() && arg[0] != '-') {
                 VideoSourceConfig source;
                 if (!ParseFeedSpec(arg, &source)) {
@@ -884,6 +997,10 @@ bool ParseCommandLine(int argc, char* argv[], DatasetPrepOptions* out_options) {
     }
     if (options.frame_stride <= 0) {
         std::cerr << "frame_stride must be >= 1.\n";
+        return false;
+    }
+    if (options.temporal_smooth_alpha < 0.0f || options.temporal_smooth_alpha > 1.0f) {
+        std::cerr << "smooth-alpha must be in [0, 1].\n";
         return false;
     }
     if (options.sources.empty()) {
@@ -1107,6 +1224,10 @@ int main(int argc, char* argv[]) {
     int selected_frame_count = 0;
     int exported_frame_count = 0;
     SyncedFrameCollection synced_frames;
+    bool has_prev_pose = false;
+    std::vector<float> prev_global_orient(static_cast<size_t>(kSmplxGlobalOrientParamCount), 0.0f);
+    std::vector<float> prev_body_pose(static_cast<size_t>(kSmplxBodyPoseParamCount), 0.0f);
+    cv::Vec3f prev_training_translation(0.0f, 0.0f, 0.0f);
 
     while (synchronizer.GetNextSyncedViews(&synced_frames)) {
         if (options.max_frames >= 0 && selected_frame_count >= options.max_frames) {
@@ -1372,6 +1493,50 @@ int main(int argc, char* argv[]) {
         training_camera_translation = ProjectionSignFlip() * camera_translation;
 #endif
 
+        if (options.temporal_smooth_alpha < 1.0f) {
+            if (has_prev_pose) {
+                const float alpha = options.temporal_smooth_alpha;
+                SmoothAxisAngleBlocks(prev_global_orient,
+                                      &export_global_orient,
+                                      alpha,
+                                      kTemporalMaxRotationStepRad);
+                SmoothAxisAngleBlocks(prev_body_pose,
+                                      &export_body_pose,
+                                      alpha,
+                                      kTemporalMaxRotationStepRad);
+                training_camera_translation =
+                    SmoothTranslationStep(prev_training_translation,
+                                          training_camera_translation,
+                                          alpha,
+                                          kTemporalMaxTranslationStep);
+            }
+
+            if (train_pose_local.size() < 72u) {
+                train_pose_local.resize(72u, 0.0f);
+            }
+            std::copy_n(export_global_orient.begin(),
+                        static_cast<size_t>(kSmplxGlobalOrientParamCount),
+                        train_pose_local.begin());
+            std::copy_n(export_body_pose.begin(),
+                        static_cast<size_t>(kSmplxBodyPoseParamCount),
+                        train_pose_local.begin() + 3);
+
+#if DATASET_PREP_HAS_SMPL
+            if (!has_optimized_pose) {
+                const cv::Matx33f train_rotation = ProjectionSignFlip() * camera_rotation;
+                ApplyExtraRootRotation(train_rotation, &train_pose_local);
+            }
+#else
+            const cv::Matx33f train_rotation = ProjectionSignFlip() * camera_rotation;
+            ApplyExtraRootRotation(train_rotation, &train_pose_local);
+#endif
+
+            prev_global_orient = export_global_orient;
+            prev_body_pose = export_body_pose;
+            prev_training_translation = training_camera_translation;
+            has_prev_pose = true;
+        }
+
         const std::array<float, 3> train_camera = BuildTrainingCameraParams(
             training_camera_translation,
             target_view_it->training_crop,
@@ -1538,6 +1703,10 @@ int main(int argc, char* argv[]) {
                   << train_camera[0] << ", "
                   << train_camera[1] << ", "
                   << train_camera[2] << "]";
+        jsonl_out << ",\"translation\":["
+                  << training_camera_translation[0] << ", "
+                  << training_camera_translation[1] << ", "
+                  << training_camera_translation[2] << "]";
         jsonl_out << ",\"body_model\":\"smplx\"";
         jsonl_out << ",\"smplx_shape\":";
         WriteFloatArray(jsonl_out, fused_result.betas, static_cast<size_t>(kSmplxShapeParamCount));

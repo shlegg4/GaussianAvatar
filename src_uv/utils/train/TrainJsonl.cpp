@@ -151,6 +151,7 @@ bool ParseTrainSample(const std::string &line, TrainSample *out)
     std::vector<float> smplx_eye_pose;
     std::vector<float> smplx_left_hand_pose;
     std::vector<float> smplx_right_hand_pose;
+    std::vector<float> explicit_translation;
     double value = 0.0;
     if (ExtractNumberField(line, "frame", &value))
     {
@@ -208,7 +209,18 @@ bool ParseTrainSample(const std::string &line, TrainSample *out)
     {
         sample.camera_rt.clear();
     }
-    sample.has_translation = TryBuildTranslationFromCameraRt(sample.camera_rt, &sample.translation);
+    if (ExtractArrayField(line, "translation", &explicit_translation) && explicit_translation.size() >= 3u)
+    {
+        sample.translation = {
+            explicit_translation[0],
+            explicit_translation[1],
+            explicit_translation[2]};
+        sample.has_translation = true;
+    }
+    else
+    {
+        sample.has_translation = TryBuildTranslationFromCameraRt(sample.camera_rt, &sample.translation);
+    }
     sample.uses_smplx = has_smplx_shape || has_smplx_global || has_smplx_body ||
                         !smplx_expression.empty() || !smplx_jaw_pose.empty() ||
                         !smplx_eye_pose.empty() || !smplx_left_hand_pose.empty() ||
