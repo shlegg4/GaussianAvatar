@@ -97,7 +97,7 @@ function(dataset_prep_import_prebuilt_onnxruntime out_root out_runtime_dir)
 endfunction()
 
 # Find OpenCV (vcpkg intercepts this if the vcpkg toolchain is used)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio calib3d dnn)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio calib3d dnn viz)
 message(STATUS "Found OpenCV ${OpenCV_VERSION}")
 
 set(DATASET_PREP_ONNXRUNTIME_ROOT "")
@@ -176,6 +176,8 @@ if(MSVC)
             "${VCPKG_BIN_DIR}/opencv_videoio*.dll"
             "${VCPKG_BIN_DIR}/opencv_calib3d*.dll"
             "${VCPKG_BIN_DIR}/opencv_dnn*.dll"
+            "${VCPKG_BIN_DIR}/opencv_viz*.dll"
+            "${VCPKG_BIN_DIR}/vtk*.dll"
             
             # FFmpeg Codecs (Critical for videoio backend)
             "${VCPKG_BIN_DIR}/avformat*.dll"

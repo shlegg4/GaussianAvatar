@@ -43,6 +43,7 @@ struct SmplxOptimizationResult {
     std::vector<float> global_orient;
     std::vector<float> body_pose;
     cv::Vec3f translation_world{0.0f, 0.0f, 0.0f};
+    std::vector<cv::Point3f> optimized_joints;
 };
 
 bool OptimizeSmplxPoseFromTriangulatedJoints(SmplxTorchModule* smplx_layer,

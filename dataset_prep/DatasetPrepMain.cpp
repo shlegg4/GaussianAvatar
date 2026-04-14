@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include "utils/YoloPersonDetector.h"
 
 #if DATASET_PREP_HAS_SMPL
+#include "dataset_prep/utils/SmplxLBS.h"
 #include <torch/script.h>
 #endif
 
@@ -36,6 +38,12 @@ constexpr float kTemporalMaxTranslationStep = 0.15f;
 constexpr int kTargetCropRes = 1024;
 constexpr int kPoseInputRes = 256;
 constexpr float kCropMargin = 1.25f;
+
+const std::array<std::pair<int, int>, 17> kSmplxBones = {{
+    {0, 1}, {0, 2}, {1, 4}, {2, 5}, {4, 7}, {5, 8},
+    {0, 3}, {3, 6}, {6, 9}, {9, 12}, {12, 15},
+    {9, 13}, {9, 14}, {13, 16}, {14, 17}, {16, 18}, {17, 19},
+}};
 
 struct TrainingCropMetadata {
     float crop_cx = 0.0f;
@@ -61,6 +69,7 @@ struct TargetViewSample {
     cv::Mat crop_image_to_save;
     cv::Mat crop_matte;
     cv::Mat crop_overlay;
+    cv::Matx23f crop_trans = cv::Matx23f::eye();
     TrainingCropMetadata training_crop;
     size_t synced_view_index = 0u;
 };
@@ -204,6 +213,12 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to load camera calibrations from " << calibration_dir.string() << "\n";
         return 1;
     }
+
+    const float kWorldScale = 3.0f; // Adjust based on your metric height calibration
+    for (auto& calib : calibrations) {
+        calib.t *= kWorldScale;
+    }
+
     const auto calibration_by_camera_id = BuildCalibrationByCameraId(calibrations);
 
     YoloPersonDetectorOptions yolo_opts;
@@ -237,14 +252,21 @@ int main(int argc, char* argv[]) {
 
 #if DATASET_PREP_HAS_SMPL
     torch::jit::script::Module smplx_layer;
+    std::unique_ptr<SMPLXLayer> smplx_lbs;
     try {
         smplx_layer = torch::jit::load("C:\\Users\\Sam\\Documents\\GaussianAvatar\\smplx_libtorch.pt");
+        smplx_lbs = std::make_unique<SMPLXLayer>("C:\\Users\\Sam\\Documents\\GaussianAvatar\\smplx_data.pt");
     } catch (const c10::Error& error) {
         std::cerr << "Failed to load SMPL-X TorchScript module.\n" << error.what() << std::endl;
+        return 1;
+    } catch (const std::exception& error) {
+        std::cerr << "Failed to load SMPL-X LBS model.\n" << error.what() << std::endl;
         return 1;
     }
     smplx_layer.to(torch::kCPU);
     smplx_layer.eval();
+    smplx_lbs->to(torch::kCPU);
+    smplx_lbs->eval();
 #endif
 
     DatasetExporter::Options export_opts;
@@ -307,6 +329,7 @@ int main(int argc, char* argv[]) {
             }
 
             cv::Mat crop_image;
+            cv::Matx23f crop_trans = cv::Matx23f::eye();
             cv::Matx23f crop_inv_trans = cv::Matx23f::eye();
             if (!GeneratePatchImage(view.image,
                                     crop_bbox,
@@ -315,7 +338,7 @@ int main(int argc, char* argv[]) {
                                     false,
                                     cv::Size(kTargetCropRes, kTargetCropRes),
                                     &crop_image,
-                                    nullptr,
+                                    &crop_trans,
                                     &crop_inv_trans)) {
                 continue;
             }
@@ -334,6 +357,7 @@ int main(int argc, char* argv[]) {
                 target_sample.calibration = &calibration_it->second;
                 target_sample.crop_image = crop_image;
                 target_sample.crop_overlay = crop_image.clone();
+                target_sample.crop_trans = crop_trans;
                 target_sample.synced_view_index = view_index;
                 target_sample.training_crop = BuildTrainingCropMetadata(target_sample.calibration,
                                                                         view.image.cols,
@@ -354,7 +378,7 @@ int main(int argc, char* argv[]) {
         std::vector<cv::Point3f> triangulated_joints;
         std::vector<float> triangulated_scores;
         TriangulateJoints(triangulation_views, &triangulated_joints, &triangulated_scores);
-
+         
         std::vector<float> smplx_shape(static_cast<size_t>(kSmplxShapeParamCount), 0.0f);
         std::vector<float> smplx_expression(static_cast<size_t>(kSmplxExpressionParamCount), 0.0f);
         std::vector<float> smplx_global_orient(static_cast<size_t>(kSmplxGlobalOrientParamCount), 0.0f);
@@ -364,6 +388,9 @@ int main(int argc, char* argv[]) {
         std::vector<float> smplx_left_hand_pose(static_cast<size_t>(kSmplxHandPoseParamCount), 0.0f);
         std::vector<float> smplx_right_hand_pose(static_cast<size_t>(kSmplxHandPoseParamCount), 0.0f);
         cv::Vec3f training_camera_translation(0.0f, 0.0f, 2.5f);
+        SmplxOptimizationResult optimization_result;
+        bool has_optimization_result = false;
+        std::vector<cv::Point3f> smplx_vertices_world;
 
 #if DATASET_PREP_HAS_SMPL
         SmplxOptimizationInputs optimization_inputs;
@@ -378,8 +405,8 @@ int main(int argc, char* argv[]) {
         optimization_inputs.triangulated_joints = triangulated_joints;
         optimization_inputs.triangulated_scores = triangulated_scores;
 
-        SmplxOptimizationResult optimization_result;
         if (OptimizeSmplxPoseFromTriangulatedJoints(&smplx_layer, optimization_inputs, &optimization_result)) {
+            has_optimization_result = true;
             smplx_global_orient = PadFloatVector(optimization_result.global_orient,
                                                  static_cast<size_t>(kSmplxGlobalOrientParamCount));
             smplx_body_pose = PadFloatVector(optimization_result.body_pose,
@@ -388,6 +415,75 @@ int main(int argc, char* argv[]) {
                 training_camera_translation =
                     target_sample.calibration->R * optimization_result.translation_world +
                     target_sample.calibration->t;
+            }
+
+            std::vector<float> pose_axis_angle(55u * 3u, 0.0f);
+            if (smplx_global_orient.size() >= 3u) {
+                std::copy_n(smplx_global_orient.begin(), 3u, pose_axis_angle.begin());
+            }
+            if (smplx_body_pose.size() >= 63u) {
+                std::copy_n(smplx_body_pose.begin(), 63u, pose_axis_angle.begin() + 3u);
+            }
+
+            torch::NoGradGuard no_grad;
+            torch::Tensor betas = torch::from_blob(
+                                      smplx_shape.data(),
+                                      {1, static_cast<int64_t>(smplx_shape.size())},
+                                      torch::kFloat32)
+                                      .clone();
+            torch::Tensor expression = torch::from_blob(
+                                           smplx_expression.data(),
+                                           {1, static_cast<int64_t>(smplx_expression.size())},
+                                           torch::kFloat32)
+                                           .clone();
+            torch::Tensor pose = torch::from_blob(
+                                     pose_axis_angle.data(),
+                                     {1, 55, 3},
+                                     torch::kFloat32)
+                                     .clone();
+            torch::Tensor jaw = torch::from_blob(
+                                    smplx_jaw_pose.data(),
+                                    {1, static_cast<int64_t>(smplx_jaw_pose.size())},
+                                    torch::kFloat32)
+                                    .clone();
+            torch::Tensor eye = torch::from_blob(
+                                    smplx_eye_pose.data(),
+                                    {1, static_cast<int64_t>(smplx_eye_pose.size())},
+                                    torch::kFloat32)
+                                    .clone();
+            torch::Tensor left_hand = torch::from_blob(
+                                          smplx_left_hand_pose.data(),
+                                          {1, static_cast<int64_t>(smplx_left_hand_pose.size())},
+                                          torch::kFloat32)
+                                          .clone();
+            torch::Tensor right_hand = torch::from_blob(
+                                           smplx_right_hand_pose.data(),
+                                           {1, static_cast<int64_t>(smplx_right_hand_pose.size())},
+                                           torch::kFloat32)
+                                           .clone();
+            torch::Tensor trans = torch::tensor(
+                                    {optimization_result.translation_world[0],
+                                     optimization_result.translation_world[1],
+                                     optimization_result.translation_world[2]},
+                                    torch::kFloat32)
+                                    .reshape({1, 3});
+
+            SmplxOutput smplx_out = smplx_lbs->forward(
+                betas,
+                expression,
+                pose,
+                jaw,
+                eye,
+                left_hand,
+                right_hand,
+                trans);
+            torch::Tensor verts_cpu = smplx_out.vertices.squeeze(0).to(torch::kCPU).contiguous();
+            smplx_vertices_world.reserve(static_cast<size_t>(verts_cpu.size(0)));
+            for (int64_t i = 0; i < verts_cpu.size(0); ++i) {
+                smplx_vertices_world.emplace_back(
+                    verts_cpu[i][0].item<float>(),
+                    verts_cpu[i][1].item<float>(),
+                    verts_cpu[i][2].item<float>());
             }
         }
 #endif
@@ -421,20 +517,99 @@ int main(int argc, char* argv[]) {
                 if (!IsFinitePoint3(point_world)) {
                     continue;
                 }
-                cv::Point2f pixel;
-                if (!ProjectWorldPointToImage(*target_sample.calibration, point_world, &pixel)) {
+
+                cv::Point2f full_pixel;
+                if (!ProjectWorldPointToImage(*target_sample.calibration, point_world, &full_pixel)) {
                     continue;
                 }
-                if (pixel.x >= 0.0f && pixel.y >= 0.0f &&
-                    pixel.x < static_cast<float>(full_overlay.cols) &&
-                    pixel.y < static_cast<float>(full_overlay.rows)) {
+
+                if (full_pixel.x >= 0.0f && full_pixel.y >= 0.0f &&
+                    full_pixel.x < static_cast<float>(full_overlay.cols) &&
+                    full_pixel.y < static_cast<float>(full_overlay.rows)) {
                     cv::circle(full_overlay,
-                               cv::Point(static_cast<int>(std::lround(pixel.x)),
-                                         static_cast<int>(std::lround(pixel.y))),
+                               cv::Point(static_cast<int>(std::lround(full_pixel.x)),
+                                         static_cast<int>(std::lround(full_pixel.y))),
                                2,
                                cv::Scalar(0, 255, 0),
                                -1,
                                cv::LINE_AA);
+                }
+
+                cv::Point2f crop_pixel = ApplyAffinePoint(target_sample.crop_trans, full_pixel);
+                if (crop_pixel.x >= 0.0f && crop_pixel.y >= 0.0f &&
+                    crop_pixel.x < static_cast<float>(target_sample.crop_overlay.cols) &&
+                    crop_pixel.y < static_cast<float>(target_sample.crop_overlay.rows)) {
+                    cv::circle(target_sample.crop_overlay,
+                               cv::Point(static_cast<int>(std::lround(crop_pixel.x)),
+                                         static_cast<int>(std::lround(crop_pixel.y))),
+                               3,
+                               cv::Scalar(0, 165, 255),
+                               -1,
+                               cv::LINE_AA);
+                }
+            }
+
+            if (!optimization_result.optimized_joints.empty()) {
+                for (const auto& bone : kSmplxBones) {
+                    const int idx0 = bone.first;
+                    const int idx1 = bone.second;
+                    if (idx0 < 0 || idx1 < 0 ||
+                        idx0 >= static_cast<int>(optimization_result.optimized_joints.size()) ||
+                        idx1 >= static_cast<int>(optimization_result.optimized_joints.size())) {
+                        continue;
+                    }
+
+                    const cv::Point3f& p0_world = optimization_result.optimized_joints[static_cast<size_t>(idx0)];
+                    const cv::Point3f& p1_world = optimization_result.optimized_joints[static_cast<size_t>(idx1)];
+                    cv::Point2f p0_full;
+                    cv::Point2f p1_full;
+                    if (!ProjectWorldPointToImage(*target_sample.calibration, p0_world, &p0_full) ||
+                        !ProjectWorldPointToImage(*target_sample.calibration, p1_world, &p1_full)) {
+                        continue;
+                    }
+
+                    cv::Point2f p0_crop = ApplyAffinePoint(target_sample.crop_trans, p0_full);
+                    cv::Point2f p1_crop = ApplyAffinePoint(target_sample.crop_trans, p1_full);
+                    cv::line(target_sample.crop_overlay,
+                             cv::Point(static_cast<int>(std::lround(p0_crop.x)), static_cast<int>(std::lround(p0_crop.y))),
+                             cv::Point(static_cast<int>(std::lround(p1_crop.x)), static_cast<int>(std::lround(p1_crop.y))),
+                             cv::Scalar(255, 0, 0),
+                             2,
+                             cv::LINE_AA);
+                }
+            }
+
+            if (has_optimization_result && !smplx_vertices_world.empty()) {
+                for (const auto& vertex_world : smplx_vertices_world) {
+                    cv::Point2f full_pixel;
+                    if (!ProjectWorldPointToImage(*target_sample.calibration, vertex_world, &full_pixel)) {
+                        continue;
+                    }
+
+                    if (full_pixel.x >= 0.0f && full_pixel.y >= 0.0f &&
+                        full_pixel.x < static_cast<float>(full_overlay.cols) &&
+                        full_pixel.y < static_cast<float>(full_overlay.rows)) {
+                        cv::circle(full_overlay,
+                                   cv::Point(static_cast<int>(std::lround(full_pixel.x)),
+                                             static_cast<int>(std::lround(full_pixel.y))),
+                                   1,
+                                   cv::Scalar(255, 200, 0),
+                                   -1,
+                                   cv::LINE_AA);
+                    }
+
+                    cv::Point2f crop_pixel = ApplyAffinePoint(target_sample.crop_trans, full_pixel);
+                    if (crop_pixel.x >= 0.0f && crop_pixel.y >= 0.0f &&
+                        crop_pixel.x < static_cast<float>(target_sample.crop_overlay.cols) &&
+                        crop_pixel.y < static_cast<float>(target_sample.crop_overlay.rows)) {
+                        cv::circle(target_sample.crop_overlay,
+                                   cv::Point(static_cast<int>(std::lround(crop_pixel.x)),
+                                             static_cast<int>(std::lround(crop_pixel.y))),
+                                   1,
+                                   cv::Scalar(255, 255, 0),
+                                   -1,
+                                   cv::LINE_AA);
+                    }
                 }
             }
         }
