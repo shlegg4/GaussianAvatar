@@ -156,6 +156,8 @@
                 "400",
                 "--frame-stride",
                 "4",
+                "--start-frame-index",
+                "14",
                 "--smooth-alpha",
                 "1.0"
             ],

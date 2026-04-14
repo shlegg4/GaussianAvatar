@@ -179,6 +179,37 @@ void TriangulateJoints(const std::vector<TriangulationViewSample>& views,
     }
 }
 
+float EstimateSubjectHeight(const std::vector<cv::Point3f>& joints,
+                            const std::vector<float>& scores) {
+    const auto is_valid = [&](int idx) {
+        return idx >= 0 &&
+               idx < static_cast<int>(joints.size()) &&
+               idx < static_cast<int>(scores.size()) &&
+               scores[static_cast<size_t>(idx)] >= kTriangulationMinScore &&
+               IsFinitePoint3(joints[static_cast<size_t>(idx)]);
+    };
+
+    cv::Point3f top_pt;
+    if (is_valid(0)) {
+        top_pt = joints[0];
+    } else if (is_valid(5) && is_valid(6)) {
+        top_pt = (joints[5] + joints[6]) * 0.5f;
+    } else {
+        return -1.0f;
+    }
+
+    cv::Point3f bottom_pt;
+    if (is_valid(15) && is_valid(16)) {
+        bottom_pt = (joints[15] + joints[16]) * 0.5f;
+    } else if (is_valid(11) && is_valid(12)) {
+        bottom_pt = (joints[11] + joints[12]) * 0.5f;
+    } else {
+        return -1.0f;
+    }
+
+    return static_cast<float>(cv::norm(top_pt - bottom_pt));
+}
+
 }  // namespace
 
 }  // namespace dataset_prep
@@ -214,12 +245,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const float kWorldScale = 3.0f; // Adjust based on your metric height calibration
-    for (auto& calib : calibrations) {
-        calib.t *= kWorldScale;
-    }
-
-    const auto calibration_by_camera_id = BuildCalibrationByCameraId(calibrations);
+    auto calibration_by_camera_id = BuildCalibrationByCameraId(calibrations);
 
     YoloPersonDetectorOptions yolo_opts;
     yolo_opts.conf_threshold = 0.25f;
@@ -292,11 +318,16 @@ int main(int argc, char* argv[]) {
     std::vector<float> prev_global_orient(static_cast<size_t>(kSmplxGlobalOrientParamCount), 0.0f);
     std::vector<float> prev_body_pose(static_cast<size_t>(kSmplxBodyPoseParamCount), 0.0f);
     cv::Vec3f prev_training_translation(0.0f, 0.0f, 2.5f);
+    bool is_scale_calibrated = false;
+    const float kTargetMetricHeight = 1.7f;
 
     int selected_frame_count = 0;
     int exported_frame_count = 0;
     SyncedFrameCollection synced_frames;
     while (synchronizer.GetNextSyncedViews(&synced_frames)) {
+        if (synced_frames.sync_index < options.start_frame_index) {
+            continue;
+        }
         if (options.max_frames >= 0 && selected_frame_count >= options.max_frames) {
             break;
         }
@@ -378,6 +409,22 @@ int main(int argc, char* argv[]) {
         std::vector<cv::Point3f> triangulated_joints;
         std::vector<float> triangulated_scores;
         TriangulateJoints(triangulation_views, &triangulated_joints, &triangulated_scores);
+
+        if (!is_scale_calibrated) {
+            const float unscaled_height = EstimateSubjectHeight(triangulated_joints, triangulated_scores);
+            if (unscaled_height > 0.1f) {
+                const float scale_factor = kTargetMetricHeight / unscaled_height;
+                std::cout << "Dynamically calculated Scale Factor (SF): " << scale_factor
+                          << " (Unscaled height: " << unscaled_height << ")" << std::endl;
+
+                for (auto& pair : calibration_by_camera_id) {
+                    pair.second.t *= scale_factor;
+                }
+
+                TriangulateJoints(triangulation_views, &triangulated_joints, &triangulated_scores);
+                is_scale_calibrated = true;
+            }
+        }
          
         std::vector<float> smplx_shape(static_cast<size_t>(kSmplxShapeParamCount), 0.0f);
         std::vector<float> smplx_expression(static_cast<size_t>(kSmplxExpressionParamCount), 0.0f);
@@ -411,6 +458,10 @@ int main(int argc, char* argv[]) {
                                                  static_cast<size_t>(kSmplxGlobalOrientParamCount));
             smplx_body_pose = PadFloatVector(optimization_result.body_pose,
                                              static_cast<size_t>(kSmplxBodyPoseParamCount));
+            if (!optimization_result.optimized_betas.empty()) {
+                smplx_shape = PadFloatVector(optimization_result.optimized_betas,
+                                             static_cast<size_t>(kSmplxShapeParamCount));
+            }
             if (target_sample.calibration != nullptr) {
                 training_camera_translation =
                     target_sample.calibration->R * optimization_result.translation_world +
@@ -639,7 +690,7 @@ int main(int argc, char* argv[]) {
         export_sample.crop_w = target_sample.training_crop.crop_w;
         export_sample.crop_h = target_sample.training_crop.crop_h;
         export_sample.focal_length = target_sample.training_crop.focal_length;
-        export_sample.y_sign = 1.0f;
+        export_sample.y_sign = -1.0f;
         export_sample.cam = {train_camera[0], train_camera[1], train_camera[2]};
         export_sample.pose = train_pose;
         export_sample.betas = PadFloatVector(smplx_shape, 10u);
@@ -678,6 +729,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Finished exporting " << exported_frame_count
               << " frames from " << selected_frame_count
               << " selected synchronized frames (stride " << options.frame_stride
+              << ", start_frame_index " << options.start_frame_index
               << ", feeds " << options.sources.size() << ")." << std::endl;
     return 0;
 }

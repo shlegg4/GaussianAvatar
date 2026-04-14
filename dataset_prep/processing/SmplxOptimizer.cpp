@@ -32,14 +32,13 @@ struct JointMapEntry {
     int mocap_index;
     int smpl_index;
 };
-
-// In dataset_prep/processing/SmplxOptimizer.cpp (around line 35)
+ 
 const std::array<JointMapEntry, 20> kMocapToSmplJointMap = {{
-    {12, 1}, {11, 2}, {14, 4}, {13, 5}, {16, 7}, {15, 8}, {18, 12}, // Swapped 11/12, 13/14, 15/16
-    {17, 15}, 
-    {6, 16}, {5, 17}, {8, 18}, {7, 19}, {10, 20}, {9, 21},          // Swapped 5/6, 7/8, 9/10
-    {21, 10}, {23, 10}, {25, 10},                                  // R-Toes/Heel -> SMPL L-Foot
-    {20, 11}, {22, 11}, {24, 11},                                  // L-Toes/Heel -> SMPL R-Foot
+    {11, 1}, {12, 2}, {13, 4}, {14, 5}, {15, 7}, {16, 8}, {18, 12}, // Hips, Knees, Ankles, Neck
+    {17, 15},                                                      // Head
+    {5, 16}, {6, 17}, {7, 18}, {8, 19}, {9, 20}, {10, 21},          // Shoulders, Elbows, Wrists
+    {20, 10}, {22, 10}, {24, 10},                                  // L-Toes/Heel -> SMPL L-Foot
+    {21, 11}, {23, 11}, {25, 11},                                  // R-Toes/Heel -> SMPL R-Foot
 }};
 
 bool IsFinitePoint3(const cv::Point3f& point) {
@@ -76,8 +75,8 @@ bool EstimateRootOrientationFromHips(const std::vector<cv::Point3f>& triangulate
 
     cv::Vec3f left_hip;
     cv::Vec3f right_hip;
-    if (!HasReliableJoint(triangulated_joints, triangulated_scores, 11, &left_hip) ||
-        !HasReliableJoint(triangulated_joints, triangulated_scores, 12, &right_hip)) {
+    if (!HasReliableJoint(triangulated_joints, triangulated_scores, 12, &left_hip) ||
+        !HasReliableJoint(triangulated_joints, triangulated_scores, 11, &right_hip)) {
         return false;
     }
 
@@ -256,7 +255,11 @@ bool OptimizeSmplxPoseFromTriangulatedJoints(SmplxTorchModule* smplx_layer,
     }
 
     const torch::Device device(torch::kCPU);
-    torch::Tensor betas = MakeTorchInputTensor(inputs.fixed_betas, kSmplxShapeParamCount, device).detach();
+    torch::Tensor betas =
+        MakeTorchInputTensor(inputs.fixed_betas, kSmplxShapeParamCount, device)
+            .detach()
+            .clone()
+            .set_requires_grad(true);
     torch::Tensor expression =
         MakeTorchInputTensor(inputs.fixed_expression, kSmplxExpressionParamCount, device).detach();
     torch::Tensor jaw = MakeTorchInputTensor(inputs.jaw_pose, kSmplxJawPoseParamCount, device).detach();
@@ -341,8 +344,8 @@ bool OptimizeSmplxPoseFromTriangulatedJoints(SmplxTorchModule* smplx_layer,
     auto global_orient_init = global_orient.detach().clone();
     auto body_pose_init = body_pose.detach().clone();
 
-    torch::optim::Adam optimizer({global_orient, body_pose, translation},
-                                 torch::optim::AdamOptions(5e-3));
+    torch::optim::Adam optimizer({global_orient, body_pose, translation, betas},
+                                 torch::optim::AdamOptions(3e-2));
 
 // #if DATASET_PREP_HAS_OPENCV_VIZ
 //     cv::viz::Viz3d viewer("SMPL-X 3D Optimization View");
@@ -364,7 +367,7 @@ bool OptimizeSmplxPoseFromTriangulatedJoints(SmplxTorchModule* smplx_layer,
 //     }
 // #endif
 
-    for (int iter = 0; iter < 60; ++iter) {
+    for (int iter = 0; iter < 100; ++iter) {
         optimizer.zero_grad();
 
         std::vector<torch::jit::IValue> fwd_inputs;
@@ -389,7 +392,8 @@ bool OptimizeSmplxPoseFromTriangulatedJoints(SmplxTorchModule* smplx_layer,
         auto data_loss = ((diff * diff).sum(1) * weight_tensor).mean();
         auto orient_reg = (global_orient - global_orient_init).pow(2).mean() * 1e-2;
         auto body_reg = (body_pose - body_pose_init).pow(2).mean() * 1e-2;
-        auto total_loss = data_loss + orient_reg + body_reg; 
+        auto shape_reg = betas.pow(2).mean() * 1e-3;
+        auto total_loss = data_loss + orient_reg + body_reg + shape_reg;
         total_loss.backward();
         optimizer.step();
 
@@ -416,6 +420,7 @@ bool OptimizeSmplxPoseFromTriangulatedJoints(SmplxTorchModule* smplx_layer,
     auto go_cpu = global_orient.detach().to(torch::kCPU).contiguous();
     auto bp_cpu = body_pose.detach().to(torch::kCPU).contiguous();
     auto tr_cpu = translation.detach().to(torch::kCPU).contiguous();
+    auto betas_cpu = betas.detach().to(torch::kCPU).contiguous();
 
     out_result->global_orient.assign(go_cpu.data_ptr<float>(), go_cpu.data_ptr<float>() + go_cpu.numel());
     out_result->body_pose.assign(bp_cpu.data_ptr<float>(), bp_cpu.data_ptr<float>() + bp_cpu.numel());
@@ -423,6 +428,7 @@ bool OptimizeSmplxPoseFromTriangulatedJoints(SmplxTorchModule* smplx_layer,
         tr_cpu[0][0].item<float>(),
         tr_cpu[0][1].item<float>(),
         tr_cpu[0][2].item<float>());
+    out_result->optimized_betas.assign(betas_cpu.data_ptr<float>(), betas_cpu.data_ptr<float>() + betas_cpu.numel());
 
     out_result->optimized_joints.clear();
     {

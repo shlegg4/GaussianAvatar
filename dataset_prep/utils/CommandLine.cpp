@@ -27,10 +27,10 @@ bool ParseFeedSpec(const std::string& feed_spec, VideoSourceConfig* out_source) 
 
 void PrintDatasetPrepUsage(std::ostream& out) {
     out << "Usage:\n"
-        << "  dataset_prep <video.mp4> <output_dir> <camera_id> [max_frames] [frame_stride]\n"
+    << "  dataset_prep <video.mp4> <output_dir> <camera_id> [max_frames] [frame_stride] [start_frame_index]\n"
         << "  dataset_prep --output-dir <dir> --target-camera <camera_id>\n"
         << "               --feed <camera_id=video.mp4> [--feed <camera_id=video.mp4> ...]\n"
-        << "               [--max-frames N] [--frame-stride N] [--sync-tolerance-ms MS]\n"
+    << "               [--max-frames N] [--frame-stride N] [--start-frame-index N] [--sync-tolerance-ms MS]\n"
         << "               [--smooth-alpha A]\n";
 }
 
@@ -40,11 +40,12 @@ bool ParseDatasetPrepCommandLine(int argc, char* argv[], DatasetPrepOptions* out
     }
 
     DatasetPrepOptions options;
-    if (argc >= 4 && argc <= 6 && std::string(argv[1]).rfind("--", 0) != 0) {
+    if (argc >= 4 && argc <= 7 && std::string(argv[1]).rfind("--", 0) != 0) {
         options.output_dir = argv[2];
         options.target_camera_id = argv[3];
         options.max_frames = (argc > 4) ? std::stoi(argv[4]) : -1;
         options.frame_stride = (argc > 5) ? std::stoi(argv[5]) : 1;
+        options.start_frame_index = (argc > 6) ? std::stoi(argv[6]) : 0;
 
         VideoSourceConfig source;
         source.camera_id = options.target_camera_id;
@@ -89,6 +90,12 @@ bool ParseDatasetPrepCommandLine(int argc, char* argv[], DatasetPrepOptions* out
                     return false;
                 }
                 options.frame_stride = std::stoi(argv[++arg_index]);
+            } else if (arg == "--start-frame-index") {
+                if (arg_index + 1 >= argc) {
+                    std::cerr << "Missing value after --start-frame-index.\n";
+                    return false;
+                }
+                options.start_frame_index = std::stoi(argv[++arg_index]);
             } else if (arg == "--sync-tolerance-ms") {
                 if (arg_index + 1 >= argc) {
                     std::cerr << "Missing value after --sync-tolerance-ms.\n";
@@ -121,6 +128,10 @@ bool ParseDatasetPrepCommandLine(int argc, char* argv[], DatasetPrepOptions* out
     }
     if (options.frame_stride <= 0) {
         std::cerr << "frame_stride must be >= 1.\n";
+        return false;
+    }
+    if (options.start_frame_index < 0) {
+        std::cerr << "start-frame-index must be >= 0.\n";
         return false;
     }
     if (options.temporal_smooth_alpha < 0.0f || options.temporal_smooth_alpha > 1.0f) {
