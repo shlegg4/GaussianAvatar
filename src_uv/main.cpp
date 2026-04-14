@@ -405,7 +405,7 @@ bool ParseTrainArgs(int argc, char *argv[], TrainOptions *options)
         }
     return true;
 }
-
+#pragma optimize("", off)
 int run_real_training(int argc, char *argv[])
 {
     if (argc < 2)
@@ -613,6 +613,19 @@ int run_real_training(int argc, char *argv[])
 
         entry.matte_mask = matte_mask;
         entry.crop_bgr = crop;
+        const std::string full_frame_path = DeriveFullFramePath(sample.crop_path);
+        if (!full_frame_path.empty())
+        {
+            cv::Mat full_frame = cv::imread(full_frame_path);
+            if (!full_frame.empty())
+            {
+                entry.target_bgr = std::move(full_frame);
+            }
+        }
+        if (entry.target_bgr.empty())
+        {
+            entry.target_bgr = crop;
+        }
         entry.valid = true;
         cached[i] = std::move(entry);
     }
@@ -1278,13 +1291,7 @@ int run_real_training(int argc, char *argv[])
                 {
                     return render_result;
                 }
-                if (cached_entry.crop_bgr.empty())
-                {
-                    return render_result;
-                }
-                const int H = cached_entry.crop_bgr.rows;
-                const int W = cached_entry.crop_bgr.cols;
-                if (H <= 0 || W <= 0)
+                if (sample.img_h <= 0 || sample.img_w <= 0)
                 {
                     return render_result;
                 }
@@ -1468,24 +1475,37 @@ int run_real_training(int argc, char *argv[])
                 means3D = means3D * y_scale;
                 means3D = means3D + trans;
 
-                const int render_w = W;
-                const int render_h = H;
+                const int render_w = std::max(1, sample.img_w);
+                const int render_h = std::max(1, sample.img_h);
+                const float default_cx = static_cast<float>(render_w) * 0.5f;
+                const float default_cy = static_cast<float>(render_h) * 0.5f;
+                const float full_fx = (sample.full_fx > 0.0f) ? sample.full_fx : sample.focal_length;
+                const float full_fy = (sample.full_fy > 0.0f) ? sample.full_fy : sample.focal_length;
+                const float full_cx = (sample.full_cx > 0.0f) ? sample.full_cx : default_cx;
+                const float full_cy = (sample.full_cy > 0.0f) ? sample.full_cy : default_cy;
                 const CameraProjectionInput projection_input{
                     sample.focal_length,
+                    full_fx,
+                    full_fy,
                     sample.img_w,
                     sample.img_h,
                     render_w,
                     render_h,
-                    sample.crop_cx,
-                    sample.crop_cy,
-                    sample.crop_x0,
-                    sample.crop_y0,
-                    sample.crop_w,
-                    sample.crop_h};
+                    full_cx,
+                    full_cy,
+                    0.0f,
+                    0.0f,
+                    static_cast<float>(render_w),
+                    static_cast<float>(render_h)};
                 const CameraProjectionOutput projection =
-                    BuildCameraProjection(projection_input, device);
+                    BuildCameraProjection(projection_input, device); 
+
+                // Temporary debug path: identity view with means3D + trans only.
+                torch::Tensor view_mat = projection.view_mat;
+                torch::Tensor cam_pos_render = cam_pos;
 
                 auto colors = use_sh ? torch::zeros({0}, avatar.g_colors.options()) : avatar.current_flat_colors;
+                
                 auto outputs = GaussianRasterizer::apply(
                     means3D,
                     colors,
@@ -1493,7 +1513,7 @@ int run_real_training(int argc, char *argv[])
                     capped_scales(avatar.current_flat_scales),
                     current_rots,
                     render_scale_modifier,
-                    projection.view_mat,
+                    view_mat,
                     projection.proj_mat,
                     projection.tan_fovx,
                     projection.tan_fovy,
@@ -1501,11 +1521,11 @@ int run_real_training(int argc, char *argv[])
                     render_w,
                     current_sh,
                     use_sh ? sh_degree : 0,
-                    cam_pos,
+                    cam_pos_render,
                     false);
                 auto image = outputs[0];
                 if (!image.defined() || image.dim() != 3 || image.size(0) != 3 ||
-                    image.size(1) != H || image.size(2) != W)
+                    image.size(1) != render_h || image.size(2) != render_w)
                 {
                     return render_result;
                 }
@@ -1551,7 +1571,7 @@ int run_real_training(int argc, char *argv[])
     }
     return 0;
 }
-
+#pragma optimize("", on)
 int main(int argc, char *argv[])
 {
     // std::cout << "Starting Full Program Profiling..." << std::endl;

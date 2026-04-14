@@ -459,14 +459,23 @@ private:
 
             y_sign_cpu.push_back(sample.y_sign);
 
+            const float full_fx = (sample.full_fx > 0.0f) ? sample.full_fx : sample.focal_length;
+            const float full_fy = (sample.full_fy > 0.0f) ? sample.full_fy : sample.focal_length;
+            const float default_cx = static_cast<float>(sample.img_w) * 0.5f;
+            const float default_cy = static_cast<float>(sample.img_h) * 0.5f;
+            const float full_cx = (sample.full_cx > 0.0f) ? sample.full_cx : default_cx;
+            const float full_cy = (sample.full_cy > 0.0f) ? sample.full_cy : default_cy;
+
             const CameraProjectionInput projection_input{
                 sample.focal_length,
+                full_fx,
+                full_fy,
                 sample.img_w,
                 sample.img_h,
                 W,
                 H,
-                sample.crop_cx,
-                sample.crop_cy,
+                full_cx,
+                full_cy,
                 sample.crop_x0,
                 sample.crop_y0,
                 sample.crop_w,

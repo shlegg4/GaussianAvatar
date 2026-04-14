@@ -70,6 +70,9 @@ struct TargetViewSample {
     cv::Mat crop_image_to_save;
     cv::Mat crop_matte;
     cv::Mat crop_overlay;
+    cv::Mat full_image_to_save;
+    cv::Mat full_matte;
+    cv::Mat full_overlay;
     cv::Matx23f crop_trans = cv::Matx23f::eye();
     TrainingCropMetadata training_crop;
     size_t synced_view_index = 0u;
@@ -411,6 +414,8 @@ int main(int argc, char* argv[]) {
                 target_sample.calibration = &calibration_it->second;
                 target_sample.crop_image = crop_image;
                 target_sample.crop_overlay = crop_image.clone();
+                target_sample.full_image_to_save = view.image.clone();
+                target_sample.full_overlay = view.image.clone();
                 target_sample.crop_trans = crop_trans;
                 target_sample.synced_view_index = view_index;
                 target_sample.training_crop = BuildTrainingCropMetadata(target_sample.calibration,
@@ -418,8 +423,21 @@ int main(int argc, char* argv[]) {
                                                                         kTargetCropRes);
                 if (modnet.ProcessImage(crop_image, &target_sample.crop_matte)) {
                     target_sample.crop_image_to_save = ApplyCropMatte(crop_image, target_sample.crop_matte);
+
+                    cv::Matx23f crop_inv_trans = cv::Matx23f::eye();
+                    cv::invertAffineTransform(target_sample.crop_trans, crop_inv_trans);
+                    cv::warpAffine(target_sample.crop_matte,
+                                   target_sample.full_matte,
+                                   crop_inv_trans,
+                                   view.image.size(),
+                                   cv::INTER_LINEAR,
+                                   cv::BORDER_CONSTANT,
+                                   cv::Scalar(0));
+                    target_sample.full_image_to_save =
+                        ApplyCropMatte(target_sample.full_image_to_save, target_sample.full_matte);
                 } else {
                     target_sample.crop_image_to_save = crop_image;
+                    target_sample.full_matte = cv::Mat::zeros(view.image.rows, view.image.cols, CV_8UC1);
                 }
             }
         }
@@ -486,9 +504,14 @@ int main(int argc, char* argv[]) {
                                              static_cast<size_t>(kSmplxShapeParamCount));
             }
             if (target_sample.calibration != nullptr) {
-                training_camera_translation =
-                    target_sample.calibration->R * optimization_result.translation_world +
-                    target_sample.calibration->t;
+                // 1. Get the posed root joint in world space
+                cv::Vec3f j_world(optimization_result.optimized_joints[0]);
+                
+                // 2. Transform the root joint into the camera's coordinate space
+                cv::Vec3f j_cam = target_sample.calibration->R * j_world + target_sample.calibration->t;
+                
+                // 3. Apply the mathematically correct translation offset
+                training_camera_translation = j_cam - j_world + optimization_result.translation_world;
             }
 
             std::vector<float> pose_axis_angle(55u * 3u, 0.0f);
@@ -590,7 +613,7 @@ int main(int argc, char* argv[]) {
         std::copy_n(smplx_global_orient.begin(), 3, train_pose.begin());
         std::copy_n(smplx_body_pose.begin(), 63, train_pose.begin() + 3);
 
-        cv::Mat full_overlay = target_sample.view->image.clone();
+        cv::Mat full_overlay = target_sample.full_overlay;
         if (options.show_rtmpose_points_overlay) {
             for (const auto& tri_view : triangulation_views) {
                 if (tri_view.calibration == target_sample.calibration) {
@@ -744,37 +767,36 @@ int main(int argc, char* argv[]) {
         export_sample.video_frame_index = target_sample.view->video_frame_index;
         export_sample.person_index = 0;
         export_sample.person_id = 0;
-        export_sample.crop_image = target_sample.crop_image_to_save;
-        export_sample.crop_matte = target_sample.crop_matte;
-        export_sample.crop_overlay = target_sample.crop_overlay;
+        export_sample.crop_image = target_sample.full_image_to_save;
+        export_sample.crop_matte = target_sample.full_matte;
+        export_sample.crop_overlay = full_overlay;
         export_sample.img_w = static_cast<float>(target_sample.view->image.cols);
         export_sample.img_h = static_cast<float>(target_sample.view->image.rows);
-        export_sample.crop_cx = target_sample.training_crop.crop_cx;
-        export_sample.crop_cy = target_sample.training_crop.crop_cy;
-
-        float S = target_sample.training_crop.crop_w / target_sample.training_crop.crop_size;
-        export_sample.crop_size = target_sample.training_crop.crop_w;
-        export_sample.crop_w = target_sample.training_crop.crop_w;
-        export_sample.crop_h = target_sample.training_crop.crop_h;
-        export_sample.focal_length = target_sample.training_crop.focal_length * S;
-        export_sample.crop_x0 = target_sample.training_crop.crop_x0;
-        export_sample.crop_y0 = target_sample.training_crop.crop_y0;
+        export_sample.crop_cx = export_sample.img_w * 0.5f;
+        export_sample.crop_cy = export_sample.img_h * 0.5f;
+        export_sample.crop_size = export_sample.img_w;
+        export_sample.crop_w = export_sample.img_w;
+        export_sample.crop_h = export_sample.img_h;
+        export_sample.crop_x0 = 0.0f;
+        export_sample.crop_y0 = 0.0f;
 
         if (target_sample.calibration != nullptr) {
             export_sample.full_fx = target_sample.calibration->K(0, 0);
             export_sample.full_fy = target_sample.calibration->K(1, 1);
             export_sample.full_cx = target_sample.calibration->K(0, 2);
             export_sample.full_cy = target_sample.calibration->K(1, 2);
+            export_sample.focal_length = 0.5f * (export_sample.full_fx + export_sample.full_fy);
         } else {
             export_sample.full_fx = target_sample.training_crop.focal_length;
             export_sample.full_fy = target_sample.training_crop.focal_length;
             export_sample.full_cx = export_sample.img_w * 0.5f;
             export_sample.full_cy = export_sample.img_h * 0.5f;
+            export_sample.focal_length = target_sample.training_crop.focal_length;
         }
 
         export_sample.crop_affine = {
-            target_sample.crop_trans(0, 0), target_sample.crop_trans(0, 1), target_sample.crop_trans(0, 2),
-            target_sample.crop_trans(1, 0), target_sample.crop_trans(1, 1), target_sample.crop_trans(1, 2)};
+            1.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f};
 
         export_sample.y_sign = 1.0f;
         export_sample.cam = {train_camera[0], train_camera[1], train_camera[2]};

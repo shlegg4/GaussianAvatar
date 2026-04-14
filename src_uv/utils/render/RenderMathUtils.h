@@ -1,12 +1,15 @@
 #pragma once
 
 #include <tuple>
+#include <vector>
 
 #include <torch/torch.h>
 
 struct CameraProjectionInput
 {
     float focal = 0.0f;
+    float focal_x = 0.0f;
+    float focal_y = 0.0f;
     int full_width = 0;
     int full_height = 0;
     int render_width = 0;
@@ -30,11 +33,17 @@ struct CameraProjectionOutput
 };
 
 CameraProjectionOutput BuildCameraProjection(const CameraProjectionInput &input, torch::Device device);
+torch::Tensor BuildViewMatrixFromCameraRt(const std::vector<float> &camera_rt, torch::Device device);
+torch::Tensor CameraPositionFromViewMatrix(const torch::Tensor &view_mat);
 
 std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float focal, int width, int height,
                                                                        torch::Device device);
 std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float focal, int width, int height,
                                                                        float cx, float cy, torch::Device device);
+std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float fx, float fy,
+                                                                       int width, int height,
+                                                                       float cx, float cy,
+                                                                       torch::Device device);
 torch::Tensor ComputeTriFrames(const torch::Tensor &A, const torch::Tensor &B, const torch::Tensor &C);
 torch::Tensor MatrixToQuat(const torch::Tensor &rot_mat);
 torch::Tensor QuatMultiply(const torch::Tensor &p, const torch::Tensor &q);

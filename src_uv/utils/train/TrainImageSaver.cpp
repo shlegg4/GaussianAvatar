@@ -351,11 +351,11 @@ int SaveEpochViewPairs(const std::vector<TrainSample> &samples,
             continue;
         }
 
-        if (cached_entry.crop_bgr.empty())
+        cv::Mat target_bgr = cached_entry.target_bgr.empty() ? cached_entry.crop_bgr : cached_entry.target_bgr;
+        if (target_bgr.empty())
         {
             continue;
         }
-        cv::Mat target_bgr = cached_entry.crop_bgr;
         if (render_bgr.size() != target_bgr.size())
         {
             cv::resize(render_bgr, render_bgr, target_bgr.size(), 0, 0, cv::INTER_AREA);

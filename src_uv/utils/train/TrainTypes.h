@@ -19,6 +19,10 @@ struct TrainSample
     float crop_w = 0.0f;
     float crop_h = 0.0f;
     float focal_length = 0.0f;
+    float full_fx = 0.0f;
+    float full_fy = 0.0f;
+    float full_cx = 0.0f;
+    float full_cy = 0.0f;
     float y_sign = 1.0f;
     std::vector<float> pose;
     std::vector<float> betas;

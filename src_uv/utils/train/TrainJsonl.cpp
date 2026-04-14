@@ -192,6 +192,14 @@ bool ParseTrainSample(const std::string &line, TrainSample *out)
     if (!ExtractNumberField(line, "focal_length", &value))
         return false;
     sample.focal_length = static_cast<float>(value);
+    if (ExtractNumberField(line, "full_fx", &value))
+        sample.full_fx = static_cast<float>(value);
+    if (ExtractNumberField(line, "full_fy", &value))
+        sample.full_fy = static_cast<float>(value);
+    if (ExtractNumberField(line, "full_cx", &value))
+        sample.full_cx = static_cast<float>(value);
+    if (ExtractNumberField(line, "full_cy", &value))
+        sample.full_cy = static_cast<float>(value);
     if (!ExtractNumberField(line, "y_sign", &value))
         return false;
     sample.y_sign = static_cast<float>(value);

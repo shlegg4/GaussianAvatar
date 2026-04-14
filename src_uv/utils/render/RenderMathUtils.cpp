@@ -22,13 +22,43 @@ CameraProjectionOutput BuildCameraProjection(const CameraProjectionInput &input,
 
     const float cx_crop = full_cx - x0;
     const float cy_crop = full_cy - y0;
+    const float fx = (input.focal_x > 0.0f) ? input.focal_x : input.focal;
+    const float fy = (input.focal_y > 0.0f) ? input.focal_y : input.focal;
 
     CameraProjectionOutput output;
     output.principal_x = cx_crop;
     output.principal_y = cy_crop;
     std::tie(output.view_mat, output.proj_mat, output.tan_fovx, output.tan_fovy) =
-        BuildProjection(input.focal, render_w, render_h, cx_crop, cy_crop, device);
+        BuildProjection(fx, fy, render_w, render_h, cx_crop, cy_crop, device);
     return output;
+}
+
+torch::Tensor BuildViewMatrixFromCameraRt(const std::vector<float> &camera_rt, torch::Device device)
+{
+    if (camera_rt.size() < 16u)
+    {
+        return torch::eye(4, torch::TensorOptions().device(device)).transpose(0, 1).contiguous();
+    }
+
+    auto view_rm = torch::tensor(
+        {
+            {camera_rt[0], camera_rt[1], camera_rt[2], camera_rt[3]},
+            {camera_rt[4], camera_rt[5], camera_rt[6], camera_rt[7]},
+            {camera_rt[8], camera_rt[9], camera_rt[10], camera_rt[11]},
+            {camera_rt[12], camera_rt[13], camera_rt[14], camera_rt[15]},
+        },
+        torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+    return view_rm.transpose(0, 1).contiguous();
+}
+
+torch::Tensor CameraPositionFromViewMatrix(const torch::Tensor &view_mat)
+{
+    using torch::indexing::Slice;
+
+    auto view_rm = view_mat.transpose(0, 1).contiguous();
+    auto view_inv = torch::inverse(view_rm);
+    return view_inv.index({Slice(0, 3), 3}).contiguous();
 }
 
 std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float focal, int width, int height,
@@ -53,10 +83,17 @@ std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float foc
 std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float focal, int width, int height,
                                                                        float cx, float cy, torch::Device device)
 {
+    return BuildProjection(focal, focal, width, height, cx, cy, device);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float fx, float fy,
+                                                                       int width, int height,
+                                                                       float cx, float cy, torch::Device device)
+{
     const float n = 0.01f;
     const float f = 100.0f;
-    const float tan_fovx = (static_cast<float>(width) * 0.5f) / std::max(focal, 1e-6f);
-    const float tan_fovy = (static_cast<float>(height) * 0.5f) / std::max(focal, 1e-6f);
+    const float tan_fovx = (static_cast<float>(width) * 0.5f) / std::max(fx, 1e-6f);
+    const float tan_fovy = (static_cast<float>(height) * 0.5f) / std::max(fy, 1e-6f);
 
     auto view = torch::eye(4, device);
     auto proj = torch::zeros({4, 4}, device);
