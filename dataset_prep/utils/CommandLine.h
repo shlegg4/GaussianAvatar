@@ -18,6 +18,9 @@ struct DatasetPrepOptions {
     int frame_stride = 1;
     double sync_tolerance_ms = 8.0;
     float temporal_smooth_alpha = 1.0f;
+    bool show_rtmpose_points_overlay = true;
+    bool show_smpl_joints_overlay = true;
+    bool show_smpl_verts_overlay = true;
 };
 
 void PrintDatasetPrepUsage(std::ostream& out);

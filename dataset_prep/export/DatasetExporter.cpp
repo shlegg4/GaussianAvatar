@@ -379,6 +379,13 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
                    << ",\"crop_w\":" << sample.crop_w
                    << ",\"crop_h\":" << sample.crop_h
                    << ",\"focal_length\":" << sample.focal_length
+                     << ",\"full_fx\":" << sample.full_fx
+                     << ",\"full_fy\":" << sample.full_fy
+                     << ",\"full_cx\":" << sample.full_cx
+                     << ",\"full_cy\":" << sample.full_cy
+                     << ",\"crop_affine\":";
+                 WriteFloatArray(output, sample.crop_affine, 6u);
+                 output
                    << ",\"y_sign\":" << sample.y_sign
                    << ",\"smpl_scale\":";
             WriteOptionalFloat(output, sample.smpl_scale);

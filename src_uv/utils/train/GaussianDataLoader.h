@@ -459,27 +459,25 @@ private:
 
             y_sign_cpu.push_back(sample.y_sign);
 
-            const float full_cx = static_cast<float>(sample.img_w) * 0.5f;
-            const float full_cy = static_cast<float>(sample.img_h) * 0.5f;
-            const float x0 = (sample.crop_w > 0.0f) ? sample.crop_x0 : (sample.crop_cx - static_cast<float>(W) * 0.5f);
-            const float y0 = (sample.crop_h > 0.0f) ? sample.crop_y0 : (sample.crop_cy - static_cast<float>(H) * 0.5f);
+            const CameraProjectionInput projection_input{
+                sample.focal_length,
+                sample.img_w,
+                sample.img_h,
+                W,
+                H,
+                sample.crop_cx,
+                sample.crop_cy,
+                sample.crop_x0,
+                sample.crop_y0,
+                sample.crop_w,
+                sample.crop_h};
+            const CameraProjectionOutput projection =
+                BuildCameraProjection(projection_input, torch::kCPU);
 
-            torch::Tensor view_cpu;
-            torch::Tensor proj_cpu;
-            float tan_fovx = 0.0f;
-            float tan_fovy = 0.0f;
-            std::tie(view_cpu, proj_cpu, tan_fovx, tan_fovy) =
-                BuildProjection(sample.focal_length,
-                                W,
-                                H,
-                                full_cx - x0,
-                                full_cy - y0,
-                                torch::kCPU);
-
-            view_mats_cpu.push_back(view_cpu);
-            proj_mats_cpu.push_back(proj_cpu);
-            batch.tan_fovx.push_back(tan_fovx);
-            batch.tan_fovy.push_back(tan_fovy);
+            view_mats_cpu.push_back(projection.view_mat);
+            proj_mats_cpu.push_back(projection.proj_mat);
+            batch.tan_fovx.push_back(projection.tan_fovx);
+            batch.tan_fovy.push_back(projection.tan_fovy);
         }
 
         auto image_cpu_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);

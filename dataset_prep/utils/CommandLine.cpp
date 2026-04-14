@@ -8,6 +8,21 @@ namespace fs = std::filesystem;
 namespace dataset_prep {
 namespace {
 
+bool ParseBoolFlagValue(const std::string& value, bool* out_value) {
+    if (out_value == nullptr) {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "TRUE" || value == "on" || value == "ON") {
+        *out_value = true;
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "FALSE" || value == "off" || value == "OFF") {
+        *out_value = false;
+        return true;
+    }
+    return false;
+}
+
 bool ParseFeedSpec(const std::string& feed_spec, VideoSourceConfig* out_source) {
     if (out_source == nullptr) {
         return false;
@@ -31,7 +46,8 @@ void PrintDatasetPrepUsage(std::ostream& out) {
         << "  dataset_prep --output-dir <dir> --target-camera <camera_id>\n"
         << "               --feed <camera_id=video.mp4> [--feed <camera_id=video.mp4> ...]\n"
     << "               [--max-frames N] [--frame-stride N] [--start-frame-index N] [--sync-tolerance-ms MS]\n"
-        << "               [--smooth-alpha A]\n";
+        << "               [--smooth-alpha A]\n"
+        << "               [--show-rtmpose-overlay 0|1] [--show-smpl-joints-overlay 0|1] [--show-smpl-verts-overlay 0|1]\n";
 }
 
 bool ParseDatasetPrepCommandLine(int argc, char* argv[], DatasetPrepOptions* out_options) {
@@ -108,6 +124,33 @@ bool ParseDatasetPrepCommandLine(int argc, char* argv[], DatasetPrepOptions* out
                     return false;
                 }
                 options.temporal_smooth_alpha = std::stof(argv[++arg_index]);
+            } else if (arg == "--show-rtmpose-overlay") {
+                if (arg_index + 1 >= argc) {
+                    std::cerr << "Missing value after --show-rtmpose-overlay.\n";
+                    return false;
+                }
+                if (!ParseBoolFlagValue(argv[++arg_index], &options.show_rtmpose_points_overlay)) {
+                    std::cerr << "Invalid value for --show-rtmpose-overlay (use 0/1, true/false, on/off).\n";
+                    return false;
+                }
+            } else if (arg == "--show-smpl-joints-overlay") {
+                if (arg_index + 1 >= argc) {
+                    std::cerr << "Missing value after --show-smpl-joints-overlay.\n";
+                    return false;
+                }
+                if (!ParseBoolFlagValue(argv[++arg_index], &options.show_smpl_joints_overlay)) {
+                    std::cerr << "Invalid value for --show-smpl-joints-overlay (use 0/1, true/false, on/off).\n";
+                    return false;
+                }
+            } else if (arg == "--show-smpl-verts-overlay") {
+                if (arg_index + 1 >= argc) {
+                    std::cerr << "Missing value after --show-smpl-verts-overlay.\n";
+                    return false;
+                }
+                if (!ParseBoolFlagValue(argv[++arg_index], &options.show_smpl_verts_overlay)) {
+                    std::cerr << "Invalid value for --show-smpl-verts-overlay (use 0/1, true/false, on/off).\n";
+                    return false;
+                }
             } else if (!arg.empty() && arg[0] != '-') {
                 VideoSourceConfig source;
                 if (!ParseFeedSpec(arg, &source)) {

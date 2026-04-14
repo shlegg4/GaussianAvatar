@@ -2,6 +2,35 @@
 
 #include <algorithm>
 
+CameraProjectionOutput BuildCameraProjection(const CameraProjectionInput &input, torch::Device device)
+{
+    const int render_w = std::max(1, input.render_width);
+    const int render_h = std::max(1, input.render_height);
+    const int full_w = std::max(1, input.full_width);
+    const int full_h = std::max(1, input.full_height);
+
+    const float full_cx = static_cast<float>(full_w) * 0.5f;
+    const float full_cy = static_cast<float>(full_h) * 0.5f;
+
+    float x0 = input.crop_x0;
+    float y0 = input.crop_y0;
+    if (input.crop_w <= 0.0f || input.crop_h <= 0.0f)
+    {
+        x0 = input.crop_cx - (static_cast<float>(render_w) * 0.5f);
+        y0 = input.crop_cy - (static_cast<float>(render_h) * 0.5f);
+    }
+
+    const float cx_crop = full_cx - x0;
+    const float cy_crop = full_cy - y0;
+
+    CameraProjectionOutput output;
+    output.principal_x = cx_crop;
+    output.principal_y = cy_crop;
+    std::tie(output.view_mat, output.proj_mat, output.tan_fovx, output.tan_fovy) =
+        BuildProjection(input.focal, render_w, render_h, cx_crop, cy_crop, device);
+    return output;
+}
+
 std::tuple<torch::Tensor, torch::Tensor, float, float> BuildProjection(float focal, int width, int height,
                                                                        torch::Device device)
 {

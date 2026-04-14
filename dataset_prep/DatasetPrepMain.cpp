@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "dataset_prep/export/DatasetExporter.h"
@@ -78,6 +79,31 @@ bool IsFinitePoint3(const cv::Point3f& point) {
     return std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z);
 }
 
+std::vector<float> RotateRootAxisAngleToCamera(const cv::Matx33f& camera_rotation,
+                                               const std::vector<float>& global_orient_world) {
+    std::vector<float> global_orient_camera =
+        PadFloatVector(global_orient_world, static_cast<size_t>(kSmplxGlobalOrientParamCount));
+    if (global_orient_camera.size() < 3u) {
+        return global_orient_camera;
+    }
+
+    const cv::Vec3f root_world_axis_angle(
+        global_orient_camera[0],
+        global_orient_camera[1],
+        global_orient_camera[2]);
+    cv::Matx33f root_world_rotation = cv::Matx33f::eye();
+    cv::Rodrigues(root_world_axis_angle, root_world_rotation);
+
+    const cv::Matx33f root_camera_rotation = camera_rotation * root_world_rotation;
+    cv::Vec3f root_camera_axis_angle;
+    cv::Rodrigues(cv::Mat(root_camera_rotation), root_camera_axis_angle);
+
+    global_orient_camera[0] = root_camera_axis_angle[0];
+    global_orient_camera[1] = root_camera_axis_angle[1];
+    global_orient_camera[2] = root_camera_axis_angle[2];
+    return global_orient_camera;
+}
+
 std::map<std::string, CameraCalibration> BuildCalibrationByCameraId(
     const std::vector<CameraCalibration>& calibrations) {
     std::map<std::string, CameraCalibration> by_id;
@@ -88,22 +114,18 @@ std::map<std::string, CameraCalibration> BuildCalibrationByCameraId(
 }
 
 TrainingCropMetadata BuildTrainingCropMetadata(const CameraCalibration* calibration,
-                                               int img_width,
-                                               int img_height,
+                                               const cv::Rect2f& crop_bbox,
                                                int target_crop_res) {
     TrainingCropMetadata metadata;
     if (target_crop_res <= 0) {
         return metadata;
     }
 
-    const float full_cx = static_cast<float>(img_width) * 0.5f;
-    const float full_cy = static_cast<float>(img_height) * 0.5f;
-    const float crop_half = static_cast<float>(target_crop_res) * 0.5f;
-    metadata.crop_cx = full_cx;
-    metadata.crop_cy = full_cy;
-    metadata.crop_size = static_cast<float>(target_crop_res);
-    metadata.crop_x0 = full_cx - crop_half;
-    metadata.crop_y0 = full_cy - crop_half;
+    metadata.crop_cx = crop_bbox.x + crop_bbox.width * 0.5f;
+    metadata.crop_cy = crop_bbox.y + crop_bbox.height * 0.5f;
+    metadata.crop_size = std::max(crop_bbox.width, crop_bbox.height);
+    metadata.crop_x0 = crop_bbox.x;
+    metadata.crop_y0 = crop_bbox.y;
     metadata.crop_w = static_cast<float>(target_crop_res);
     metadata.crop_h = static_cast<float>(target_crop_res);
     metadata.focal_length = calibration != nullptr
@@ -319,6 +341,7 @@ int main(int argc, char* argv[]) {
     std::vector<float> prev_body_pose(static_cast<size_t>(kSmplxBodyPoseParamCount), 0.0f);
     cv::Vec3f prev_training_translation(0.0f, 0.0f, 2.5f);
     bool is_scale_calibrated = false;
+    float current_scale_factor = 1.0f;
     const float kTargetMetricHeight = 1.7f;
 
     int selected_frame_count = 0;
@@ -391,8 +414,7 @@ int main(int argc, char* argv[]) {
                 target_sample.crop_trans = crop_trans;
                 target_sample.synced_view_index = view_index;
                 target_sample.training_crop = BuildTrainingCropMetadata(target_sample.calibration,
-                                                                        view.image.cols,
-                                                                        view.image.rows,
+                                                                        crop_bbox,
                                                                         kTargetCropRes);
                 if (modnet.ProcessImage(crop_image, &target_sample.crop_matte)) {
                     target_sample.crop_image_to_save = ApplyCropMatte(crop_image, target_sample.crop_matte);
@@ -414,6 +436,7 @@ int main(int argc, char* argv[]) {
             const float unscaled_height = EstimateSubjectHeight(triangulated_joints, triangulated_scores);
             if (unscaled_height > 0.1f) {
                 const float scale_factor = kTargetMetricHeight / unscaled_height;
+                current_scale_factor = scale_factor;
                 std::cout << "Dynamically calculated Scale Factor (SF): " << scale_factor
                           << " (Unscaled height: " << unscaled_height << ")" << std::endl;
 
@@ -539,6 +562,11 @@ int main(int argc, char* argv[]) {
         }
 #endif
 
+    if (has_optimization_result && target_sample.calibration != nullptr) {
+        smplx_global_orient = RotateRootAxisAngleToCamera(target_sample.calibration->R,
+                                  smplx_global_orient);
+    }
+
         if (options.temporal_smooth_alpha < 1.0f && has_prev_pose) {
             SmoothAxisAngleBlocks(prev_global_orient,
                                   &smplx_global_orient,
@@ -563,6 +591,45 @@ int main(int argc, char* argv[]) {
         std::copy_n(smplx_body_pose.begin(), 63, train_pose.begin() + 3);
 
         cv::Mat full_overlay = target_sample.view->image.clone();
+        if (options.show_rtmpose_points_overlay) {
+            for (const auto& tri_view : triangulation_views) {
+                if (tri_view.calibration == target_sample.calibration) {
+                    for (size_t i = 0; i < tri_view.keypoints.size(); ++i) {
+                        if (i < tri_view.scores.size() && tri_view.scores[i] < kTriangulationMinScore) {
+                            continue;
+                        }
+
+                        const cv::Point2f& full_pixel = tri_view.keypoints[i];
+                        if (full_pixel.x >= 0.0f && full_pixel.y >= 0.0f &&
+                            full_pixel.x < static_cast<float>(full_overlay.cols) &&
+                            full_pixel.y < static_cast<float>(full_overlay.rows)) {
+                            cv::circle(full_overlay,
+                                       cv::Point(static_cast<int>(std::lround(full_pixel.x)),
+                                                 static_cast<int>(std::lround(full_pixel.y))),
+                                       4,
+                                       cv::Scalar(255, 0, 255),
+                                       -1,
+                                       cv::LINE_AA);
+                        }
+
+                        cv::Point2f crop_pixel = ApplyAffinePoint(target_sample.crop_trans, full_pixel);
+                        if (crop_pixel.x >= 0.0f && crop_pixel.y >= 0.0f &&
+                            crop_pixel.x < static_cast<float>(target_sample.crop_overlay.cols) &&
+                            crop_pixel.y < static_cast<float>(target_sample.crop_overlay.rows)) {
+                            cv::circle(target_sample.crop_overlay,
+                                       cv::Point(static_cast<int>(std::lround(crop_pixel.x)),
+                                                 static_cast<int>(std::lround(crop_pixel.y))),
+                                       5,
+                                       cv::Scalar(255, 0, 255),
+                                       -1,
+                                       cv::LINE_AA);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         if (target_sample.calibration != nullptr) {
             for (const auto& point_world : triangulated_joints) {
                 if (!IsFinitePoint3(point_world)) {
@@ -600,7 +667,7 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (!optimization_result.optimized_joints.empty()) {
+            if (options.show_smpl_joints_overlay && !optimization_result.optimized_joints.empty()) {
                 for (const auto& bone : kSmplxBones) {
                     const int idx0 = bone.first;
                     const int idx1 = bone.second;
@@ -630,7 +697,7 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (has_optimization_result && !smplx_vertices_world.empty()) {
+            if (options.show_smpl_verts_overlay && has_optimization_result && !smplx_vertices_world.empty()) {
                 for (const auto& vertex_world : smplx_vertices_world) {
                     cv::Point2f full_pixel;
                     if (!ProjectWorldPointToImage(*target_sample.calibration, vertex_world, &full_pixel)) {
@@ -684,21 +751,41 @@ int main(int argc, char* argv[]) {
         export_sample.img_h = static_cast<float>(target_sample.view->image.rows);
         export_sample.crop_cx = target_sample.training_crop.crop_cx;
         export_sample.crop_cy = target_sample.training_crop.crop_cy;
-        export_sample.crop_size = target_sample.training_crop.crop_size;
-        export_sample.crop_x0 = target_sample.training_crop.crop_x0;
-        export_sample.crop_y0 = target_sample.training_crop.crop_y0;
+
+        float S = target_sample.training_crop.crop_w / target_sample.training_crop.crop_size;
+        export_sample.crop_size = target_sample.training_crop.crop_w;
         export_sample.crop_w = target_sample.training_crop.crop_w;
         export_sample.crop_h = target_sample.training_crop.crop_h;
-        export_sample.focal_length = target_sample.training_crop.focal_length;
-        export_sample.y_sign = -1.0f;
+        export_sample.focal_length = target_sample.training_crop.focal_length * S;
+        export_sample.crop_x0 = target_sample.training_crop.crop_x0;
+        export_sample.crop_y0 = target_sample.training_crop.crop_y0;
+
+        if (target_sample.calibration != nullptr) {
+            export_sample.full_fx = target_sample.calibration->K(0, 0);
+            export_sample.full_fy = target_sample.calibration->K(1, 1);
+            export_sample.full_cx = target_sample.calibration->K(0, 2);
+            export_sample.full_cy = target_sample.calibration->K(1, 2);
+        } else {
+            export_sample.full_fx = target_sample.training_crop.focal_length;
+            export_sample.full_fy = target_sample.training_crop.focal_length;
+            export_sample.full_cx = export_sample.img_w * 0.5f;
+            export_sample.full_cy = export_sample.img_h * 0.5f;
+        }
+
+        export_sample.crop_affine = {
+            target_sample.crop_trans(0, 0), target_sample.crop_trans(0, 1), target_sample.crop_trans(0, 2),
+            target_sample.crop_trans(1, 0), target_sample.crop_trans(1, 1), target_sample.crop_trans(1, 2)};
+
+        export_sample.y_sign = 1.0f;
         export_sample.cam = {train_camera[0], train_camera[1], train_camera[2]};
         export_sample.pose = train_pose;
         export_sample.betas = PadFloatVector(smplx_shape, 10u);
+        export_sample.body_model = "smplx";
+
         export_sample.translation = {
             training_camera_translation[0],
             training_camera_translation[1],
-            training_camera_translation[2],
-        };
+            training_camera_translation[2]};
         export_sample.body_model = "smplx";
         export_sample.smplx_shape = smplx_shape;
         export_sample.smplx_expression = smplx_expression;
