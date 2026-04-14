@@ -14,6 +14,7 @@ public:
         bool save_masks = true;
         bool save_training_debug = true;
         bool save_pose_json = true;
+        bool save_rtmpose_keypoints3d = true;
         bool append_manifest = true;
         int png_compression = 3;
     };
@@ -29,6 +30,7 @@ private:
                        const std::filesystem::path& pose_path) const;
     bool AppendManifestLine(const ExportFrameArtifacts& artifacts,
                             const std::filesystem::path& pose_path) const;
+    bool AppendRtmposeKeypoints3dLine(const ExportFrameArtifacts& artifacts) const;
     bool UseTrainingExport(const ExportFrameArtifacts& artifacts) const;
     std::filesystem::path MakeTrainingCropPath(const ExportFrameArtifacts& artifacts,
                                                const ExportTrainingSample& sample) const;

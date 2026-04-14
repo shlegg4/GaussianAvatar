@@ -49,6 +49,23 @@ void WriteFloatArray(std::ostream& out,
     out << "]";
 }
 
+void WritePoint3Array(std::ostream& out,
+                      const std::vector<cv::Point3f>& points,
+                      size_t expected_count) {
+    out << "[";
+    for (size_t i = 0; i < expected_count; ++i) {
+        if (i > 0u) {
+            out << ", ";
+        }
+        if (i < points.size() && std::isfinite(points[i].x) && std::isfinite(points[i].y) && std::isfinite(points[i].z)) {
+            out << points[i].x << ", " << points[i].y << ", " << points[i].z;
+        } else {
+            out << "0.0, 0.0, 0.0";
+        }
+    }
+    out << "]";
+}
+
 std::string JsonEscape(const std::string& input) {
     std::string out;
     out.reserve(input.size() + 8u);
@@ -187,6 +204,10 @@ bool DatasetExporter::SaveFrame(const ExportFrameArtifacts& artifacts) {
     }
 
     if (options_.append_manifest && !AppendManifestLine(artifacts, pose_path)) {
+        return false;
+    }
+
+    if (options_.save_rtmpose_keypoints3d && !AppendRtmposeKeypoints3dLine(artifacts)) {
         return false;
     }
 
@@ -333,6 +354,8 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
         for (const auto& sample : artifacts.training_samples) {
             const auto crop_path = std::filesystem::absolute(
                 MakeTrainingCropPath(artifacts, sample)).lexically_normal();
+            const auto matte_path = std::filesystem::absolute(
+                MakeTrainingMattePath(artifacts, sample)).lexically_normal();
             const std::filesystem::path overlay_path = options_.save_training_debug && !sample.crop_overlay.empty()
                 ? std::filesystem::absolute(MakeTrainingOverlayPath(artifacts, sample)).lexically_normal()
                 : std::filesystem::path();
@@ -343,6 +366,7 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
                    << ",\"video_frame_index\":" << sample.video_frame_index
                    << ",\"image\":\"\""
                    << ",\"crop\":\"" << JsonEscape(crop_path.generic_string()) << "\""
+                   << ",\"mask\":\"" << JsonEscape(matte_path.generic_string()) << "\""
                    << ",\"input\":\"\""
                    << ",\"overlay\":\"" << JsonEscape(overlay_path.generic_string()) << "\""
                    << ",\"img_w\":" << sample.img_w
@@ -364,6 +388,29 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
             WriteFloatArray(output, sample.betas, kSmplShapeParamCount);
             output << ",\"cam\":";
             WriteFloatArray(output, sample.cam, 3u);
+            output << ",\"translation\":";
+            WriteFloatArray(output, sample.translation, 3u);
+            output << ",\"body_model\":\"" << JsonEscape(sample.body_model) << "\"";
+            output << ",\"smplx_shape\":";
+            WriteFloatArray(output, sample.smplx_shape, sample.smplx_shape.size());
+            output << ",\"smplx_expression\":";
+            WriteFloatArray(output, sample.smplx_expression, sample.smplx_expression.size());
+            output << ",\"smplx_global_orient\":";
+            WriteFloatArray(output, sample.smplx_global_orient, sample.smplx_global_orient.size());
+            output << ",\"smplx_body_pose\":";
+            WriteFloatArray(output, sample.smplx_body_pose, sample.smplx_body_pose.size());
+            output << ",\"smplx_jaw_pose\":";
+            WriteFloatArray(output, sample.smplx_jaw_pose, sample.smplx_jaw_pose.size());
+            output << ",\"smplx_eye_pose\":";
+            WriteFloatArray(output, sample.smplx_eye_pose, sample.smplx_eye_pose.size());
+            output << ",\"smplx_left_hand_pose\":";
+            WriteFloatArray(output, sample.smplx_left_hand_pose, sample.smplx_left_hand_pose.size());
+            output << ",\"smplx_right_hand_pose\":";
+            WriteFloatArray(output, sample.smplx_right_hand_pose, sample.smplx_right_hand_pose.size());
+            if (!sample.camera_rt.empty()) {
+                output << ",\"camera_rt\":";
+                WriteFloatArray(output, sample.camera_rt, sample.camera_rt.size());
+            }
             if (!pose_path.empty()) {
                 const auto normalized_pose = std::filesystem::absolute(pose_path).lexically_normal();
                 output << ",\"pose_json\":\"" << JsonEscape(normalized_pose.generic_string()) << "\"";
@@ -402,6 +449,39 @@ bool DatasetExporter::AppendManifestLine(const ExportFrameArtifacts& artifacts,
         }
     }
     output << "]}\n";
+    return true;
+}
+
+bool DatasetExporter::AppendRtmposeKeypoints3dLine(const ExportFrameArtifacts& artifacts) const {
+    if (artifacts.triangulated_joints.empty() && artifacts.triangulated_scores.empty()) {
+        return true;
+    }
+
+    std::string camera_id;
+    if (!artifacts.training_samples.empty()) {
+        camera_id = artifacts.training_samples.front().camera_id;
+    } else if (!artifacts.synced_frames.views.empty()) {
+        camera_id = artifacts.synced_frames.views.front().camera_id;
+    }
+
+    const auto output_path = options_.output_dir / "rtmpose_keypoints3d.jsonl";
+    std::ofstream output(output_path, std::ios::app);
+    if (!output.is_open()) {
+        std::cerr << "DatasetExporter: failed to append " << output_path.string() << std::endl;
+        return false;
+    }
+
+    output.setf(std::ios::fixed);
+    output << std::setprecision(6);
+    output << "{\"frame\":" << artifacts.synced_frames.sync_index
+           << ",\"sync_index\":" << artifacts.synced_frames.sync_index
+           << ",\"camera_id\":\"" << JsonEscape(camera_id) << "\""
+           << ",\"joint_count\":" << kMocapJointCount
+           << ",\"rtmpose_keypoints_3d\":";
+    WritePoint3Array(output, artifacts.triangulated_joints, kMocapJointCount);
+    output << ",\"rtmpose_scores\":";
+    WriteFloatArray(output, artifacts.triangulated_scores, kMocapJointCount);
+    output << "}\n";
     return true;
 }
 

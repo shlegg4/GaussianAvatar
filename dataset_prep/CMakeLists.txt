@@ -121,9 +121,13 @@ set(DATASET_PREP_SOURCES
     ingestion/MocapPoseParser.cpp
     ingestion/VideoSynchronizer.cpp
     processing/BackgroundExtractor.cpp
-    processing/PearEstimator.cpp
+    processing/SmplxOptimizer.cpp
     export/DatasetExporter.cpp
+    utils/CommandLine.cpp
+    utils/GeometryUtils.cpp
+    utils/ImageUtils.cpp
     utils/ModNetMatte.cpp
+    ../src/utils/RtmPoseDetector.cpp
     ../src/utils/YoloPersonDetector.cpp
 )
 
@@ -218,11 +222,6 @@ if(DATASET_PREP_ENABLE_SMPL)
     find_package(Torch REQUIRED)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
-    target_sources(dataset_prep PRIVATE
-        ../src/utils/HmrMathHelpers.cpp
-        ../src/utils/RtmPoseDetector.cpp
-        ../src/utils/SmplifyLite.cpp
-    )
     target_link_libraries(dataset_prep PRIVATE "${TORCH_LIBRARIES}")
     target_compile_definitions(dataset_prep PRIVATE DATASET_PREP_HAS_SMPL=1)
 

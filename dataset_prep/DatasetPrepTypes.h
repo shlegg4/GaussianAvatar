@@ -237,6 +237,17 @@ struct ExportTrainingSample {
     std::vector<float> cam = std::vector<float>(3u, 0.0f);
     std::vector<float> pose = std::vector<float>(kSmplPoseParamCount, 0.0f);
     std::vector<float> betas = std::vector<float>(kSmplShapeParamCount, 0.0f);
+    std::vector<float> translation = std::vector<float>(3u, 0.0f);
+    std::string body_model = "smplx";
+    std::vector<float> smplx_shape;
+    std::vector<float> smplx_expression;
+    std::vector<float> smplx_global_orient;
+    std::vector<float> smplx_body_pose;
+    std::vector<float> smplx_jaw_pose;
+    std::vector<float> smplx_eye_pose;
+    std::vector<float> smplx_left_hand_pose;
+    std::vector<float> smplx_right_hand_pose;
+    std::vector<float> camera_rt;
 };
 
 struct ExportFrameArtifacts {
@@ -246,6 +257,8 @@ struct ExportFrameArtifacts {
     MocapFrame3D pose3d;
     std::vector<ExportTrainingSample> training_samples;
     std::vector<cv::Mat> full_overlays;
+    std::vector<cv::Point3f> triangulated_joints;
+    std::vector<float> triangulated_scores;
     bool training_export_requested = false;
 };
 

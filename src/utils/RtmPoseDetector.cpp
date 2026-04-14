@@ -4,6 +4,8 @@
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
+#include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -17,28 +19,81 @@ namespace {
 const float kMean[3] = {0.485f, 0.456f, 0.406f};
 const float kStd[3] = {0.229f, 0.224f, 0.225f};
 
-float SoftmaxArgMaxProb(const float* data, int size, int* out_argmax) {
+float DecodeSimccArgMaxConfidence(const float* data, int size, int* out_argmax) {
     if (!data || size <= 0) {
         if (out_argmax) *out_argmax = 0;
         return 0.0f;
     }
+
     int argmax = 0;
     float max_val = data[0];
+    float second_val = -std::numeric_limits<float>::infinity();
+    float min_val = data[0];
+    float sum_val = data[0];
     for (int i = 1; i < size; ++i) {
         if (data[i] > max_val) {
+            second_val = max_val;
             max_val = data[i];
             argmax = i;
+        } else if (data[i] > second_val) {
+            second_val = data[i];
+        }
+        min_val = std::min(min_val, data[i]);
+        sum_val += data[i];
+    }
+    if (!std::isfinite(second_val)) {
+        second_val = max_val;
+    }
+
+    if (out_argmax) *out_argmax = argmax;
+
+    float confidence = 0.0f;
+    const char* decode_mode = "logits_softmax";
+
+    // Some RTMPose exports already output probabilities for each SimCC axis.
+    // In that case, applying softmax again collapses confidence to about 1/N.
+    if (min_val >= -1e-6f && max_val <= 1.0f + 1e-3f &&
+        sum_val >= 0.5f && sum_val <= 1.5f) {
+        decode_mode = "probabilities";
+        confidence = std::clamp(data[argmax], 0.0f, 1.0f);
+    } else {
+        float sum_exp = 0.0f;
+        for (int i = 0; i < size; ++i) {
+            sum_exp += std::exp(data[i] - max_val);
+        }
+        if (sum_exp <= 0.0f) {
+            confidence = 0.0f;
+        } else {
+            const float logsumexp = max_val + std::log(sum_exp);
+
+            // If values are log-probabilities (logsumexp ~= 0), exp(max_logp)
+            // is the canonical confidence.
+            if (max_val <= 1e-4f && std::abs(logsumexp) <= 0.2f) {
+                decode_mode = "log_probabilities";
+                confidence = std::exp(max_val);
+            } else {
+                // SimCC heads are often decoded from argmax directly, and the raw
+                // maxima are better confidence proxies than softmax over long axes.
+                decode_mode = "logits_peak_sigmoid";
+                confidence = 1.0f / (1.0f + std::exp(-max_val));
+            }
         }
     }
-    float sum = 0.0f;
-    for (int i = 0; i < size; ++i) {
-        sum += std::exp(data[i] - max_val);
+
+    static bool printed_decode_stats = false;
+    if (!printed_decode_stats) {
+        printed_decode_stats = true;
+        std::cout << "RTMPose SimCC decode mode=" << decode_mode
+                  << " size=" << size
+                  << " min=" << min_val
+                  << " max=" << max_val
+                  << " second=" << second_val
+                  << " sum=" << sum_val
+                  << " conf=" << confidence
+                  << std::endl;
     }
-    if (out_argmax) *out_argmax = argmax;
-    if (sum <= 0.0f) {
-        return 0.0f;
-    }
-    return 1.0f / sum;
+
+    return std::clamp(confidence, 0.0f, 1.0f);
 }
 
 } // namespace
@@ -165,10 +220,11 @@ bool RtmPoseDetector::DetectPose(const cv::Mat& bgr,
         simcc_y = &outputs[1];
     }
 
-    return DecodeSimcc(*simcc_x, *simcc_y,
+    const bool success = DecodeSimcc(*simcc_x, *simcc_y,
                        scale, pad_x, pad_y,
                        bgr.cols, bgr.rows,
                        out_keypoints, out_keypoint_scores);
+    return success;
 }
 
 cv::Mat RtmPoseDetector::Letterbox(const cv::Mat& src, float* out_scale, int* out_pad_x, int* out_pad_y) const {
@@ -207,15 +263,18 @@ bool RtmPoseDetector::DecodeSimcc(const Ort::Value& simcc_x,
                                   std::vector<cv::Point2f>* out_keypoints,
                                   std::vector<float>* out_keypoint_scores) const {
     if (!simcc_x.IsTensor() || !simcc_y.IsTensor()) {
+        std::cerr << "RTMPose outputs are not tensors." << std::endl;
         return false;
     }
 
     const auto shape_x = simcc_x.GetTensorTypeAndShapeInfo().GetShape();
     const auto shape_y = simcc_y.GetTensorTypeAndShapeInfo().GetShape();
     if (shape_x.size() != 3 || shape_y.size() != 3) {
+        std::cerr << "RTMPose SimCC outputs have invalid shape." << std::endl;
         return false;
     }
     if (shape_x[0] != 1 || shape_y[0] != 1 || shape_x[1] != shape_y[1]) {
+        std::cerr << "RTMPose SimCC outputs have incompatible shape." << std::endl;
         return false;
     }
 
@@ -226,6 +285,7 @@ bool RtmPoseDetector::DecodeSimcc(const Ort::Value& simcc_x,
     const float* data_x = simcc_x.GetTensorData<float>();
     const float* data_y = simcc_y.GetTensorData<float>();
     if (!data_x || !data_y) {
+        std::cerr << "RTMPose SimCC outputs have no data." << std::endl;
         return false;
     }
 
@@ -239,8 +299,8 @@ bool RtmPoseDetector::DecodeSimcc(const Ort::Value& simcc_x,
         const float* row_y = data_y + j * simcc_h;
         int argmax_x = 0;
         int argmax_y = 0;
-        const float prob_x = SoftmaxArgMaxProb(row_x, simcc_w, &argmax_x);
-        const float prob_y = SoftmaxArgMaxProb(row_y, simcc_h, &argmax_y);
+        const float prob_x = DecodeSimccArgMaxConfidence(row_x, simcc_w, &argmax_x);
+        const float prob_y = DecodeSimccArgMaxConfidence(row_y, simcc_h, &argmax_y);
 
         float x = static_cast<float>(argmax_x) / options_.simcc_split_ratio;
         float y = static_cast<float>(argmax_y) / options_.simcc_split_ratio;
@@ -263,6 +323,7 @@ bool RtmPoseDetector::DecodeSimcc(const Ort::Value& simcc_x,
             }
         }
         if (!any_valid) {
+            std::cerr << "RTMPose detection confidence scores are all below threshold." << std::endl;
             return false;
         }
     }
